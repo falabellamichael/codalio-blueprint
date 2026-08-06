@@ -1,0 +1,9 @@
+# internal planning docs
+docs/
+
+# node
+node_modules/
+npm-debug.log*
+
+# OS
+.DS_Store
