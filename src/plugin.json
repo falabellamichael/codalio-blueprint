@@ -1,0 +1,107 @@
+{
+  "schemaVersion": 1,
+  "id": "codalio-blueprint",
+  "name": "Codalio Blueprint",
+  "version": "1.0.0",
+  "description": "A Cursor-style planning agent page: one big AI chat that runs the Codalio Blueprint skills (PRD builder, MVP checklist, GTM plan, architecture evaluation, doc generation, code-to-PRD), streaming every step while the project folder tree and each generated document stay visible.",
+  "publisher": {
+    "name": "Michael Anthony Falabella"
+  },
+  "license": "MIT",
+  "permissions": [
+    {
+      "id": "ui.page",
+      "reason": "Contributes one dedicated app-bar page that hosts the planning agent chat, the project file tree, and the document viewer.",
+      "required": true
+    },
+    {
+      "id": "llm.use",
+      "reason": "Runs each planning lens (product/scope, architecture-lite, GTM-lite), the synthesis pass, and the other Blueprint skills through the active workspace model endpoint.",
+      "required": true
+    },
+    {
+      "id": "filesystem.write",
+      "reason": "Export a generated planning document to a Markdown file the user chooses. Generated documents are otherwise kept only in the plug-in's own local project store.",
+      "required": false
+    },
+    {
+      "id": "clipboard.write",
+      "reason": "Copy a generated planning document or a single agent step to the clipboard on explicit user action.",
+      "required": false
+    }
+  ],
+  "frontend": {
+    "entrypoint": "codalio-blueprint.js",
+    "capabilities": [
+      "workspace.commands.v1",
+      "workspace.import-export.v1",
+      "workspace.page-controller.v1"
+    ]
+  },
+  "contributes": {
+    "commands": [
+      {
+        "id": "codalio-blueprint.open-blueprint",
+        "title": "Blueprint: Open Planning Agent",
+        "description": "Open the Cursor-style planning agent page with the chat, project file tree, and document viewer.",
+        "entrypoint": "codalio-blueprint.js",
+        "handler": "codalioBlueprint.openPage",
+        "permissions": [
+          "ui.page",
+          "llm.use"
+        ]
+      },
+      {
+        "id": "codalio-blueprint.run-prd-builder",
+        "title": "Blueprint: Build a PRD",
+        "description": "Run the multi-lens PRD builder skill on a described product idea and write the result to docs/prd/ in the Blueprint project.",
+        "entrypoint": "codalio-blueprint.js",
+        "handler": "codalioBlueprint.runPrdBuilder",
+        "permissions": [
+          "llm.use"
+        ]
+      },
+      {
+        "id": "codalio-blueprint.export-document",
+        "title": "Blueprint: Export Open Document",
+        "description": "Export the currently open generated planning document as a Markdown file.",
+        "entrypoint": "codalio-blueprint.js",
+        "handler": "codalioBlueprint.exportOpenDocument",
+        "permissions": [
+          "filesystem.write"
+        ]
+      }
+    ],
+    "exporters": [
+      {
+        "id": "codalio-blueprint.export-markdown",
+        "title": "Export Blueprint Markdown",
+        "description": "Export the active generated planning document as a Markdown file.",
+        "entrypoint": "codalio-blueprint.js",
+        "handler": "codalioBlueprint.exportOpenDocument",
+        "permissions": [
+          "filesystem.write"
+        ],
+        "extensions": [
+          ".md"
+        ],
+        "mimeTypes": [
+          "text/markdown"
+        ]
+      }
+    ],
+    "pages": [
+      {
+        "id": "codalio-blueprint.blueprint-page",
+        "location": "app-bar",
+        "icon": "fa-compass-drafting",
+        "title": "Blueprint",
+        "ariaLabel": "Open the Codalio Blueprint planning agent",
+        "order": 38,
+        "entrypoint": "codalio-blueprint.js",
+        "offlineCapable": true,
+        "controllerCapability": "workspace.page-controller.v1"
+      }
+    ]
+  }
+}
