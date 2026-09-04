@@ -754,6 +754,79 @@
                             ]
                         }
                     ]
+                },
+                {
+                    id: 'path-context',
+                    label: 'Path context',
+                    icon: 'fa-diagram-project',
+                    summary: settings => settings.pathContextEnabled
+                        ? (String(settings.pathContextPath || '').trim()
+                            ? `Reading "${String(settings.pathContextPath).trim()}"`
+                                + ` · ${settings.pathContextMaxFiles} files`
+                            : 'On · no folder named yet')
+                        : 'Off',
+                    groups: [
+                        {
+                            id: 'target',
+                            label: 'Read a folder live, instead of importing it',
+                            icon: 'fa-folder-open',
+                            note: 'Importing a folder STORES its text in this browser profile, which is capped at 2 MB total — far less than a real project. On the work_on_rag-main tree, TrainingModel alone holds 108 MB of source text and GUI holds 326 MB. Path context reads the folder you name at RUN TIME through the folder you granted access to, so it never enters storage and never competes with your imported files.',
+                            fields: [
+                                {
+                                    key: 'pathContextEnabled',
+                                    label: 'Give the agent this folder as context',
+                                    type: 'toggle',
+                                    help: 'When on, the code-reading skills read the folder below live before each run. The same toggle appears beneath the Agent chat box.'
+                                },
+                                {
+                                    key: 'pathContextPath',
+                                    label: 'Folder to read',
+                                    type: 'text',
+                                    maxChars: 500,
+                                    placeholder: 'TrainingModel',
+                                    help: 'A folder inside the project you granted access to. Type it relative to that root (TrainingModel, or GUI/ai_agents), or paste a full path — the matching root prefix is ignored. A browser cannot open a typed path without a granted folder, so pick one on the Agent page if you have not.'
+                                }
+                            ]
+                        },
+                        {
+                            id: 'caps',
+                            label: 'How much of it to read',
+                            icon: 'fa-gauge-high',
+                            note: 'The folder is walked for metadata only, then the most valuable files are read until one of these caps is reached. Every exclusion is reported in the run, so a cap is never silent. Raising these costs disk time and prompt tokens on every run.',
+                            fields: [
+                                {
+                                    key: 'pathContextMaxFiles',
+                                    label: 'Maximum files read',
+                                    type: 'number',
+                                    min: 1,
+                                    max: 5000,
+                                    step: 10,
+                                    unit: 'files',
+                                    help: 'Entry points and implementation files are read first; deep trivia and data files last. A large subtree stops here and the run says so.'
+                                },
+                                {
+                                    key: 'pathContextTotalKb',
+                                    label: 'Maximum total size read',
+                                    type: 'number',
+                                    min: 64,
+                                    max: 65536,
+                                    step: 64,
+                                    unit: 'KB',
+                                    help: 'Read from disk only — this is NOT stored in the workspace, so it is independent of the 2 MB import cap.'
+                                },
+                                {
+                                    key: 'pathContextFileKb',
+                                    label: 'Maximum size per file',
+                                    type: 'number',
+                                    min: 8,
+                                    max: 4096,
+                                    step: 8,
+                                    unit: 'KB',
+                                    help: 'A single enormous generated file is skipped rather than consuming the whole budget. Measured on the real tree, 170 files exceed 1 MB and are mostly branding images, which are not source.'
+                                }
+                            ]
+                        }
+                    ]
                 }
             ]
         },

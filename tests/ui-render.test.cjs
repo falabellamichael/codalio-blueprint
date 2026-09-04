@@ -832,25 +832,31 @@ assert.equal(findAll(emptyNav, byClass('cb-settings-results-empty')).length, 1, 
 //
 // Asserted as a CONTRACT against the live schema rather than as hardcoded
 // counts: "the source section renders 0 tabs" froze a snapshot that became
-// wrong the moment a second page was added to that section. The invariant
-// under test is the relationship — tabs render iff section.pages.length > 1,
-// and exactly one per page — which holds however the schema grows.
+// wrong the moment a second page was added to that section.
+// The invariant under test is RELATIONSHIP, not a count: sub-tabs render iff a
+// section has more than one page, exactly one per page. Deriving the expected
+// count from the schema means this holds however the schema grows — a hardcoded
+// number broke the moment Path context became the Source section's third page.
+const dataSection = schema.getSection('data');
 const dataPage = ui.renderSettingsPage(baseState({
     folder: 'cb-settings', settingsSection: 'data', settingsPage: 'storage', settings: core.readSettings()
 }));
-assert.equal(findAll(dataPage, byAction('settings-goto')).length, 2,
-    'the Data section has two pages so both sub-tabs should render');
+assert.equal(findAll(dataPage, byAction('settings-goto')).length, dataSection.pages.length,
+    `the Data section has ${dataSection.pages.length} pages so that many sub-tabs should render`);
 
 // Both source pages are rendered and kept, because the innerHTML sweep in
 // section 10 walks them for unsafe model text.
+const sourceSection = schema.getSection('source');
 const sourceLimitsPage = ui.renderSettingsPage(baseState({
     folder: 'cb-settings', settingsSection: 'source', settingsPage: 'limits', settings: core.readSettings()
 }));
 const sourceDigestPage = ui.renderSettingsPage(baseState({
     folder: 'cb-settings', settingsSection: 'source', settingsPage: 'digest', settings: core.readSettings()
 }));
-assert.equal(findAll(sourceLimitsPage, byAction('settings-goto')).length, 2,
-    'the Source section now has two pages (attach limits + whole-codebase reading)');
+assert.equal(findAll(sourceLimitsPage, byAction('settings-goto')).length, sourceSection.pages.length,
+    `the Source section has ${sourceSection.pages.length} pages (attach limits, whole-codebase reading, path context)`);
+assert.ok(sourceSection.pages.some(page => page.id === 'path-context'),
+    'the Path context page is missing from the Source section schema');
 
 // The digest page renders its three controls with the documented bounds, so a
 // user can actually reach the feature and cannot configure a step that hangs.
@@ -874,6 +880,36 @@ const checkedMode = modeInputs.find(input => input.checked);
 assert.ok(checkedMode, 'neither source context mode was selected by default');
 assert.equal(checkedMode.value, 'attached',
     'the default mode is not "attached" — that would silently change behaviour for existing users');
+
+// The Path context page renders its controls with the documented bounds, so a
+// user can actually reach the feature and cannot configure a read that hangs
+// the tab. Defaults mirror core.DEFAULT_SETTINGS.
+const pathContextPage = ui.renderSettingsPage(baseState({
+    folder: 'cb-settings', settingsSection: 'source', settingsPage: 'path-context', settings: core.readSettings()
+}));
+const pathContextText = textOf(pathContextPage);
+assert.match(pathContextText, /Folder to read/, 'the path field label is missing from the Path context page');
+assert.match(pathContextText, /Maximum files read/, 'the file-cap control is missing');
+const pathContextInputs = findAll(pathContextPage, node => node.tagName === 'INPUT');
+const pathInput = pathContextInputs.find(input => input.dataset.cbSetting === 'pathContextPath');
+assert.ok(pathInput, 'the path input did not render');
+assert.equal(pathInput.value, '', 'the path field did not render its empty default');
+assert.equal(pathInput.maxLength, 500, 'the path length cap is not enforced in the UI');
+const enabledToggle = pathContextInputs.find(input => input.dataset.cbSetting === 'pathContextEnabled');
+assert.ok(enabledToggle, 'the enable toggle did not render');
+assert.equal(enabledToggle.checked, false,
+    'path context must default OFF in the UI — it reads the disk at run time');
+const maxFilesInput = pathContextInputs.find(input => input.dataset.cbSetting === 'pathContextMaxFiles');
+assert.ok(maxFilesInput, 'the file-cap input did not render');
+assert.equal(maxFilesInput.value, '400', 'the file cap did not render its default');
+assert.equal(maxFilesInput.max, '5000', 'the file-cap ceiling is not enforced in the UI');
+const totalKbInput = pathContextInputs.find(input => input.dataset.cbSetting === 'pathContextTotalKb');
+assert.ok(totalKbInput, 'the total-size input did not render');
+assert.equal(totalKbInput.value, '6144', 'the total-size cap did not render its default');
+const fileKbInput = pathContextInputs.find(input => input.dataset.cbSetting === 'pathContextFileKb');
+assert.ok(fileKbInput, 'the per-file-size input did not render');
+assert.equal(fileKbInput.value, '256', 'the per-file cap did not render its default');
+assert.equal(fileKbInput.max, '4096', 'the per-file ceiling is not enforced in the UI');
 
 schema.sections().forEach(section => {
     section.pages.forEach(page => {

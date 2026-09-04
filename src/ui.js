@@ -1387,7 +1387,110 @@
         right.appendChild(send);
         bar.appendChild(right);
         composer.appendChild(bar);
+
+        composer.appendChild(renderPathContextBar(state, isEffectivelyBusy));
         return composer;
+    }
+
+    /**
+     * Path context bar: one folder pick, one path field, one toggle.
+     *
+     * Sits BENEATH the send row because the top of the composer already carries
+     * the folder select, file select and attachment chips. It reads a named
+     * subdirectory live at run time, so it is the escape hatch from the 2 MB
+     * workspace cap that keeps a large project's real source out of reach.
+     */
+    function renderPathContextBar(state, disabled) {
+        const bar = node('div', `cb-path-context${state.pathContextEnabled ? ' cb-path-context-on' : ''}`);
+        const enabled = state.pathContextEnabled === true;
+        const hasGrant = Boolean(state.pathContextHasGrant);
+        const busy = Boolean(state.pathContextBusy) || Boolean(disabled);
+
+        // The toggle is the primary control and stays visible at all times.
+        const toggle = node('button', `cb-path-toggle${enabled ? ' on' : ''}`);
+        toggle.type = 'button';
+        toggle.dataset.cbAction = 'toggle-path-context';
+        toggle.setAttribute('role', 'switch');
+        toggle.setAttribute('aria-checked', enabled ? 'true' : 'false');
+        toggle.title = enabled
+            ? 'Path context ON — the named folder is read live when a code-reading skill runs'
+            : 'Path context OFF — runs use only the imported project files';
+        if (busy) toggle.disabled = true;
+        const knob = node('span', 'cb-path-toggle-knob');
+        knob.appendChild(icon(enabled ? 'fa-folder-open' : 'fa-folder'));
+        toggle.appendChild(knob);
+        toggle.appendChild(node('span', 'cb-path-toggle-label', enabled ? 'On' : 'Off'));
+        bar.appendChild(toggle);
+
+        const label = node('span', 'cb-path-context-label');
+        label.appendChild(icon('fa-diagram-project'));
+        label.appendChild(node('span', null, 'Folder path'));
+        bar.appendChild(label);
+
+        // The draft wins over the saved value while typing so the field never
+        // fights the user mid-word (commit happens on blur/Enter).
+        const value = state.pathContextDraft !== null && state.pathContextDraft !== undefined
+            ? state.pathContextDraft
+            : String(state.pathContextPath || '');
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'cb-path-context-input';
+        input.dataset.cbRole = 'path-context-input';
+        input.value = value;
+        input.spellcheck = false;
+        input.autocomplete = 'off';
+        input.placeholder = hasGrant
+            ? 'TrainingModel  ·  or GUI/ai_agents'
+            : 'TrainingModel  ·  pick a folder first';
+        input.title = 'A folder inside the granted project. Type it relative to the root '
+            + '(TrainingModel), or paste a full path — the matching root prefix is ignored.';
+        if (busy) input.disabled = true;
+        bar.appendChild(input);
+
+        // Reuse the folder-import grant when there is one; otherwise offer a
+        // pick. A browser cannot open a typed path without a granted handle, so
+        // this button is what makes the field meaningful.
+        const pickLabel = hasGrant
+            ? (state.pathContextRootName || 'Folder')
+            : 'Pick folder';
+        const pick = button(pickLabel, hasGrant ? 'fa-folder-check' : 'fa-folder-plus',
+            'pick-path-context-root', {
+                compact: true,
+                title: hasGrant
+                    ? `Reading paths inside "${state.pathContextRootName}". Pick again to change it.`
+                    : 'Grant Blueprint read access to the project folder the path is inside',
+                disabled: busy
+            });
+        bar.appendChild(pick);
+
+        const check = button('Check', 'fa-circle-question', 'recheck-path-context', {
+            compact: true,
+            title: 'Resolve the path now and report whether that folder exists',
+            disabled: busy || !hasGrant || !value.trim()
+        });
+        bar.appendChild(check);
+
+        // One-line status so the state is never a guess: whether the grant is
+        // present, and what the caps will be. A lost grant after a reload is
+        // called out explicitly rather than reading as "off".
+        const status = node('span', 'cb-path-context-status');
+        const settings = state.settings || {};
+        if (enabled && hasGrant && value.trim()) {
+            status.appendChild(icon('fa-circle-check'));
+            status.appendChild(node('span', null,
+                `${state.pathContextRootName}/… · up to ${Number(settings.pathContextMaxFiles || 400).toLocaleString()} files`));
+        } else if (enabled && !hasGrant) {
+            status.appendChild(icon('fa-triangle-exclamation'));
+            status.appendChild(node('span', null, 'Needs folder access — pick the project folder'));
+        } else if (enabled && !value.trim()) {
+            status.appendChild(icon('fa-circle-info'));
+            status.appendChild(node('span', null, 'Type a folder to read'));
+        } else {
+            status.appendChild(node('span', null, 'Off · imported files only'));
+        }
+        bar.appendChild(status);
+
+        return bar;
     }
 
     function renderFilesPage(state) {

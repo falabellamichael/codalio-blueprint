@@ -189,6 +189,18 @@
         activeRunId: '',
         projectName: '',
         sourceFiles: [],
+        // Path context. A FileSystemDirectoryHandle CANNOT be persisted in the
+        // workspace store (it is a live browser object, not data), so it lives
+        // here for the session only. `pathContextRootName` mirrors the granted
+        // root's name so the UI can still say which folder it needs re-picking
+        // after a page reload, instead of showing a blank field.
+        pathContextRoot: null,
+        pathContextRootName: '',
+        pathContextBusy: false,
+        // Uncommitted text in the path field. Kept separate from settings so
+        // typing does not re-render the composer on every keystroke (which would
+        // reset the caret and lose focus mid-word).
+        pathContextDraft: null,
         modal: null,
         toast: null,
         toastTimer: null,
@@ -1149,6 +1161,28 @@
         }).filter(Boolean);
     }
 
+    /**
+     * The path-context instruction for a run: { enabled, path, rootHandle }.
+     *
+     * Enabled + a non-empty path + a live granted handle are all required. A
+     * handle is lost on page reload (it cannot be persisted), so this returns
+     * `rootHandle: null` in that case and the source gate reports the missing
+     * grant instead of silently reading nothing. The typed path itself IS
+     * persisted in settings, so only the grant needs re-picking.
+     */
+    function pathContextForRun() {
+        const settings = core.readSettings();
+        const enabled = settings.pathContextEnabled === true;
+        const path = String(settings.pathContextPath || '').trim();
+        if (!enabled || !path) return { enabled: false, path: '', rootHandle: null, rootName: '' };
+        return {
+            enabled: true,
+            path,
+            rootHandle: runtime.pathContextRoot || null,
+            rootName: String(runtime.pathContextRootName || '')
+        };
+    }
+
     function stateSnapshot() {
         // v1/v2 workspace state keyed expanded directories only by relative path.
         // Expand that intent into one independent key per root exactly once.
@@ -1210,6 +1244,18 @@
             projectName: activeFolder ? activeFolder.name : runtime.projectName,
             projectFiles: core.listFiles(activeFolder ? activeFolder.id : undefined),
             sourceFiles: activeSourceFiles(),
+            // Path context for the Agent-page bar. `hasGrant` distinguishes
+            // "you have not picked a folder yet" from "the page reloaded and the
+            // grant was lost" — the two need different instructions, and a lost
+            // grant must never look like a silently empty context.
+            pathContextEnabled: settings.pathContextEnabled === true,
+            pathContextPath: String(settings.pathContextPath || ''),
+            pathContextRootName: String(runtime.pathContextRootName || ''),
+            pathContextHasGrant: Boolean(runtime.pathContextRoot),
+            pathContextBusy: Boolean(runtime.pathContextBusy),
+            // The uncommitted field text, so a re-render triggered by something
+            // else cannot wipe what the user is mid-way through typing.
+            pathContextDraft: runtime.pathContextDraft,
             openPath: core.store.openPath,
             openFolderId: core.store.openFolderId,
             pendingQuestion: runtime.pendingQuestion,
@@ -3364,6 +3410,11 @@
             requirementsText: idea,
             activeFolderId: runFolderId,
             sourceFiles: activeSourceFiles(runFolderId),
+            // Path context: the live handle is passed by reference and read at
+            // the source gate. It is deliberately NOT written into `run` —
+            // checkpointing saves `run` only, and a live FileSystemDirectoryHandle
+            // cannot survive serialization anyway.
+            pathContext: pathContextForRun(),
             selectedOptions: Array.isArray(opts.selectedOptions) ? opts.selectedOptions.slice() : null,
             compaction: sameRootContext && runtime.compaction
                 && (!runtime.compaction.folderId
@@ -4214,6 +4265,12 @@
         // through the same busy/progress state the importer uses, and yields
         // every 40 entries so the page repaints mid-scan.
         setToast(`Scanning "${rootHandle.name}"…`, 'info');
+        // Keep the granted root for Path context. Importing a folder already
+        // required the user to grant access to exactly the tree they want read,
+        // so reusing this handle means the context path needs no second picker
+        // trip. A later explicit pick overwrites it.
+        runtime.pathContextRoot = rootHandle;
+        runtime.pathContextRootName = String(rootHandle.name || '');
         let collected;
         try {
             collected = await core.collectFilesFromDirectoryHandle(rootHandle, {
@@ -4615,6 +4672,127 @@
         if (runtime.sourceFiles.length === before) return;
         setToast('Detached all source files from this project context.', 'info');
         renderHostSurfaces();
+        renderPage();
+    }
+
+    // ------------------------------------------------------------------
+    // Path context (Agent page): one pick, one path field, one toggle
+    //
+    // The 2 MB workspace cap means an imported folder can only ever show a
+    // slice of a large project. This reads a named subdirectory LIVE at run
+    // time through a granted handle, so a 10 GB subtree can be described
+    // without storing any of it.
+    // ------------------------------------------------------------------
+
+    /** Persist the typed path, clearing the draft so the field reflects truth. */
+    function commitPathContextPath(rawPath) {
+        const value = String(rawPath || '').trim();
+        runtime.pathContextDraft = null;
+        const settings = core.readSettings();
+        if (String(settings.pathContextPath || '').trim() === value) {
+            renderPage();
+            return;
+        }
+        settings.pathContextPath = value;
+        if (!core.writeSettings(settings)) {
+            setToast('That path could not be saved.', 'error', 8000);
+            renderPage();
+            return;
+        }
+        // Validate eagerly so a typo is caught now, not after a model run starts.
+        // Without a granted folder there is nothing to validate against, and
+        // saying so is more useful than silence.
+        if (value && !runtime.pathContextRoot) {
+            setToast('Path saved. Pick the project folder so Blueprint is allowed to read it.', 'info', 9000);
+        } else if (value) {
+            void checkPathContextExists(value);
+        }
+        renderHostSurfaces();
+        renderPage();
+    }
+
+    /**
+     * Resolve the typed path against the granted root WITHOUT reading any file
+     * contents, so the user learns about a typo before spending a run on it.
+     */
+    async function checkPathContextExists(rawPath) {
+        const rootHandle = runtime.pathContextRoot;
+        if (!rootHandle) return;
+        runtime.pathContextBusy = true;
+        renderPage();
+        try {
+            const { segments } = core.resolveContextSegments(rootHandle.name, rawPath);
+            const { handle, resolved, missing } = await core.resolveDirectoryPath(rootHandle, segments);
+            const rootName = String(rootHandle.name || 'project');
+            if (handle) {
+                const where = resolved.length ? `${rootName}/${resolved.join('/')}` : rootName;
+                setToast(`Path context: ${where} — will be read when a code-reading skill runs.`, 'success', 7000);
+            } else {
+                const where = resolved.length ? `${rootName}/${resolved.join('/')}` : rootName;
+                setToast(`No "${missing}" inside ${where}. Check the path.`, 'error', 12000);
+            }
+        } catch (error) {
+            setToast(`That path could not be checked: ${String((error && error.message) || error)}`, 'error', 10000);
+        } finally {
+            runtime.pathContextBusy = false;
+            renderPage();
+        }
+    }
+
+    /** Flip the toggle. Turning it ON with no grant starts the picker. */
+    function togglePathContext(forceState) {
+        const settings = core.readSettings();
+        const next = typeof forceState === 'boolean'
+            ? forceState
+            : settings.pathContextEnabled !== true;
+        settings.pathContextEnabled = next;
+        if (!core.writeSettings(settings)) {
+            setToast('That setting could not be saved.', 'error', 8000);
+            renderPage();
+            return;
+        }
+        renderHostSurfaces();
+        renderPage();
+        if (!next) {
+            setToast('Path context off — runs use only imported project files.', 'info', 5000);
+            return;
+        }
+        // Enabling with no path yet: send the user to the field rather than
+        // guessing a folder for them.
+        if (!String(settings.pathContextPath || '').trim()) {
+            setToast('Type the folder to read (for example TrainingModel), then run a skill.', 'info', 9000);
+            return;
+        }
+        if (!runtime.pathContextRoot) void pickPathContextRoot();
+    }
+
+    /** Ask for the folder that the typed path is relative to. */
+    async function pickPathContextRoot() {
+        if (operationBusy()) {
+            setToast('Finish the active operation before picking a folder.', 'warn');
+            return;
+        }
+        if (!core.canPickDirectoryHandle || !core.canPickDirectoryHandle()) {
+            // No File System Access API: there is no handle to grant, so a typed
+            // path cannot be read. Say that plainly instead of failing silently.
+            setToast('This browser cannot grant folder access, so a typed path cannot be read. '
+                + 'Import the folder instead.', 'error', 12000);
+            return;
+        }
+        let handle = null;
+        try {
+            handle = await window.showDirectoryPicker({ mode: 'read' });
+        } catch (error) {
+            if (error && error.name === 'AbortError') return;
+            setToast(`The folder could not be opened: ${String((error && error.message) || error)}`, 'error', 10000);
+            return;
+        }
+        if (!handle) return;
+        runtime.pathContextRoot = handle;
+        runtime.pathContextRootName = String(handle.name || '');
+        setToast(`Granted "${runtime.pathContextRootName}" — path context can now be read from it.`, 'success', 7000);
+        const path = String(core.readSettings().pathContextPath || '').trim();
+        if (path) void checkPathContextExists(path);
         renderPage();
     }
 
@@ -5378,6 +5556,19 @@
             case 'clear-attached-files':
                 clearAttachedFiles();
                 return;
+            case 'toggle-path-context':
+                togglePathContext();
+                return;
+            case 'pick-path-context-root':
+                void pickPathContextRoot();
+                return;
+            case 'recheck-path-context': {
+                const path = String(core.readSettings().pathContextPath || '').trim();
+                if (!path) { setToast('Type a folder path first.', 'info'); return; }
+                if (!runtime.pathContextRoot) { void pickPathContextRoot(); return; }
+                void checkPathContextExists(path);
+                return;
+            }
             case 'go-files':
                 goToSection('cb-files');
                 return;
@@ -5563,6 +5754,13 @@
             runtime.draft = target.value;
             return;
         }
+        // Path-context field: store the draft WITHOUT re-rendering so the caret
+        // and focus survive typing. The value is committed to settings on
+        // 'change' (blur/Enter), which is when a re-render is harmless.
+        if (target && target.dataset && target.dataset.cbRole === 'path-context-input') {
+            runtime.pathContextDraft = String(target.value || '');
+            return;
+        }
         if (target && target.dataset && target.dataset.cbSetting) {
             applySettingInput(target);
             return;
@@ -5676,6 +5874,15 @@
                 attachExistingFile(val);
                 target.value = '';
             }
+            return;
+        }
+
+        // Commit the path-context field on blur/Enter. Validating the path here
+        // (rather than at send time) gives immediate feedback: a typo reports
+        // which segment did not exist, instead of the user waiting for a run to
+        // fail.
+        if (target.dataset.cbRole === 'path-context-input') {
+            commitPathContextPath(String(target.value || ''));
             return;
         }
 

@@ -609,8 +609,15 @@
      *
      * Manually attached files are ALWAYS included verbatim, ahead of the
      * scored picks: an explicit user choice outranks the heuristic.
+     *
+     * `extra` optionally carries path-context records — files read live from a
+     * user-named subdirectory through a granted folder handle, never stored in
+     * the workspace. They merge into the same digest so one token budget covers
+     * both, and a live read WINS over a stored copy of the same path because
+     * the store may hold an older version from a previous import.
      */
-    function sourceFilesFromDigest(projectState, cfg) {
+    function sourceFilesFromDigest(projectState, cfg, extra) {
+        const extraRecords = Array.isArray(extra && extra.records) ? extra.records : [];
         const activeFolderId = projectState.activeFolderId
             || (core.store && core.store.activeFolderId);
 
@@ -643,6 +650,34 @@
             return !generated;
         });
         let targetRecords = nonGenerated.length ? nonGenerated : allRecords;
+
+        // Path-context records are read live from disk at run time. They join
+        // the digest here so ONE token budget covers stored + live source, and
+        // they replace any stored copy of the same path (the store can hold a
+        // stale import from before the file changed). Sensitive paths are
+        // already filtered inside collectPathContext, so re-checking here is
+        // defence in depth only.
+        let pathContextMerged = 0;
+        if (extraRecords.length) {
+            const liveByPath = new Map();
+            extraRecords.forEach(record => {
+                const path = String((record && record.path) || '');
+                if (!path || typeof record.content !== 'string') return;
+                if (typeof core.isSensitiveSourcePath === 'function'
+                    && core.isSensitiveSourcePath(path)) {
+                    if (!sensitiveRejected.some(entry => entry.path === path)) {
+                        sensitiveRejected.push({ path, reason: 'sensitive credential file' });
+                    }
+                    return;
+                }
+                liveByPath.set(path, { path, content: record.content, origin: 'path-context' });
+            });
+            if (liveByPath.size) {
+                targetRecords = targetRecords.filter(record => !liveByPath.has(record.path));
+                liveByPath.forEach(record => targetRecords.push(record));
+                pathContextMerged = liveByPath.size;
+            }
+        }
 
         const manualInput = (Array.isArray(projectState.sourceFiles) ? projectState.sourceFiles : [])
             .filter(item => item && item.path);
@@ -783,7 +818,12 @@
             scopeAnswer: scopeFilter.answer,
             scopeNote: scopeFilter.note,
             explicitWhole: scopeFilter.explicitWhole,
-            folderId: activeFolderId || ''
+            folderId: activeFolderId || '',
+            // Path-context transparency: how many files came from a live read
+            // of a user-named subdirectory rather than the stored workspace,
+            // plus that read's own stats (scanned/ranked/read/bytes/skips).
+            pathContextFiles: pathContextMerged,
+            pathContextStats: (extra && extra.stats) || null
         };
         return selected;
     }
@@ -800,20 +840,31 @@
      * In digest mode (Settings -> Source files -> Whole-codebase reading) the
      * selection is delegated to sourceFilesFromDigest(), which replaces the
      * file-count/byte caps with a token budget covering the whole project.
+     *
+     * `pathContext` carries records read live from a user-named subdirectory
+     * (Settings -> Source files -> Path context, or the Agent-page toggle). Its
+     * presence selects digest mode on its own: a live subtree is far larger
+     * than the attach caps, and the digest is the only engine that can bound
+     * it. The records merge into the same digest as stored source.
      */
-    function sourceFilesForModel(projectState, settings) {
+    function sourceFilesForModel(projectState, settings, pathContext) {
         const cfg = settings || core.readSettings();
         if (cfg.includeSourceInPrompts === false) return [];
 
         const scopeFilter = deriveScopeFilter(projectState.answers);
+        const liveRecords = Array.isArray(pathContext && pathContext.records)
+            ? pathContext.records : [];
+        const hasPathContext = liveRecords.length > 0;
 
         // Whole-codebase digest mode: the structural digest decides BOTH what
         // is described and which files get their full text attached, so the
         // attach limits below (maxSourceFiles/maxSourceTotalKb) do not apply.
         // Those limits describe how much manually attached source may crowd a
         // prompt; the digest has its own token budget for exactly that purpose.
-        if (cfg.sourceContextMode === 'digest' || scopeFilter.active || scopeFilter.explicitWhole) {
-            return sourceFilesFromDigest(projectState, cfg);
+        // A live path-context read also lands here, so one budget covers both.
+        if (cfg.sourceContextMode === 'digest' || scopeFilter.active
+            || scopeFilter.explicitWhole || hasPathContext) {
+            return sourceFilesFromDigest(projectState, cfg, hasPathContext ? pathContext : null);
         }
 
         const requestedAttachments = Array.isArray(projectState.sourceFiles)
@@ -1380,7 +1431,116 @@
 
         // ---- Source requirement gate --------------------------------
         if (skill.requiresSource) {
-            const attached = sourceFilesForModel(input, settings);
+            // Path context: read the user-named subdirectory LIVE, through the
+            // granted folder handle, at this moment rather than at import time.
+            // This is what lets a 10 GB subtree be described without ever
+            // entering the 2 MB workspace store. The read is cancellable via the
+            // run signal and always reports itself as a step, because a context
+            // read that silently produced nothing would leave the model
+            // reasoning about a folder it never saw.
+            let pathContext = null;
+            const contextWanted = Boolean(input.pathContext
+                && input.pathContext.enabled
+                && String(input.pathContext.path || '').trim());
+            if (contextWanted) {
+                const requested = String(input.pathContext.path).trim();
+                const reading = makeStep({
+                    kind: 'notice',
+                    label: 'Reading path context',
+                    summary: requested,
+                    status: 'running',
+                    icon: 'fa-folder-open'
+                });
+                emit(reading);
+                render();
+                try {
+                    const collected = await core.collectPathContext(
+                        input.pathContext.rootHandle, requested, {
+                            signal: input.signal,
+                            maxRecords: Number(settings.pathContextMaxFiles) || 400,
+                            maxTotalBytes: (Number(settings.pathContextTotalKb) || 6144) * 1024,
+                            maxFileBytes: (Number(settings.pathContextFileKb) || 256) * 1024,
+                            onProgress: (count, bytes) => {
+                                reading.summary = `${requested} · ${count.toLocaleString()} file(s), `
+                                    + core.formatBytes(bytes) + ' read';
+                                render();
+                            }
+                        }
+                    );
+                    pathContext = { records: collected.records, stats: collected.stats };
+                    const stats = collected.stats;
+                    if (stats.error && !collected.records.length) {
+                        finishStep(reading, 'error');
+                        reading.label = 'Path context was not read';
+                        reading.summary = stats.resolvedPath || requested;
+                        reading.text = [
+                            stats.error,
+                            '',
+                            'The run continues without that folder. '
+                            + 'Nothing from it was sent to the model.'
+                        ].join('\n');
+                        reading.error = stats.error;
+                        emit(reading);
+                        render();
+                        pathContext = null;
+                    } else {
+                        finishStep(reading, 'done');
+                        reading.label = 'Path context read';
+                        reading.summary = `${stats.resolvedPath} · `
+                            + `${stats.recordsRead.toLocaleString()} file(s), `
+                            + core.formatBytes(stats.bytesRead);
+                        const lines = [
+                            `Read live from disk: **${stats.resolvedPath}**`,
+                            '',
+                            `- Files found: ${stats.filesScanned.toLocaleString()}`,
+                            `- Files eligible after filtering: ${stats.filesRanked.toLocaleString()}`,
+                            `- Files read into context: ${stats.recordsRead.toLocaleString()}`,
+                            `- Bytes read: ${core.formatBytes(stats.bytesRead)}`
+                        ];
+                        if (stats.truncated) {
+                            lines.push('- The listing was cut short by the scan cap; '
+                                + 'deeper files were not enumerated.');
+                        }
+                        if (stats.stoppedAt === 'records') {
+                            lines.push(`- Stopped at the ${stats.recordsRead.toLocaleString()}-file cap. `
+                                + 'Narrow the path to see more of it.');
+                        }
+                        if (stats.skipped) {
+                            const skipParts = [];
+                            if (stats.skipped.oversize) skipParts.push(`${stats.skipped.oversize} over the per-file limit`);
+                            if (stats.skipped.extension) skipParts.push(`${stats.skipped.extension} non-source type`);
+                            if (stats.skipped.data) skipParts.push(`${stats.skipped.data} data file`);
+                            if (stats.skipped.vendored) skipParts.push(`${stats.skipped.vendored} vendored`);
+                            if (stats.skipped.sensitive) skipParts.push(`${stats.skipped.sensitive} credential path`);
+                            if (skipParts.length) lines.push(`- Skipped: ${skipParts.join(', ')}.`);
+                        }
+                        if (stats.unreadable) lines.push(`- ${stats.unreadable} file(s) were locked or vanished.`);
+                        reading.text = lines.join('\n');
+                        reading.open = false;
+                        emit(reading);
+                        render();
+                    }
+                } catch (error) {
+                    if (error instanceof core.BlueprintAbort || (error && error.code === 'aborted')) throw error;
+                    // A failed context read must not kill the run: the stored
+                    // project source may still be enough. Report and continue.
+                    finishStep(reading, 'error');
+                    reading.label = 'Path context could not be read';
+                    reading.summary = requested;
+                    reading.text = [
+                        String((error && error.message) || error),
+                        '',
+                        'The run continues using the imported project files only.'
+                    ].join('\n');
+                    reading.error = String((error && error.message) || error);
+                    emit(reading);
+                    render();
+                    pathContext = null;
+                }
+                throwIfAborted(input.signal);
+            }
+
+            const attached = sourceFilesForModel(input, settings, pathContext);
             if (attached.scopeError) {
                 const available = attached.scopeError.availablePaths || [];
                 const blocked = makeStep({

@@ -195,6 +195,25 @@
         digestBudgetTokens: 16000,
         digestMinFullTextLines: 40,
 
+        // Source files -> Path context
+        // A subdirectory named by the user and read at RUN TIME through a
+        // granted folder handle, so it never enters the 2 MB workspace store.
+        // The path navigates inside the granted root; a browser cannot open a
+        // typed absolute path without one.
+        pathContextEnabled: false,
+        pathContextPath: '',
+        // 400 files / 6 MB is the largest read that still leaves the digest
+        // engine responsive. Measured on the real work_on_rag-main tree:
+        // TrainingModel holds 2,572 importable files totalling 108.8 MB and
+        // GUI holds 23,914 totalling 325.8 MB, so reading everything is not
+        // possible and ranking has to decide what fits.
+        pathContextMaxFiles: 400,
+        pathContextTotalKb: 6144,
+        // 256 KB keeps one enormous generated file from eating the whole
+        // budget; 170 files in the real tree exceed 1 MB and are mostly
+        // branding PNGs, which are not source anyway.
+        pathContextFileKb: 256,
+
         // Data -> Storage & privacy
         showStorageUsage: true
     };
@@ -279,6 +298,15 @@
         // keeps room for a usable digest of a small project.
         settings.digestBudgetTokens = boundedInt(settings.digestBudgetTokens, 2048, 65536, DEFAULT_SETTINGS.digestBudgetTokens);
         settings.digestMinFullTextLines = boundedInt(settings.digestMinFullTextLines, 1, 2000, DEFAULT_SETTINGS.digestMinFullTextLines);
+        // Path context. The file cap and byte cap are independent limits: a
+        // subtree of thousands of small files hits the count first, while one
+        // of large modules hits the bytes first. Both are reported.
+        settings.pathContextMaxFiles = boundedInt(settings.pathContextMaxFiles, 1, 5000, DEFAULT_SETTINGS.pathContextMaxFiles);
+        settings.pathContextTotalKb = boundedInt(settings.pathContextTotalKb, 64, 65536, DEFAULT_SETTINGS.pathContextTotalKb);
+        settings.pathContextFileKb = boundedInt(settings.pathContextFileKb, 8, 4096, DEFAULT_SETTINGS.pathContextFileKb);
+        settings.pathContextPath = typeof settings.pathContextPath === 'string'
+            ? settings.pathContextPath.slice(0, 500)
+            : '';
 
         const enums = {
             fileNameStyle: ['date-slug', 'slug-date', 'slug'],
@@ -3208,6 +3236,30 @@
         /^\.?env(?:[-_.].*)?$/,
         /^\.?virtualenvs?$/,
         /^\.?pyenv(?:[-_.].*)?$/,
+        // INSTALLED third-party packages. Not the user's source, and enormous:
+        // one real project carried a vendored Python runtime whose
+        // site-packages alone consumed 120 of 246 context files — pip,
+        // setuptools and llama_cpp instead of the GUI code being analysed.
+        /^site-packages$/,
+        /^__pypackages__$/,
+        /^.*\.dist-info$/,
+        /^.*\.egg-info$/,
+        /^.*\.egg-link$/,
+        // Package-manager caches. Same class of noise: a real project carried
+        // .npm-cache/_npx/<hash>/package-lock.json into a code review.
+        /^\.?npm[-_]cache$/,
+        /^_npx$/,
+        /^\.?yarn[-_](?:cache|berry|unplugged)$/,
+        /^\.?pnpm[-_](?:store|cache)$/,
+        // Only the DOTTED forms: `.gradle`, `.m2`, `.cargo` are always caches,
+        // while a bare `gradle/` directory is often real project config
+        // (gradle-wrapper.properties, version catalogues) that a review needs.
+        // Dropping real source is worse than importing noise.
+        /^\.(?:gradle|m2|nuget|cargo|go|ivy)(?:[-_.].*)?$/,
+        // Model/asset caches in Hugging Face hub layout (models--org--name).
+        // Weight and cache directories are not source.
+        /^models--.+$/,
+        /^\.?no_exist$/,
         // Tool caches and scratch output
         /^\.?(?:mypy|pytest|ruff|pytype|pyre|tox|nox|eslint|prettier)_(?:cache|tmp)(?:[-_.].*)?$/,
         /^\.?(?:cache|tmp|temp)(?:[-_.].*)?$/,
@@ -3215,7 +3267,10 @@
         // Extracted/unpacked binaries and packaging intermediates
         /^.*\.exe_extracted$/,
         /^.*[-_](?:extracted|unpacked|decompiled)$/,
-        /^electron[-_](?:dist|build|smoke)(?:[-_.].*)?$/
+        /^electron[-_](?:dist|build|smoke)(?:[-_.].*)?$/,
+        // Build output. `dist` was already skipped by exact name; suffixed
+        // variants (dist-web, dist-assets) are the same generated bundle.
+        /^dist(?:[-_.].*)?$/
     ];
 
     /**
@@ -3302,7 +3357,45 @@
         'license', 'readme', 'changelog', '.gitignore', '.dockerignore', '.editorconfig'
     ]);
 
-    /** High-confidence credential paths that must never enter model context. */
+    /**
+     * High-confidence credential paths that must never enter model context.
+     *
+     * Credential-ish WORDS are matched anywhere in the filename, but only for
+     * DATA and config files — never for source code. The distinction is the
+     * whole point:
+     *
+     *   GUI/data/discord_credentials.dpapi.json  -> a secret store. Refuse.
+     *   GUI/secure_credentials.py                -> CODE ABOUT credentials.
+     *   tests/test_secure_endpoint_credentials.py   Keep. Refusing it would
+     *                                              blind a security review to
+     *                                              exactly the file that tests
+     *                                              credential handling.
+     *
+     * A previous version anchored the word match at the START of the basename,
+     * so `discord_credentials.dpapi.json` slipped through and was imported into
+     * the workspace and into prompts.
+     */
+    const CREDENTIAL_WORD_PATTERN = /(?:secret|credential|passw(?:or)?d|api[-_]?key|token|private[-_]?key|auth[-_]?token|access[-_]?key|signing[-_]?key|dpapi|keychain|keyring|keystore)/;
+    /** Extensions that hold DATA rather than logic: a secret store, not source. */
+    const CREDENTIAL_DATA_EXTENSIONS = new Set([
+        'json', 'jsonc', 'yaml', 'yml', 'toml', 'ini', 'cfg', 'conf', 'config',
+        'env', 'properties', 'txt', 'csv', 'tsv', 'xml', 'dat', 'db', 'sqlite',
+        'sqlite3', 'bak', 'backup', 'dump', 'gpg', 'enc', 'p12', 'pfx'
+    ]);
+
+    /**
+     * True when a filename's extension marks it as SOURCE CODE rather than data.
+     * Derived from CODE_EXTENSIONS so the two lists cannot drift: a language the
+     * digest understands is by definition code about a subject, not a store of
+     * that subject's values.
+     */
+    function isSourceCodeExtension(basename) {
+        const name = String(basename || '').toLowerCase();
+        const dot = name.lastIndexOf('.');
+        if (dot < 0) return false;
+        return CODE_EXTENSIONS.indexOf(name.slice(dot + 1)) >= 0;
+    }
+
     function isSensitiveSourcePath(path) {
         const normalized = String(path || '').replace(/\\/g, '/').replace(/^\/+/, '').toLowerCase();
         const parts = normalized.split('/').filter(Boolean);
@@ -3312,8 +3405,23 @@
             && !/\.(example|sample|template|dist)$/.test(base))) return true;
         if (['.npmrc', '.pypirc', '.netrc', '.dockercfg', 'id_rsa', 'id_dsa', 'id_ed25519',
             'credentials', 'credentials.json', 'service-account.json'].includes(base)) return true;
-        if (/^(?:secrets?|credentials?|service[-_]?account|firebase[-_]?adminsdk)(?:\.|-|_)/.test(base)) return true;
+        // Leading credential words (`secrets.yaml`, `credentials.json`,
+        // `service-account.json`) are matched anywhere in the name, but ONLY for
+        // data files. Applying this start-anchored rule to source as well
+        // refused real code — `credentials_service.py` and `secret_rotator.py`
+        // are the modules that HANDLE credentials, and a security review needs
+        // exactly those. Dropping real source is the worse error.
+        if (/^(?:secrets?|credentials?|service[-_]?account|firebase[-_]?adminsdk)(?:\.|-|_)/.test(base)
+            && !isSourceCodeExtension(base)) return true;
         if (/\.(?:pem|key|p12|pfx|jks|keystore|kdbx)$/.test(base)) return true;
+        // Credential-ish words anywhere in the name, restricted to data files.
+        // An extensionless name counts as data (`.gitignore`-style dotfiles,
+        // `credentials`, `token`); source extensions are exempt by design.
+        if (CREDENTIAL_WORD_PATTERN.test(base) && !isSourceCodeExtension(base)) {
+            const dot = base.lastIndexOf('.');
+            const extension = dot > 0 ? base.slice(dot + 1) : '';
+            if (!extension || CREDENTIAL_DATA_EXTENSIONS.has(extension)) return true;
+        }
         return false;
     }
 
@@ -4324,6 +4432,306 @@
             }
         }
         return out;
+    }
+
+    // ------------------------------------------------------------------
+    // Path context (a typed subdirectory, read at run time)
+    //
+    // WHY THIS EXISTS
+    // Folder import stores file CONTENT in the workspace, so it is capped at
+    // IMPORT_MAX_TOTAL_KB (2 MB). On a real project that cap is the binding
+    // constraint, not pruning: work_on_rag-main holds 9.9 GB under
+    // TrainingModel and 27 GB under GUI, of which 108 MB and 326 MB is
+    // importable text. Importing "the whole folder" verbatim is not possible
+    // in browser storage, so the Project Files pane can only ever show a
+    // 2 MB slice and the agent only ever sees that slice.
+    //
+    // This path gives the user the other half: name a subdirectory and have
+    // the code-reading skills see it, without storing it. The walk is
+    // metadata-only (collectFilesFromDirectoryHandle calls getFile() for
+    // size/name and never .text()), so enumerating a 10 GB subtree costs
+    // directory listings, not reads. Text is then read ONLY for the files
+    // that survive ranking, up to a small byte cap, and handed to the digest
+    // engine — which is exactly what it was built for.
+    //
+    // A browser cannot open a typed "D:\..." path cold: the File System
+    // Access API grants access through a user-picked handle only. So the
+    // typed path NAVIGATES WITHIN an already-granted root, and the caller
+    // keeps that root alive for the session.
+    // ------------------------------------------------------------------
+
+    /** Extensions that carry structure but almost never explain a system. */
+    const CONTEXT_LOW_VALUE_EXTENSIONS = new Set(['csv', 'tsv', 'svg', 'xml']);
+
+    /**
+     * Turn a typed path into segments relative to the granted root.
+     *
+     * Accepts every shape a user actually types — `TrainingModel`,
+     * `TrainingModel/coyote`, `D:\PyMu\work_on_rag-main\TrainingModel`,
+     * `/TrainingModel`, `work_on_rag-main/TrainingModel` — because the
+     * granted root's own absolute path is NOT exposed by the File System
+     * Access API and cannot be subtracted directly.
+     *
+     * The rule: if the root's NAME appears anywhere in the typed path, take
+     * everything after its LAST occurrence (that is the root boundary, and
+     * using the last occurrence survives an absolute prefix). Otherwise the
+     * whole path is already relative to the root. Drive letters and empty
+     * segments are dropped either way.
+     */
+    function resolveContextSegments(rootName, rawPath) {
+        const segments = String(rawPath || '')
+            .replace(/\\/g, '/')
+            .split('/')
+            .map(part => part.trim())
+            // A Windows drive is `D:` — drop it, but never a bare `.` or `..`,
+            // which would otherwise be handed to getDirectoryHandle and throw.
+            .filter(part => part && !/^[a-z]:$/i.test(part));
+        if (!segments.length) return { segments: [], matchedRoot: false };
+        const root = String(rootName || '').toLowerCase();
+        if (!root) return { segments, matchedRoot: false };
+        let lastRootIndex = -1;
+        segments.forEach((part, index) => {
+            if (part.toLowerCase() === root) lastRootIndex = index;
+        });
+        if (lastRootIndex < 0) return { segments, matchedRoot: false };
+        return { segments: segments.slice(lastRootIndex + 1), matchedRoot: true };
+    }
+
+    /**
+     * Walk down a granted root one segment at a time.
+     *
+     * Returns `{ handle, resolved, missing }` where `resolved` is the deepest
+     * prefix that existed, so a typo can be reported against the part the user
+     * actually got wrong instead of a bare "not found".
+     */
+    async function resolveDirectoryPath(rootHandle, segments) {
+        let handle = rootHandle;
+        const resolved = [];
+        for (const segment of segments) {
+            if (!handle || typeof handle.getDirectoryHandle !== 'function') {
+                return { handle: null, resolved, missing: segment };
+            }
+            let next = null;
+            try {
+                next = await handle.getDirectoryHandle(segment, { create: false });
+            } catch (_) {
+                next = null;
+            }
+            if (!next) return { handle: null, resolved, missing: segment };
+            handle = next;
+            resolved.push(segment);
+        }
+        return { handle, resolved, missing: '' };
+    }
+
+    /**
+     * Rank a metadata-only file list for context value, BEFORE any read.
+     *
+     * Smallest-first is the wrong order: on the real GUI subtree it selects
+     * 7,558 near-empty files and never reaches the 13,204 substantive Python
+     * modules. Ranking is therefore path- and size-based, using only what the
+     * walk already returned, so no bytes are touched to decide what to read.
+     */
+    function rankContextFiles(files, options) {
+        const cfg = options || {};
+        const maxFileBytes = Number.isFinite(Number(cfg.maxFileBytes))
+            ? Math.max(1024, Number(cfg.maxFileBytes)) : 256 * 1024;
+        const importable = new Set(IMPORTABLE_EXTENSIONS);
+        const implementation = new Set(IMPLEMENTATION_EXTENSIONS);
+        const entryNames = new Set(ENTRY_FILE_NAMES.map(name => name.toLowerCase()));
+
+        const ranked = [];
+        const skipped = { sensitive: 0, vendored: 0, extension: 0, oversize: 0, data: 0 };
+        (Array.isArray(files) ? files : []).forEach(file => {
+            const relativePath = String((file && file.relativePath) || '');
+            if (!relativePath) { skipped.extension += 1; return; }
+            // Reuse the import-time guards so a typed path cannot smuggle a
+            // credential or a vendored tree into a prompt.
+            if (isSensitiveSourcePath(relativePath)) { skipped.sensitive += 1; return; }
+            if (isVendoredPath(relativePath)) { skipped.vendored += 1; return; }
+            const extension = extensionOf(relativePath).toLowerCase();
+            if (!importable.has(extension)) { skipped.extension += 1; return; }
+            const size = Number(file.size) || 0;
+            // Data files are bytes without structure. One 12-file CSV set was
+            // 35.7 MB of the 108 MB importable total under TrainingModel.
+            if (CONTEXT_LOW_VALUE_EXTENSIONS.has(extension) && size > 8 * 1024) {
+                skipped.data += 1; return;
+            }
+            if (size > maxFileBytes) { skipped.oversize += 1; return; }
+            if (size <= 0) { skipped.oversize += 1; return; }
+
+            const leaf = relativePath.split('/').pop().toLowerCase();
+            const depth = relativePath.split('/').length;
+            let score = 0;
+            if (entryNames.has(leaf)) score += 12;
+            if (/^(router|main|app|index|controller|core|server|agent|config|settings)\b/i.test(leaf)) score += 8;
+            if (implementation.has(extension)) score += 6;
+            if (extension === 'md' || extension === 'txt') score += 3;
+            // Shallower files describe the system; deeply nested ones describe
+            // a detail. Bounded so depth never outranks an entry point.
+            score += Math.max(0, 6 - depth);
+            // Prefer files with substance, but cap the bonus so one huge file
+            // does not outrank the module that imports it.
+            score += Math.min(4, Math.log10(Math.max(1, size)) - 2);
+            ranked.push({ file, relativePath, size, score, extension });
+        });
+
+        ranked.sort((left, right) => {
+            if (right.score !== left.score) return right.score - left.score;
+            return String(left.relativePath).localeCompare(String(right.relativePath), undefined, { numeric: true });
+        });
+        return { ranked, skipped };
+    }
+
+    /**
+     * Read the ranked candidates up to the caps, returning digest-ready
+     * records `{ path, content }`.
+     *
+     * Stops on the FIRST cap reached so a huge subtree degrades into "the
+     * most valuable files that fit" rather than hanging the tab. Every
+     * exclusion is counted and reported — the digest contract is that
+     * omissions are disclosed, never silent.
+     */
+    async function readContextRecords(ranked, options) {
+        const cfg = options || {};
+        const maxRecords = Number.isFinite(Number(cfg.maxRecords))
+            ? Math.max(1, Number(cfg.maxRecords)) : 400;
+        const maxTotalBytes = Number.isFinite(Number(cfg.maxTotalBytes))
+            ? Math.max(4096, Number(cfg.maxTotalBytes)) : 6 * 1024 * 1024;
+        const perFileTimeoutMs = Number.isFinite(Number(cfg.perFileTimeoutMs))
+            ? Number(cfg.perFileTimeoutMs) : 15000;
+        const signal = cfg.signal || null;
+        const onProgress = typeof cfg.onProgress === 'function' ? cfg.onProgress : null;
+
+        const records = [];
+        let totalBytes = 0;
+        const counts = { read: 0, unreadable: 0, capRecords: 0, capBytes: 0 };
+        let stopped = '';
+        for (const entry of ranked) {
+            if (signal && signal.aborted) { stopped = 'aborted'; break; }
+            if (records.length >= maxRecords) {
+                counts.capRecords = ranked.length - records.length - counts.unreadable;
+                stopped = 'records';
+                break;
+            }
+            if (totalBytes + entry.size > maxTotalBytes) {
+                // Skip this one but keep looking: a later, smaller file may
+                // still fit and be more valuable than giving up entirely.
+                counts.capBytes += 1;
+                continue;
+            }
+            let text = '';
+            try {
+                text = await readAsText(entry.file, signal, perFileTimeoutMs);
+            } catch (error) {
+                if (error && error.code === 'aborted') { stopped = 'aborted'; break; }
+                counts.unreadable += 1;
+                continue;
+            }
+            counts.read += 1;
+            totalBytes += text.length;
+            records.push({ path: entry.relativePath, content: text });
+            if (onProgress) onProgress(counts.read, totalBytes);
+        }
+        return { records, totalBytes, counts, stopped };
+    }
+
+    /**
+     * Full path-context pipeline: resolve the typed path inside the granted
+     * root, walk it (metadata only), rank, then read within the caps.
+     *
+     * Returns records ready for buildCodebaseDigest plus a `stats` object the
+     * UI and run trace can show, so "it silently read nothing" is impossible.
+     */
+    async function collectPathContext(rootHandle, rawPath, options) {
+        const cfg = options || {};
+        const stats = {
+            requested: String(rawPath || '').trim(),
+            resolvedPath: '',
+            missingSegment: '',
+            filesScanned: 0,
+            filesRanked: 0,
+            recordsRead: 0,
+            bytesRead: 0,
+            unreadable: 0,
+            skipped: null,
+            truncated: false,
+            stoppedAt: '',
+            error: ''
+        };
+        if (!rootHandle || typeof rootHandle.getDirectoryHandle !== 'function') {
+            stats.error = 'No project folder is available to read that path from. '
+                + 'Import a folder (or pick the context root) first — a browser cannot '
+                + 'open a typed path without a granted folder.';
+            return { records: [], stats };
+        }
+
+        const { segments } = resolveContextSegments(rootHandle.name, rawPath);
+        const { handle, resolved, missing } = await resolveDirectoryPath(rootHandle, segments);
+        const rootName = String(rootHandle.name || 'project');
+        stats.resolvedPath = resolved.length ? rootName + '/' + resolved.join('/') : rootName;
+        if (!handle) {
+            stats.missingSegment = missing;
+            stats.error = missing
+                ? `No "${missing}" inside ${stats.resolvedPath}. Check the spelling, or pick a path that exists in the granted folder.`
+                : 'That path could not be read.';
+            return { records: [], stats };
+        }
+
+        // Reuse the shipped walker: it brings venv/PyInstaller marker pruning,
+        // priority ordering, locked-directory tolerance and cancellation with
+        // it, so a typed path gets the same protections as an import.
+        const scan = await collectFilesFromDirectoryHandle(handle, Object.assign({}, cfg, {
+            maxFiles: Number.isFinite(Number(cfg.maxScanFiles)) ? Number(cfg.maxScanFiles) : 20000,
+            maxEntries: Number.isFinite(Number(cfg.maxScanEntries)) ? Number(cfg.maxScanEntries) : 60000
+        }));
+        if (scan.error && !scan.files.length) {
+            stats.error = scan.error;
+            return { records: [], stats };
+        }
+        stats.filesScanned = scan.files.length;
+        stats.truncated = Boolean(scan.truncated);
+
+        // REBASE onto the project-relative path. The walker prefixes every path
+        // with the handle it was given — here the SUBTREE's name (`coyote/…`),
+        // because that is the handle we descended to. But stored workspace paths
+        // are relative to the granted ROOT (`TrainingModel/coyote/…`, root name
+        // stripped). If the two disagreed, a live read could never match the
+        // stored copy of the same file: the digest would carry BOTH, one of them
+        // stale, and a scope filter or run trace would name a path the project
+        // does not have. Strip the subtree prefix and prepend the resolved path
+        // so live and stored paths are the same key.
+        const subtreePrefix = String(handle.name || '') + '/';
+        const resolvedPrefix = resolved.length ? resolved.join('/') + '/' : '';
+        scan.files.forEach(file => {
+            const raw = String(file.relativePath || '');
+            const tail = raw.startsWith(subtreePrefix) ? raw.slice(subtreePrefix.length) : raw;
+            file.relativePath = resolvedPrefix + tail;
+        });
+
+        const { ranked, skipped } = rankContextFiles(scan.files, cfg);
+        stats.filesRanked = ranked.length;
+        stats.skipped = skipped;
+        if (!ranked.length) {
+            stats.error = 'Nothing readable under ' + stats.resolvedPath
+                + ' — every file there was a credential path, vendored code, an '
+                + 'unsupported type, or larger than the per-file limit.';
+            return { records: [], stats };
+        }
+
+        const read = await readContextRecords(ranked, cfg);
+        stats.recordsRead = read.records.length;
+        stats.bytesRead = read.totalBytes;
+        stats.unreadable = read.counts.unreadable;
+        stats.stoppedAt = read.stopped;
+        if (!read.records.length) {
+            stats.error = 'Files were found under ' + stats.resolvedPath
+                + ' but none could be read'
+                + (read.counts.unreadable ? ` (${read.counts.unreadable} were locked or vanished)` : '')
+                + '.';
+            return { records: [], stats };
+        }
+        return { records: read.records, stats };
     }
 
     /** Read a File/Blob as UTF-8 text without letting one OS read wedge the app. */
@@ -7552,6 +7960,11 @@
         isUnderGeneratedRoot,
         isUnderVenvRoot,
         sortFlatListByPriority,
+        resolveContextSegments,
+        resolveDirectoryPath,
+        rankContextFiles,
+        readContextRecords,
+        collectPathContext,
         relativePathOf,
         extensionOf,
         suggestedFolderName,
