@@ -3192,6 +3192,107 @@
         'vendor', 'bower_components', '.next', '.nuxt', '.cache', 'coverage', '.gradle'
     ];
 
+    /**
+     * Name PATTERNS for generated directories. The list above matches exact
+     * names only, which is not enough in practice: a real machine carries
+     * `.venv`, `.venv-gemma4`, `.venv-py314-backup-20260703-080727` and
+     * `.venv-snowfox-gemma4-rocm` side by side, and `indexOf('.venv-gemma4')`
+     * returns -1. One such directory held 36,050 files — enough to exhaust the
+     * entire import budget on interpreter internals while the user's own source
+     * was never reached. Patterns are kept to shapes that are unambiguously
+     * generated, so a real source directory is never dropped by mistake.
+     */
+    const IMPORT_SKIP_DIR_PATTERNS = [
+        // Python virtualenvs: venv, .venv, venv-foo, .venv-py314-backup-*
+        /^\.?venv(?:[-_.].*)?$/,
+        /^\.?env(?:[-_.].*)?$/,
+        /^\.?virtualenvs?$/,
+        /^\.?pyenv(?:[-_.].*)?$/,
+        // Tool caches and scratch output
+        /^\.?(?:mypy|pytest|ruff|pytype|pyre|tox|nox|eslint|prettier)_(?:cache|tmp)(?:[-_.].*)?$/,
+        /^\.?(?:cache|tmp|temp)(?:[-_.].*)?$/,
+        /^\.?(?:pytest|test)_(?:tmp|cache)(?:[-_.].*)?$/,
+        // Extracted/unpacked binaries and packaging intermediates
+        /^.*\.exe_extracted$/,
+        /^.*[-_](?:extracted|unpacked|decompiled)$/,
+        /^electron[-_](?:dist|build|smoke)(?:[-_.].*)?$/
+    ];
+
+    /**
+     * A file whose presence proves the containing directory is a Python
+     * virtualenv, whatever it happens to be named. Name patterns are a
+     * heuristic; this is definitive, and it is what catches a venv named after
+     * a model or a date that no pattern could anticipate.
+     */
+    const VENV_MARKER_FILES = new Set(['pyvenv.cfg']);
+
+    /**
+     * Markers proving the containing directory is a FROZEN PYTHON BUNDLE
+     * (PyInstaller / Nuitka): a vendored interpreter plus thousands of
+     * third-party .py, .pyd and .h files.
+     *
+     * These are invisible to name patterns. A real tree carried
+     * `electron_app/backend/_internal` (6,882 files) and
+     * `electron_app/backend/ragworkspace-service/_internal` (6,077) — neither
+     * name says "generated" — and together they consumed the entire 10,000-file
+     * scan cap before GUI, TrainingModel or tools were ever reached.
+     *
+     * base_library.zip is PyInstaller's own bootstrap archive and never appears
+     * in source trees; verified across a whole real project, every occurrence
+     * sat inside a bundle or a build output.
+     */
+    const FROZEN_BUNDLE_MARKER_FILES = new Set(['base_library.zip']);
+
+    /**
+     * True when a directory listing contains a marker proving the directory is a
+     * generated tree (a virtualenv or a frozen interpreter bundle) rather than
+     * project source. `fileNames` must already be lowercased.
+     */
+    function isGeneratedTreeMarker(fileNames) {
+        const iterator = fileNames.values ? fileNames.values() : fileNames;
+        let entry = iterator.next();
+        while (!entry.done) {
+            const name = String(entry.value);
+            if (VENV_MARKER_FILES.has(name) || FROZEN_BUNDLE_MARKER_FILES.has(name)) return true;
+            entry = iterator.next();
+        }
+        return false;
+    }
+
+    /** True when a directory NAME alone is enough to skip it. */
+    function isSkippedDirName(name) {
+        const clean = String(name || '').toLowerCase();
+        if (!clean) return false;
+        if (IMPORT_SKIP_DIRS.indexOf(clean) >= 0) return true;
+        return IMPORT_SKIP_DIR_PATTERNS.some(pattern => pattern.test(clean));
+    }
+
+    /**
+     * Walk priority, lower first. Determines what survives when the import
+     * budget runs out — which is the whole point, because a budget cut that
+     * lands on generated directories loses nothing the user cares about, while
+     * the same cut landing first loses their actual source.
+     *
+     * Dot-directories sort last because they are overwhelmingly tool state,
+     * caches and agent scratch space. `.github` and `.vscode` are the notable
+     * exceptions, and they are tiny, so deferring them costs nothing.
+     */
+    function walkPriority(name, kind) {
+        const hidden = isHiddenPathSegment(name);
+        if (kind === 'file') return hidden ? 2 : 0;
+        return hidden ? 3 : 1;
+    }
+
+    /** Stable priority sort. Falls back to name so results are reproducible. */
+    function sortByWalkPriority(entries, kindOf, nameOf) {
+        return entries.slice().sort((left, right) => {
+            const leftPriority = walkPriority(nameOf(left), kindOf(left));
+            const rightPriority = walkPriority(nameOf(right), kindOf(right));
+            if (leftPriority !== rightPriority) return leftPriority - rightPriority;
+            return String(nameOf(left)).localeCompare(String(nameOf(right)), undefined, { numeric: true });
+        });
+    }
+
     const SENSITIVE_SOURCE_DIRS = new Set([
         '.aws', '.azure', '.gnupg', '.ssh', '.kube', '.docker', '.terraform',
         '.git', '.hg', '.svn'
@@ -3312,11 +3413,111 @@
         return raw.replace(/\\/g, '/').replace(/^\/+/, '');
     }
 
+    /**
+     * True when a path passes through a directory that should never be
+     * imported. Only the DIRECTORY components are tested — never the final
+     * segment, which is the file itself. Testing the basename too would apply
+     * directory rules to files: a legitimate `secure/.env.example` template was
+     * pruned because `.env.example` looks like a virtualenv directory name, and
+     * `README/build` would have been dropped by the `build` entry. Files are
+     * policed by the extension allow-list and the credential checks instead.
+     */
     function isSkippedPath(relativePath) {
-        const parts = String(relativePath || '').split('/').map(part => part.toLowerCase());
-        // Drop the leading directory (the folder the user picked) for the check,
-        // but still catch a skipped dir at any depth.
-        return parts.some(part => IMPORT_SKIP_DIRS.indexOf(part) >= 0);
+        const parts = String(relativePath || '')
+            .split('/')
+            .filter(part => part !== '')
+            .map(part => part.toLowerCase());
+        if (parts.length <= 1) return false; // only a filename: no directories
+        const directories = parts.slice(0, -1);
+        return directories.some(part => isSkippedDirName(part));
+    }
+
+    /**
+     * The directories in a flat <input webkitdirectory> FileList that are
+     * GENERATED trees — a Python virtualenv (pyvenv.cfg) or a frozen
+     * interpreter bundle (base_library.zip). The FS Access walker checks these
+     * markers while descending; a flat list has no descent, so derive the set of
+     * generated roots up front and skip anything beneath one.
+     *
+     * Returns { roots, kinds }: kinds maps a root to 'venv' or 'bundle' so the
+     * caller can describe a directly-picked generated folder accurately.
+     */
+    function generatedRootsFromFlatList(files) {
+        const roots = new Set();
+        const kinds = new Map();
+        for (let index = 0; index < files.length; index += 1) {
+            const relativePath = relativePathOf(files[index]);
+            if (!relativePath) continue;
+            const baseName = relativePath.split('/').pop().toLowerCase();
+            let kind = '';
+            if (VENV_MARKER_FILES.has(baseName)) kind = 'venv';
+            else if (FROZEN_BUNDLE_MARKER_FILES.has(baseName)) kind = 'bundle';
+            if (!kind) continue;
+            const parent = relativePath.slice(0, relativePath.length - baseName.length);
+            // '' means the picked root itself is the generated tree.
+            roots.add(parent);
+            // A venv verdict wins if both markers ever appear under one root.
+            if (kinds.get(parent) !== 'venv') kinds.set(parent, kind);
+        }
+        return { roots, kinds };
+    }
+
+    /** Kept for callers/tests that only care about the venv case. */
+    function venvRootsFromFlatList(files) {
+        return generatedRootsFromFlatList(files).roots;
+    }
+
+    /**
+     * True when a flat relative path sits inside one of the generated roots
+     * (a virtualenv or a frozen interpreter bundle).
+     */
+    function isUnderGeneratedRoot(relativePath, generatedRoots) {
+        if (!generatedRoots || !generatedRoots.size) return false;
+        const path = String(relativePath || '');
+        const iterator = generatedRoots.values();
+        let entry = iterator.next();
+        while (!entry.done) {
+            const root = String(entry.value);
+            if (!root) return true; // the picked root is itself generated
+            if (path.startsWith(root)) return true;
+            entry = iterator.next();
+        }
+        return false;
+    }
+
+    /** Alias kept for existing callers and tests. */
+    function isUnderVenvRoot(relativePath, generatedRoots) {
+        return isUnderGeneratedRoot(relativePath, generatedRoots);
+    }
+
+    /**
+     * A path segment counts as hidden only when it is a real dot-name. Bare '.'
+     * and '..' are navigation artifacts that browsers leave in
+     * webkitRelativePath; treating them as hidden demoted ordinary files.
+     */
+    function isHiddenPathSegment(segment) {
+        const clean = String(segment || '');
+        return clean.startsWith('.') && clean !== '.' && clean !== '..';
+    }
+
+    /**
+     * Order a flat FileList so real source is read before generated and hidden
+     * files. The legacy input path cannot prune directories during a descent,
+     * so this is its equivalent of the walker's priority ordering: when the byte
+     * budget runs out mid-list, it has already taken the files that matter.
+     *
+     * The comparison is by priority ONLY. Array.prototype.sort is stable, so
+     * files in the same band keep the browser's enumeration order. Alphabetizing
+     * the tiebreak instead would silently change which file wins when distinct
+     * picker paths canonicalize to one VFS path ('a.txt' vs ' a.txt' vs './a.txt')
+     * — a contract the alias-collapse test pins to the FIRST enumerated file.
+     */
+    function sortFlatListByPriority(files) {
+        const priorityOf = file => {
+            const parts = relativePathOf(file).split('/');
+            return parts.some(isHiddenPathSegment) ? 1 : 0;
+        };
+        return files.slice().sort((left, right) => priorityOf(left) - priorityOf(right));
     }
 
     /**
@@ -3341,7 +3542,24 @@
         }, options || {});
         const upstreamIncompleteReason = clampText(String(cfg.incompleteReason || '').trim(), 500);
 
-        const list = Array.prototype.slice.call(files || []);
+        const list = sortFlatListByPriority(Array.prototype.slice.call(files || []));
+        // Generated trees in a flat list, detected by their marker files so a venv
+        // named `.venv-gemma4` or a frozen bundle named `_internal` is caught as
+        // reliably as one named `.venv`. Without this, tens of thousands of
+        // vendored interpreter files consume the whole budget before any project
+        // source is read.
+        const generated = generatedRootsFromFlatList(list);
+        const venvRoots = generated.roots;
+        // On the flat path every webkitRelativePath carries the picked root as
+        // its first segment, so a generated root of exactly ONE segment means the
+        // user picked that generated tree itself. ('' never appears here, unlike
+        // in the handle walker, where the root has no prefix.)
+        const directGeneratedRoot = Array.from(venvRoots).find(root => {
+            const clean = String(root || '').replace(/\/+$/, '');
+            return clean === '' || clean.split('/').length === 1;
+        });
+        const directGeneratedKind = directGeneratedRoot === undefined
+            ? '' : String(generated.kinds.get(directGeneratedRoot) || 'venv');
         // `notEnumerated` counts files past the point where a budget was hit. They
         // are deliberately NOT pushed into `skipped`: doing that built an array of
         // one entry per remaining file, so a directory with hundreds of thousands
@@ -3359,6 +3577,14 @@
             skippedTotal: 0,
             notEnumerated: 0,
             truncatedByBudget: false,
+            // The picked folder is itself a generated tree (a virtualenv or a
+            // frozen interpreter bundle), so nothing in it is project source.
+            // Reported with a message that tells the user to pick the containing
+            // project instead of "no files in it".
+            rootIsVenv: directGeneratedKind === 'venv',
+            rootIsFrozenBundle: directGeneratedKind === 'bundle',
+            // Count of files dropped because they sat inside a generated tree.
+            generatedSkipped: 0,
             // Set when localStorage refused a chunk. Distinct from
             // truncatedByBudget: that is a configured limit the user can raise in
             // Settings, this is a hard browser limit they cannot.
@@ -3564,6 +3790,15 @@
 
             if (isSkippedPath(relativePath)) {
                 noteSkip(relativePath, 'ignored directory');
+                continue;
+            }
+            // Inside a generated tree identified by its marker file (pyvenv.cfg
+            // for a virtualenv, base_library.zip for a frozen bundle). Counted
+            // separately and NOT passed to noteSkip: a single such tree can hold
+            // tens of thousands of files, and they are one homogeneous reason
+            // rather than tens of thousands of individual skips worth reporting.
+            if (isUnderVenvRoot(relativePath, venvRoots)) {
+                result.generatedSkipped += 1;
                 continue;
             }
             if (isSensitiveSourcePath(relativePath)) {
@@ -3826,6 +4061,8 @@
             lockedDirs: 0,
             lockedSample: [],
             truncated: false,
+            rootIsVenv: false,
+            rootIsFrozenBundle: false,
             maxFiles,
             maxEntries,
             scannedEntries: 0,
@@ -3910,6 +4147,13 @@
                 if (!iterator || typeof iterator.next !== 'function') {
                     throw new Error('directory iterator is unavailable');
                 }
+                // Collect this directory's listing FIRST, then order it before
+                // descending. Processing entries in raw filesystem order meant
+                // dot-directories (which sort before letters) were walked first,
+                // so one large generated directory — a 36,050-file virtualenv —
+                // exhausted the entire budget before any real source was reached.
+                const entries = [];
+                let sawMarkerKind = '';
                 while (!out.truncated) {
                     const next = await awaitScanOperation(iterator.next(), 'directory listing');
                     if (!next || next.done) break;
@@ -3935,10 +4179,68 @@
 
                     const name = String((entry && entry.name) || '');
                     if (!name) continue;
+                    entries.push(entry);
+                    // A marker file at THIS level proves the directory being
+                    // walked is generated rather than project source, whatever it
+                    // is named. Name patterns catch the common cases cheaply and
+                    // are checked before we ever descend, so this backstop only
+                    // costs a listing for a tree whose name says nothing.
+                    if (entry.kind === 'file') {
+                        const lowerName = name.toLowerCase();
+                        if (VENV_MARKER_FILES.has(lowerName)) sawMarkerKind = 'venv';
+                        else if (FROZEN_BUNDLE_MARKER_FILES.has(lowerName)) {
+                            // Never downgrade a venv verdict already recorded.
+                            sawMarkerKind = sawMarkerKind || 'bundle';
+                        }
+                    }
+                }
+                if (sawMarkerKind) {
+                    // Drop everything just collected: this is an interpreter
+                    // environment or a frozen bundle, not project source.
+                    out.prunedDirs += 1;
+                    if (depth === 0) {
+                        // The user picked a generated tree directly. Say so
+                        // rather than reporting "no files in it", which is both
+                        // wrong and unactionable.
+                        out.rootIsVenv = sawMarkerKind === 'venv';
+                        out.rootIsFrozenBundle = sawMarkerKind === 'bundle';
+                    }
+                    return out.truncated;
+                }
+
+                // Real source first, generated and hidden last, so that when the
+                // byte budget runs out it costs the user noise rather than code.
+                const ordered = sortByWalkPriority(
+                    entries,
+                    entry => (entry.kind === 'directory' ? 'directory' : 'file'),
+                    entry => String((entry && entry.name) || '')
+                );
+                // Whether the scan was ALREADY capped while listing this
+                // directory. Those entries were collected and counted, so they
+                // are still processed; what must stop the loop is a truncation
+                // that happens DURING processing (a child walk or the file cap),
+                // which would otherwise discard this listing entirely.
+                const truncatedWhileListing = out.truncated;
+                let processedSinceYield = 0;
+                for (let index = 0; index < ordered.length; index += 1) {
+                    if (out.truncated && !truncatedWhileListing) break;
+                    const entry = ordered[index];
+                    processedSinceYield += 1;
+                    if (processedSinceYield >= 40) {
+                        processedSinceYield = 0;
+                        if (typeof cfg.onProgress === 'function') {
+                            cfg.onProgress(out.files.length);
+                        }
+                        await new Promise(resolve => setTimeout(resolve, 0));
+                        assertScanActive();
+                    }
+
+                    const name = String((entry && entry.name) || '');
+                    if (!name) continue;
                     const relativePath = prefix + name;
 
                     if (entry.kind === 'directory') {
-                        if (IMPORT_SKIP_DIRS.indexOf(name.toLowerCase()) >= 0) {
+                        if (isSkippedDirName(name)) {
                             out.prunedDirs += 1;
                             continue;
                         }
@@ -3957,7 +4259,20 @@
                             assertScanActive();
                             file.relativePath = relativePath;
                             out.files.push(file);
-                        } catch (_) {
+                        } catch (error) {
+                            // Cancellation and an exhausted GLOBAL scan budget
+                            // must PROPAGATE. Swallowing them would report a
+                            // user-cancelled scan as a successful one that
+                            // merely had unreadable files, and the caller would
+                            // import a partial project believing it complete.
+                            //
+                            // 'scan-timeout' is deliberately NOT propagated: it
+                            // means this ONE getFile() was slow, and the design
+                            // contract is that a single locked or vanished file
+                            // must not abort a 500-file scan. It stays counted
+                            // as unreadable so the caller can report it.
+                            const code = String((error && error.code) || '');
+                            if (code === 'aborted' || code === 'scan-budget') throw error;
                             out.unreadable += 1;
                         }
                     }
@@ -3993,7 +4308,14 @@
         // message. If ANY file was collected, return the partial result with
         // `error` empty so the caller imports what it has and reports the rest.
         if (!out.files.length) {
-            if (out.lockedDirs && !out.unreadable) {
+            if (out.rootIsVenv) {
+                out.error = 'That folder is a Python virtual environment (it contains pyvenv.cfg), '
+                    + 'not project source. Open the project folder that CONTAINS it instead.';
+            } else if (out.rootIsFrozenBundle) {
+                out.error = 'That folder is a frozen Python application bundle (it contains '
+                    + 'base_library.zip), not project source. It holds a vendored interpreter '
+                    + 'and third-party packages. Open the project folder that CONTAINS it instead.';
+            } else if (out.lockedDirs && !out.unreadable) {
                 const first = out.lockedSample[0];
                 out.error = `Nothing could be imported: ${first ? first.reason : 'the folder could not be read'}.`
                     + (out.lockedDirs > 1 ? ` (${out.lockedDirs} folders were inaccessible.)` : '');
@@ -7216,6 +7538,20 @@
         IMPLEMENTATION_EXTENSIONS,
         IMPORTABLE_EXTENSIONS,
         IMPORT_SKIP_DIRS,
+        IMPORT_SKIP_DIR_PATTERNS,
+        VENV_MARKER_FILES,
+        FROZEN_BUNDLE_MARKER_FILES,
+        isGeneratedTreeMarker,
+        isSkippedDirName,
+        isSkippedPath,
+        isHiddenPathSegment,
+        walkPriority,
+        sortByWalkPriority,
+        generatedRootsFromFlatList,
+        venvRootsFromFlatList,
+        isUnderGeneratedRoot,
+        isUnderVenvRoot,
+        sortFlatListByPriority,
         relativePathOf,
         extensionOf,
         suggestedFolderName,
