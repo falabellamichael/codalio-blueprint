@@ -21,9 +21,9 @@
 
     // Fallbacks only. The live limits come from Settings -> Source files, so
     // changing them there actually changes what the attach dialog allows.
-    const MAX_SOURCE_FILE_BYTES = 120 * 1024;
-    const MAX_SOURCE_FILES = 12;
-    const MAX_SOURCE_TOTAL_BYTES = 420 * 1024;
+    const MAX_SOURCE_FILE_BYTES = 500 * 1024;
+    const MAX_SOURCE_FILES = 50;
+    const MAX_SOURCE_TOTAL_BYTES = 2048 * 1024;
     const MAX_FILE_NAME_LENGTH = 140;
 
     function sourceLimits() {
@@ -642,6 +642,32 @@
             errorBox.appendChild(icon('fa-triangle-exclamation'));
             errorBox.appendChild(node('span', null, step.error));
             body.appendChild(errorBox);
+
+            if (step.label === 'Waiting for source' || (typeof step.error === 'string' && step.error.indexOf('No source attached') >= 0)) {
+                const actionRow = node('div', 'cb-step-source-actions');
+                const addFileBtn = node('button', 'cb-btn primary cb-step-action-btn');
+                addFileBtn.type = 'button';
+                addFileBtn.dataset.cbAction = 'add-source-file';
+                addFileBtn.appendChild(icon('fa-file-circle-plus'));
+                addFileBtn.appendChild(node('span', null, 'Add Source File'));
+                actionRow.appendChild(addFileBtn);
+
+                const importFolderBtn = node('button', 'cb-btn cb-step-action-btn');
+                importFolderBtn.type = 'button';
+                importFolderBtn.dataset.cbAction = 'open-folder';
+                importFolderBtn.appendChild(icon('fa-folder-open'));
+                importFolderBtn.appendChild(node('span', null, 'Import Folder'));
+                actionRow.appendChild(importFolderBtn);
+
+                const filesTabBtn = node('button', 'cb-btn cb-step-action-btn');
+                filesTabBtn.type = 'button';
+                filesTabBtn.dataset.cbAction = 'go-files';
+                filesTabBtn.appendChild(icon('fa-folder-tree'));
+                filesTabBtn.appendChild(node('span', null, 'Project Files'));
+                actionRow.appendChild(filesTabBtn);
+
+                body.appendChild(actionRow);
+            }
         }
 
         wrap.appendChild(body);
@@ -652,7 +678,56 @@
     // Transcript — the one big chat
     // ------------------------------------------------------------------
 
+    function renderCompactionCard(message) {
+        const compaction = message.compaction || {};
+        const wrap = node('div', 'cb-msg cb-msg-compaction');
+        wrap.dataset.messageId = message.id;
+
+        const card = node('div', 'cb-compaction-card');
+        card.setAttribute('role', 'region');
+        card.setAttribute('aria-label', 'Context Compaction');
+
+        const head = node('div', 'cb-compaction-head');
+        const titleArea = node('div', 'cb-compaction-title');
+        titleArea.appendChild(icon('fa-bolt-lightning'));
+        titleArea.appendChild(node('strong', null, '⚡ Context Compacted (Anti-gravity Protocol)'));
+        head.appendChild(titleArea);
+
+        const metrics = node('div', 'cb-compaction-metrics');
+        const reqCount = Array.isArray(compaction.userRequests) ? compaction.userRequests.length : 1;
+        const savedPercent = compaction.savedPercent || 0;
+        const origTokens = compaction.originalTokens || 0;
+        const compTokens = compaction.compactedTokens || 0;
+
+        const pillReq = node('span', 'cb-compaction-pill', `Preserved ${reqCount} user goal${reqCount === 1 ? '' : 's'}`);
+        const pillSaved = node('span', 'cb-compaction-pill highlight', `${savedPercent}% reduction (${origTokens} → ${compTokens} tokens)`);
+        metrics.appendChild(pillReq);
+        metrics.appendChild(pillSaved);
+        head.appendChild(metrics);
+
+        card.appendChild(head);
+
+        const details = node('details', 'cb-compaction-details');
+        const summaryTag = node('summary', 'cb-compaction-summary-btn', 'View Anti-gravity Structured Summary');
+        details.appendChild(summaryTag);
+
+        const body = node('div', 'cb-compaction-body');
+        if (compaction.summary) {
+            body.appendChild(core.renderMarkdown(compaction.summary));
+        } else if (message.text) {
+            body.appendChild(core.renderMarkdown(message.text));
+        }
+        details.appendChild(body);
+        card.appendChild(details);
+
+        wrap.appendChild(card);
+        return wrap;
+    }
+
     function renderMessage(message) {
+        if (message.role === 'compaction' || message.compaction) {
+            return renderCompactionCard(message);
+        }
         const wrap = node('div', `cb-msg cb-msg-${message.role}`);
         wrap.dataset.messageId = message.id;
 
@@ -774,6 +849,14 @@
         historyBtn.setAttribute('aria-label', 'Chat history');
         historyBtn.appendChild(icon('fa-clock-rotate-left'));
         actions.appendChild(historyBtn);
+
+        const compactBtn = node('button', `cb-icon-btn cb-header-icon-btn${state.hasCompaction ? ' active' : ''}`);
+        compactBtn.type = 'button';
+        compactBtn.dataset.cbAction = 'compact-context';
+        compactBtn.title = 'Compact Context (Anti-gravity Protocol)';
+        compactBtn.setAttribute('aria-label', 'Compact Context');
+        compactBtn.appendChild(icon('fa-bolt-lightning'));
+        actions.appendChild(compactBtn);
 
         const clearBtn = node('button', 'cb-icon-btn cb-header-icon-btn');
         clearBtn.type = 'button';
@@ -958,10 +1041,13 @@
 
         if (!state.busy && !state.pendingQuestion) {
             const quickBar = node('div', 'cb-quick-bar');
+
+            // --- Group 1: Skills ---
+            const skillsGroup = node('div', 'cb-quick-group cb-quick-skills');
             const quickLabel = node('span', 'cb-quick-label');
             quickLabel.appendChild(icon('fa-bolt'));
             quickLabel.appendChild(node('span', null, 'Skills:'));
-            quickBar.appendChild(quickLabel);
+            skillsGroup.appendChild(quickLabel);
 
             const quickSkills = [
                 { id: 'prd-builder', label: '/prd', title: 'PRD Builder' },
@@ -978,9 +1064,186 @@
                 chip.dataset.skillId = item.id;
                 chip.title = item.title;
                 chip.textContent = item.label;
-                quickBar.appendChild(chip);
+                skillsGroup.appendChild(chip);
             });
+
+            const compactChip = node('button', `cb-quick-chip-compact${state.hasCompaction ? ' active' : ''}`);
+            compactChip.type = 'button';
+            compactChip.dataset.cbAction = 'compact-context';
+            compactChip.title = 'Compact Context (Anti-gravity Protocol)';
+            compactChip.textContent = '/compact';
+            skillsGroup.appendChild(compactChip);
+
+            quickBar.appendChild(skillsGroup);
+
+            // Divider
+            quickBar.appendChild(node('span', 'cb-quick-divider'));
+
+            // --- Group 2: Direct Folder Access ---
+            const folderGroup = node('div', 'cb-quick-group cb-quick-folders');
+            const folderLabel = node('span', 'cb-quick-label');
+            folderLabel.appendChild(icon('fa-folder'));
+            folderLabel.appendChild(node('span', null, 'Folder:'));
+            folderGroup.appendChild(folderLabel);
+
+            const folderSelect = node('select', 'cb-composer-select');
+            folderSelect.dataset.cbRole = 'composer-folder-select';
+            folderSelect.title = 'Active project folder — select to switch, create, or import';
+
+            const folders = Array.isArray(state.folders) ? state.folders : [];
+            folders.forEach(f => {
+                const opt = node('option');
+                opt.value = f.id;
+                const count = state.folderFileCounts && typeof state.folderFileCounts[f.id] === 'number'
+                    ? state.folderFileCounts[f.id]
+                    : (core && typeof core.folderFileCount === 'function' ? core.folderFileCount(f.id) : 0);
+                opt.textContent = `📁 ${f.name} (${count} file${count === 1 ? '' : 's'})`;
+                if (f.id === state.activeFolderId) {
+                    opt.selected = true;
+                    folderSelect.value = f.id;
+                }
+                folderSelect.appendChild(opt);
+            });
+
+            const sepOpt = node('option');
+            sepOpt.disabled = true;
+            sepOpt.textContent = '──────────';
+            folderSelect.appendChild(sepOpt);
+
+            const newFolderOpt = node('option');
+            newFolderOpt.value = '__new__';
+            newFolderOpt.textContent = '➕ New Folder…';
+            folderSelect.appendChild(newFolderOpt);
+
+            const importFolderOpt = node('option');
+            importFolderOpt.value = '__import__';
+            importFolderOpt.textContent = '📂 Import Folder from Disk…';
+            folderSelect.appendChild(importFolderOpt);
+
+            folderGroup.appendChild(folderSelect);
+
+            const importBtn = node('button', 'cb-quick-action-btn');
+            importBtn.type = 'button';
+            importBtn.dataset.cbAction = 'open-folder';
+            importBtn.title = 'Import a folder of source files from disk';
+            importBtn.appendChild(icon('fa-folder-open'));
+            importBtn.appendChild(node('span', null, 'Import'));
+            folderGroup.appendChild(importBtn);
+
+            quickBar.appendChild(folderGroup);
+
+            // Divider
+            quickBar.appendChild(node('span', 'cb-quick-divider'));
+
+            // --- Group 3: Project Files Selector ---
+            const filesGroup = node('div', 'cb-quick-group cb-quick-files');
+            const filesLabel = node('span', 'cb-quick-label');
+            filesLabel.appendChild(icon('fa-file-code'));
+            filesLabel.appendChild(node('span', null, 'Files:'));
+            filesGroup.appendChild(filesLabel);
+
+            const fileSelect = node('select', 'cb-composer-select');
+            fileSelect.dataset.cbRole = 'composer-file-select';
+            fileSelect.title = 'Attach a file from Project Files to prompt context';
+
+            const defaultFileOpt = node('option');
+            defaultFileOpt.value = '';
+            defaultFileOpt.disabled = true;
+            defaultFileOpt.selected = true;
+            defaultFileOpt.textContent = 'Attach file from project…';
+            fileSelect.appendChild(defaultFileOpt);
+
+            const allFiles = (core && typeof core.listFiles === 'function') ? core.listFiles() : (state.projectFiles || []);
+            const attachedFiles = Array.isArray(state.sourceFiles) ? state.sourceFiles : [];
+
+            if (!allFiles.length) {
+                const noFilesOpt = node('option');
+                noFilesOpt.value = '';
+                noFilesOpt.disabled = true;
+                noFilesOpt.textContent = '(No files in project yet)';
+                fileSelect.appendChild(noFilesOpt);
+            } else {
+                allFiles.forEach(filePath => {
+                    const opt = node('option');
+                    opt.value = filePath;
+                    const isAttached = attachedFiles.some(f => f.path === filePath);
+                    const rec = core && typeof core.readFile === 'function' ? core.readFile(filePath) : null;
+                    const sizeStr = rec && typeof rec.bytes === 'number' ? ` (${Math.round(rec.bytes / 1024)} KB)` : '';
+                    opt.textContent = `${isAttached ? '✓ ' : '📄 '}${filePath}${sizeStr}`;
+                    fileSelect.appendChild(opt);
+                });
+            }
+
+            const fileSepOpt = node('option');
+            fileSepOpt.disabled = true;
+            fileSepOpt.textContent = '──────────';
+            fileSelect.appendChild(fileSepOpt);
+
+            const uploadOpt = node('option');
+            uploadOpt.value = '__add__';
+            uploadOpt.textContent = '➕ Upload Source File from Disk…';
+            fileSelect.appendChild(uploadOpt);
+
+            filesGroup.appendChild(fileSelect);
+
+            const addFileBtn = node('button', 'cb-quick-action-btn');
+            addFileBtn.type = 'button';
+            addFileBtn.dataset.cbAction = 'add-source-file';
+            addFileBtn.title = 'Upload or paste a source file to attach to context';
+            addFileBtn.appendChild(icon('fa-file-circle-plus'));
+            addFileBtn.appendChild(node('span', null, 'Add File'));
+            filesGroup.appendChild(addFileBtn);
+
+            const browseBtn = node('button', 'cb-quick-action-btn');
+            browseBtn.type = 'button';
+            browseBtn.dataset.cbAction = 'go-files';
+            browseBtn.title = 'Jump to Project Files tab to browse and inspect documents';
+            browseBtn.appendChild(icon('fa-folder-tree'));
+            browseBtn.appendChild(node('span', null, 'Files Tab'));
+            filesGroup.appendChild(browseBtn);
+
+            quickBar.appendChild(filesGroup);
+
             composer.appendChild(quickBar);
+        }
+
+        // --- Attached Files Bar (rendered whenever 1+ files are attached to prompt context) ---
+        if (Array.isArray(state.sourceFiles) && state.sourceFiles.length > 0) {
+            const attachedBar = node('div', 'cb-composer-attached');
+            const attachedLabel = node('span', 'cb-attached-label');
+            attachedLabel.appendChild(icon('fa-paperclip'));
+            attachedLabel.appendChild(node('span', null, `Attached (${state.sourceFiles.length}):`));
+            attachedBar.appendChild(attachedLabel);
+
+            const chipList = node('div', 'cb-attached-list');
+            state.sourceFiles.forEach(file => {
+                const chip = node('div', 'cb-attached-chip');
+                const len = file.content ? file.content.length : 0;
+                chip.title = `${file.path} (${Math.round(len / 1024)} KB)`;
+                chip.appendChild(icon('fa-file-lines'));
+                chip.appendChild(node('span', 'cb-attached-name', file.path));
+                chip.appendChild(node('span', 'cb-attached-size', ` (${Math.round(len / 1024)} KB)`));
+
+                const removeBtn = node('button', 'cb-attached-remove');
+                removeBtn.type = 'button';
+                removeBtn.title = `Detach ${file.path} from context`;
+                removeBtn.dataset.cbAction = 'detach-source-file';
+                removeBtn.dataset.path = file.path;
+                removeBtn.appendChild(icon('fa-xmark'));
+                chip.appendChild(removeBtn);
+
+                chipList.appendChild(chip);
+            });
+            attachedBar.appendChild(chipList);
+
+            const clearBtn = node('button', 'cb-attached-clear');
+            clearBtn.type = 'button';
+            clearBtn.dataset.cbAction = 'clear-attached-files';
+            clearBtn.title = 'Detach all files from prompt context';
+            clearBtn.textContent = 'Detach all';
+            attachedBar.appendChild(clearBtn);
+
+            composer.appendChild(attachedBar);
         }
 
         const isAwaitingAnswer = Boolean(state.pendingQuestion);
@@ -1094,9 +1357,23 @@
         const viewer = node('div', 'cb-viewer');
 
         const bar = node('div', 'cb-viewer-bar');
+        const isImported = record.origin === 'imported';
         const pathWrap = node('div', 'cb-viewer-path');
         pathWrap.appendChild(icon(fileIconFor(record.path)));
         pathWrap.appendChild(node('span', null, record.path));
+        if (isImported) {
+            const badge = node('span', 'cb-chip cb-chip-muted cb-viewer-badge');
+            badge.title = 'Project source file — Read-only to Blueprint';
+            badge.appendChild(icon('fa-lock'));
+            badge.appendChild(node('span', null, 'Read-Only Source'));
+            pathWrap.appendChild(badge);
+        } else {
+            const badge = node('span', 'cb-chip cb-chip-primary cb-viewer-badge');
+            badge.title = 'Created by Blueprint — Editable & rewritable';
+            badge.appendChild(icon('fa-pen-nib'));
+            badge.appendChild(node('span', null, 'Blueprint Document'));
+            pathWrap.appendChild(badge);
+        }
         bar.appendChild(pathWrap);
 
         const tools = node('div', 'cb-viewer-tools');

@@ -480,6 +480,136 @@
     gap: 6px;
 }
 
+/* Anti-gravity Context Compactor Card */
+.cb-msg-compaction {
+    padding: 0;
+    margin: 8px 0;
+}
+
+.cb-compaction-card {
+    border: 1px solid rgba(var(--cb-accent-rgb), 0.4);
+    background: linear-gradient(135deg, rgba(var(--cb-accent-rgb), 0.08) 0%, rgba(var(--cb-accent-rgb), 0.02) 100%);
+    border-radius: var(--cb-radius);
+    padding: 12px 16px;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.08);
+    position: relative;
+    overflow: hidden;
+}
+
+.cb-compaction-card::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 4px;
+    height: 100%;
+    background: linear-gradient(180deg, #f59e0b, var(--cb-accent));
+}
+
+.cb-compaction-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 10px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid rgba(var(--cb-accent-rgb), 0.15);
+}
+
+.cb-compaction-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: var(--cb-text);
+}
+
+.cb-compaction-title i {
+    color: #f59e0b;
+    filter: drop-shadow(0 0 6px rgba(245, 158, 11, 0.6));
+    animation: cbPulseGlow 2.4s ease-in-out infinite;
+}
+
+.cb-compaction-metrics {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+
+.cb-compaction-pill {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: var(--cb-soft);
+    border: 1px solid var(--cb-border);
+    color: var(--cb-text-2);
+    font-family: var(--cb-font-mono);
+}
+
+.cb-compaction-pill.highlight {
+    background: rgba(var(--cb-accent-rgb), 0.15);
+    border-color: rgba(var(--cb-accent-rgb), 0.35);
+    color: var(--cb-accent);
+    font-weight: 600;
+}
+
+.cb-compaction-details {
+    margin-top: 8px;
+}
+
+.cb-compaction-summary-btn {
+    cursor: pointer;
+    font-size: 12px;
+    color: var(--cb-accent);
+    font-weight: 500;
+    user-select: none;
+    padding: 4px 0;
+    transition: opacity 0.15s ease;
+}
+
+.cb-compaction-summary-btn:hover {
+    opacity: 0.85;
+    text-decoration: underline;
+}
+
+.cb-compaction-body {
+    margin-top: 10px;
+    padding: 12px 14px;
+    background: var(--cb-surface);
+    border: 1px solid var(--cb-border);
+    border-radius: var(--cb-radius);
+    font-size: 12px;
+    line-height: 1.6;
+    max-height: 380px;
+    overflow-y: auto;
+}
+
+.cb-quick-chip-compact {
+    background: var(--cb-chip-bg, rgba(255, 255, 255, 0.05));
+    border: 1px solid rgba(245, 158, 11, 0.45);
+    color: #f59e0b;
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 11px;
+    font-family: var(--cb-mono, monospace);
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.cb-quick-chip-compact:hover,
+.cb-quick-chip-compact.active {
+    background: rgba(245, 158, 11, 0.15);
+    border-color: #f59e0b;
+    color: #f59e0b;
+}
+
+.cb-header-icon-btn.active {
+    color: #f59e0b;
+    border-color: rgba(245, 158, 11, 0.5);
+    background: rgba(245, 158, 11, 0.1);
+}
+
 /* Step timeline — the Cursor-style visible trace */
 
 .cb-timeline {
@@ -3016,9 +3146,26 @@
 .cb-quick-bar {
     display: flex;
     align-items: center;
-    gap: 6px;
-    padding: 6px 10px 2px 10px;
+    gap: 8px;
+    padding: 6px 10px 4px 10px;
     overflow-x: auto;
+    scrollbar-width: thin;
+}
+
+.cb-quick-group {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+}
+
+.cb-quick-divider {
+    display: inline-block;
+    width: 1px;
+    height: 16px;
+    background: var(--cb-border, rgba(255, 255, 255, 0.15));
+    margin: 0 3px;
+    flex-shrink: 0;
 }
 
 .cb-quick-label {
@@ -3049,6 +3196,157 @@
     background: color-mix(in srgb, var(--cb-accent, #38bdf8) 15%, transparent);
     border-color: var(--cb-accent, #38bdf8);
     color: var(--cb-accent, #38bdf8);
+}
+
+.cb-composer-select {
+    background: var(--cb-input-bg, rgba(255, 255, 255, 0.04));
+    border: 1px solid var(--cb-border, rgba(255, 255, 255, 0.14));
+    color: var(--cb-text, #e2e8f0);
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 11px;
+    line-height: 1.4;
+    cursor: pointer;
+    max-width: 200px;
+    outline: none;
+    transition: all 0.15s ease;
+}
+
+.cb-composer-select:hover,
+.cb-composer-select:focus {
+    border-color: var(--cb-accent, #38bdf8);
+    background: var(--cb-chip-bg, rgba(255, 255, 255, 0.08));
+}
+
+.cb-composer-select option {
+    background: #18181b;
+    color: #e2e8f0;
+}
+
+.cb-quick-action-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: var(--cb-chip-bg, rgba(255, 255, 255, 0.04));
+    border: 1px solid var(--cb-border, rgba(255, 255, 255, 0.12));
+    color: var(--cb-text-2, #94a3b8);
+    border-radius: 4px;
+    padding: 2px 7px;
+    font-size: 11px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: all 0.15s ease;
+}
+
+.cb-quick-action-btn:hover {
+    background: color-mix(in srgb, var(--cb-accent, #38bdf8) 12%, transparent);
+    border-color: var(--cb-accent, #38bdf8);
+    color: var(--cb-accent, #38bdf8);
+}
+
+/* ---- Composer Attached Files Bar ---- */
+
+.cb-composer-attached {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 10px 6px 10px;
+    border-bottom: 1px dashed var(--cb-border, rgba(255, 255, 255, 0.1));
+    flex-wrap: wrap;
+    background: rgba(0, 0, 0, 0.15);
+}
+
+.cb-attached-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 10.5px;
+    font-weight: 700;
+    color: var(--cb-accent, #38bdf8);
+    white-space: nowrap;
+}
+
+.cb-attached-list {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+
+.cb-attached-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    background: color-mix(in srgb, var(--cb-accent, #38bdf8) 10%, rgba(255, 255, 255, 0.04));
+    border: 1px solid color-mix(in srgb, var(--cb-accent, #38bdf8) 30%, transparent);
+    border-radius: 4px;
+    padding: 2px 6px;
+    font-size: 11px;
+    color: var(--cb-text, #e2e8f0);
+}
+
+.cb-attached-chip i.fa-file-lines {
+    color: var(--cb-accent, #38bdf8);
+    font-size: 10.5px;
+}
+
+.cb-attached-name {
+    font-family: var(--cb-mono, monospace);
+    font-size: 10.5px;
+}
+
+.cb-attached-size {
+    font-size: 10px;
+    color: var(--cb-text-muted, #64748b);
+}
+
+.cb-attached-remove {
+    background: transparent;
+    border: none;
+    color: var(--cb-text-muted, #64748b);
+    cursor: pointer;
+    padding: 0 2px;
+    display: inline-flex;
+    align-items: center;
+    font-size: 10px;
+    transition: color 0.15s ease;
+}
+
+.cb-attached-remove:hover {
+    color: #ef4444;
+}
+
+.cb-attached-clear {
+    background: transparent;
+    border: none;
+    color: var(--cb-text-muted, #64748b);
+    font-size: 10.5px;
+    cursor: pointer;
+    padding: 0 4px;
+    text-decoration: underline;
+    transition: color 0.15s ease;
+}
+
+.cb-attached-clear:hover {
+    color: #f87171;
+}
+
+/* ---- Step Source Action Buttons ---- */
+
+.cb-step-source-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 10px;
+    flex-wrap: wrap;
+}
+
+.cb-step-action-btn {
+    padding: 4px 10px;
+    font-size: 11px;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
 }
 
 /* ---- Artifact Cards Grid ---- */
@@ -4029,4 +4327,62 @@
         width: auto;
         top: 48px;
     }
+}
+
+/* ==================================================================== */
+/*  QUICK-BAR CHIP GROUPS + VIEWER PERMISSION BADGE                       */
+/*                                                                        */
+/*  Modifier classes emitted by ui.js on top of the already-styled          */
+/*  .cb-quick-group / .cb-quick-chip / .cb-chip bases. Only the classes     */
+/*  that do not exist yet are defined here, and they override nothing the   */
+/*  base rules rely on.                                                     */
+/* ==================================================================== */
+
+/* The three chip groups share one row. Each shrinks and truncates on its own
+   rather than pushing the composer wider than its container. */
+.cb-quick-skills,
+.cb-quick-folders,
+.cb-quick-files {
+    min-width: 0;
+}
+
+.cb-quick-skills .cb-quick-chip,
+.cb-quick-folders .cb-quick-chip,
+.cb-quick-files .cb-quick-chip {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 220px;
+}
+
+/* ---- viewer permission badge ---- */
+
+/* Sits inside .cb-viewer-path beside the filename. It must never push the path
+   out of view, so it shrinks and truncates while the path keeps its share. */
+.cb-viewer-badge {
+    flex: 0 1 auto;
+    min-width: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-size: 10.5px;
+    line-height: 1.6;
+    padding: 1px 7px;
+}
+
+.cb-viewer-badge > i { font-size: 10px; flex: 0 0 auto; }
+
+.cb-chip-muted {
+    background: var(--cb-fill-soft);
+    border-color: var(--cb-border);
+    color: var(--cb-text-2);
+}
+
+.cb-chip-muted:hover {
+    border-color: var(--cb-border-strong);
+    color: var(--cb-text);
+    background: var(--cb-fill-medium);
 }

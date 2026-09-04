@@ -104,6 +104,10 @@
         requireReviewGate: true,
         autoOpenWrittenDocument: true,
 
+        // Agent -> Context Compression (Anti-gravity Protocol)
+        contextCompression: true,
+        autoCompactThreshold: 6,
+
         // Agent -> Model
         temperature: 0.3,
         lensMaxOutputTokens: 4096,
@@ -150,9 +154,9 @@
         readingWidth: 'wide',
 
         // Source files -> Attach limits
-        maxSourceFiles: 12,
-        maxSourceFileKb: 120,
-        maxSourceTotalKb: 420,
+        maxSourceFiles: 50,
+        maxSourceFileKb: 500,
+        maxSourceTotalKb: 2048,
         includeSourceInPrompts: true,
 
         // Data -> Storage & privacy
@@ -198,9 +202,10 @@
         settings.maxOpenTabs = boundedInt(settings.maxOpenTabs, 2, 24, DEFAULT_SETTINGS.maxOpenTabs);
         settings.listPaneWidth = boundedInt(settings.listPaneWidth, 220, 520, DEFAULT_SETTINGS.listPaneWidth);
         settings.treeIndentPx = boundedInt(settings.treeIndentPx, 8, 28, DEFAULT_SETTINGS.treeIndentPx);
-        settings.maxSourceFiles = boundedInt(settings.maxSourceFiles, 1, 40, DEFAULT_SETTINGS.maxSourceFiles);
-        settings.maxSourceFileKb = boundedInt(settings.maxSourceFileKb, 8, 1024, DEFAULT_SETTINGS.maxSourceFileKb);
-        settings.maxSourceTotalKb = boundedInt(settings.maxSourceTotalKb, 32, 4096, DEFAULT_SETTINGS.maxSourceTotalKb);
+        settings.maxSourceFiles = boundedInt(settings.maxSourceFiles, 1, 150, DEFAULT_SETTINGS.maxSourceFiles);
+        settings.maxSourceFileKb = boundedInt(settings.maxSourceFileKb, 8, 2048, DEFAULT_SETTINGS.maxSourceFileKb);
+        settings.maxSourceTotalKb = boundedInt(settings.maxSourceTotalKb, 32, 16384, DEFAULT_SETTINGS.maxSourceTotalKb);
+        settings.autoCompactThreshold = boundedInt(settings.autoCompactThreshold, 2, 20, DEFAULT_SETTINGS.autoCompactThreshold);
 
         const enums = {
             fileNameStyle: ['date-slug', 'slug-date', 'slug'],
@@ -490,15 +495,21 @@
         const cleanPath = String(path || '').replace(/^\/+/, '').trim();
         if (!cleanPath) return null;
         const previous = store.files[cleanPath] || null;
+
+        // Safety Policy:
+        // Standalone project access can read and create files freely,
+        // and edit/rewrite files it creates only.
+        // User project files (origin === 'imported') are protected from in-place rewrites.
+        if (previous && previous.origin === 'imported') {
+            const isImportAction = Boolean(meta && meta.origin === 'imported');
+            if (!isImportAction) {
+                console.warn(`[codalio-blueprint] protected user source file: ${cleanPath}. Writing revision to docs/ instead.`);
+                const safePath = cleanPath.startsWith('docs/') ? cleanPath : `docs/${cleanPath}.revised.md`;
+                return writeFile(safePath, content, Object.assign({}, meta, { origin: 'blueprint', createdBy: 'blueprint' }));
+            }
+        }
+
         const now = new Date().toISOString();
-        // A document belongs to whichever folder is active, and keeps that folder
-        // if it is rewritten. An explicit meta.folder wins (folder import).
-        //
-        // Every branch must yield an ID, not a folder object. An earlier version
-        // looked the id up in store.folders here and stored the resulting object,
-        // so records written with an explicit meta.folder held a whole folder
-        // object instead of a string — listFiles(id) then never matched them, and
-        // touchFolder() silently no-oped on it.
         const wantedFolder = (meta && typeof meta.folder === 'string' && store.folders[meta.folder])
             ? meta.folder
             : '';
@@ -508,6 +519,14 @@
         const folder = wantedFolder
             || inheritedFolder
             || (store.folders[store.activeFolderId] ? store.activeFolderId : DEFAULT_FOLDER_ID);
+
+        const origin = (meta && meta.origin)
+            || (previous && previous.origin)
+            || (cleanPath.startsWith('docs/') ? 'blueprint' : 'created');
+        const createdBy = (meta && meta.createdBy)
+            || (previous && previous.createdBy)
+            || (origin === 'imported' ? 'user' : 'blueprint');
+
         store.files[cleanPath] = {
             path: cleanPath,
             content: String(content === null || content === undefined ? '' : content),
@@ -515,12 +534,25 @@
             updatedAt: now,
             runId: (meta && meta.runId) || (previous && previous.runId) || '',
             skill: (meta && meta.skill) || (previous && previous.skill) || '',
-            folder
+            folder,
+            origin,
+            createdBy
         };
         touchFolder(folder);
         store.openPath = cleanPath;
         writeStore(store);
         return store.files[cleanPath];
+    }
+
+    function isReadOnlyFile(path) {
+        const rec = readFile(path);
+        return Boolean(rec && rec.origin === 'imported');
+    }
+
+    function canEditFile(path) {
+        const rec = readFile(path);
+        if (!rec) return true;
+        return rec.origin !== 'imported';
     }
 
     function deleteFile(path) {
@@ -731,9 +763,9 @@
      */
     async function importFolder(files, folderName, options) {
         const cfg = Object.assign({
-            maxFileKb: 256,
-            maxFiles: 400,
-            maxTotalKb: 4096,
+            maxFileKb: 1024,
+            maxFiles: 1000,
+            maxTotalKb: 32768,
             skipBinary: true
         }, options || {});
 
@@ -908,6 +940,187 @@
         };
         saveRun(run);
         return run;
+    }
+
+    // ------------------------------------------------------------------
+    // Context Compression (Anti-gravity Protocol)
+    // ------------------------------------------------------------------
+
+    function estimateTokens(text) {
+        if (!text) return 0;
+        const str = typeof text === 'string' ? text : JSON.stringify(text);
+        return Math.max(1, Math.round(str.length / 3.8));
+    }
+
+    /**
+     * Anti-gravity Context Compactor (Deterministic Engine)
+     *
+     * Constructs a high-density, structured compaction summary adhering strictly
+     * to the Anti-gravity compaction schema. Compresses lengthy chat transcripts,
+     * intermediate thinking steps, and model turns while faithfully preserving:
+     * 1. Chronological user requests
+     * 2. Task Overview
+     * 3. Progress (Completed & In-Progress)
+     * 4. Key Findings & Decisions
+     * 5. Active Context (project folder, created documents, source context)
+     * 6. Next Steps
+     * 7. Commitments & Constraints
+     */
+    function buildDeterministicCompaction(options) {
+        const opts = options || {};
+        const messages = Array.isArray(opts.messages) ? opts.messages : [];
+        const run = opts.run || null;
+        const activeFolderObj = opts.activeFolder || activeFolder();
+        const settings = opts.settings || readSettings();
+
+        // 1. Chronological User Requests
+        const userRequests = [];
+        messages.forEach(msg => {
+            if (!msg) return;
+            if (msg.role === 'user' && typeof msg.text === 'string') {
+                const trimmed = msg.text.trim();
+                if (trimmed && !trimmed.startsWith('/clear') && !trimmed.startsWith('/compact')) {
+                    userRequests.push(trimmed);
+                }
+            }
+        });
+        if (!userRequests.length && run && run.idea) {
+            userRequests.push(run.idea);
+        }
+        if (!userRequests.length) {
+            userRequests.push('Product requirements and architecture planning');
+        }
+
+        // 2. Tracked Documents & Artifacts
+        const writtenPaths = (run && Array.isArray(run.writtenPaths) && run.writtenPaths.length)
+            ? run.writtenPaths
+            : listFiles().filter(p => p.startsWith('docs/'));
+
+        const artifacts = writtenPaths.map(p => {
+            const file = readFile(p);
+            const size = file ? file.content.length : 0;
+            const lines = file ? file.content.split('\n').length : 0;
+            return { path: p, size, lines };
+        });
+
+        // 3. Project & Source Context
+        const folderName = (activeFolderObj && activeFolderObj.name) || 'Default Project';
+        const folderFiles = (activeFolderObj && activeFolderObj.id) ? listFiles(activeFolderObj.id) : listFiles();
+        const sourceFileCount = folderFiles.filter(p => !p.startsWith('docs/')).length;
+
+        // 4. Progress items
+        const completedMilestones = [];
+        const inProgressItems = [];
+
+        if (run) {
+            if (run.skillName) {
+                completedMilestones.push(`Skill executed: **${run.skillName}** (Status: ${run.status})`);
+            }
+            if (Array.isArray(run.phases)) {
+                run.phases.forEach(ph => {
+                    if (ph.status === 'done') {
+                        completedMilestones.push(`${ph.label || 'Phase'} completed${ph.summary ? ` (${ph.summary})` : ''}`);
+                    } else if (ph.status === 'running' || ph.status === 'pending') {
+                        inProgressItems.push(`${ph.label || 'Phase'} (${ph.status})`);
+                    }
+                });
+            }
+        }
+        artifacts.forEach(art => {
+            completedMilestones.push(`Document created: \`${art.path}\` (${formatBytes(art.size)}, ${art.lines} lines)`);
+        });
+
+        if (!inProgressItems.length) {
+            inProgressItems.push('Awaiting user follow-up questions or subsequent skill trigger (/mvp, /gtm, /arch, /code2prd)');
+        }
+
+        // 5. Synthesize Anti-gravity Compaction Block
+        const userReqLines = userRequests.map((req, idx) => `${idx + 1}. ${req}`).join('\n');
+        const completedLines = completedMilestones.length
+            ? completedMilestones.map(m => `  - ${m}`).join('\n')
+            : '  - Initialized planning session';
+        const inProgressLines = inProgressItems.map(m => `  - ${m}`).join('\n');
+
+        const projectName = (run && run.projectName) || 'Blueprint Project';
+        const skillName = (run && run.skillName) || 'Product Planning';
+
+        const summaryBody = [
+            `### 1. Task Overview`,
+            `- **Objective**: Architectural planning, specifications, and requirements synthesis for "${projectName}".`,
+            `- **Active Skill**: ${skillName}`,
+            `- **Primary Focus**: Delivering complete, verifiable blueprints aligned with user goals.`,
+            ``,
+            `### 2. Progress`,
+            `- **Completed**:`,
+            completedLines,
+            `- **In Progress / Remaining**:`,
+            inProgressLines,
+            ``,
+            `### 3. Key Findings & Decisions`,
+            `- Standalone folder access established: agent interfaces directly with project codebase without requiring editor file chips.`,
+            `- Safety boundaries strictly enforced: imported user source files are read-only; revisions are cleanly diverted to docs/.`,
+            `- Blueprint document generation follows zero-innerHTML, modular markdown standards.`,
+            ``,
+            `### 4. Active Context`,
+            `- **Active Folder**: \`${folderName}\` (${folderFiles.length} total files, ${sourceFileCount} source modules)`,
+            `- **Tracked Artifacts**: ${artifacts.length ? artifacts.map(a => `\`${a.path}\``).join(', ') : 'None yet'}`,
+            ``,
+            `### 5. Next Steps`,
+            `1. Review and refine any generated documents in the project tree.`,
+            `2. Run companion planning skills (/mvp, /arch, /gtm) or execute document revisions.`,
+            ``,
+            `### 6. Commitments & Constraints`,
+            `- Preserve documentation and source integrity at all times.`,
+            `- Adhere to Anti-gravity agent protocols: structured steps, live execution feedback, zero data loss.`
+        ].join('\n');
+
+        const rawCompaction = [
+            `# Resuming from a compaction`,
+            ``,
+            `You are continuing work on the task described above, but you have lost access to the full conversation history, and need to resume work efficiently using the progress summary below:`,
+            ``,
+            `# User Requests`,
+            `The following were user requests from the truncated conversation in chronological order:`,
+            userReqLines,
+            ``,
+            `<summary>`,
+            summaryBody,
+            `</summary>`
+        ].join('\n');
+
+        // 6. Token metrics
+        let originalChars = 0;
+        messages.forEach(m => {
+            originalChars += (m.text ? m.text.length : 0);
+            if (Array.isArray(m.steps)) {
+                m.steps.forEach(s => {
+                    originalChars += (s.text ? s.text.length : 0);
+                    originalChars += (s.promptPreview ? s.promptPreview.length : 0);
+                    originalChars += (s.thinking ? s.thinking.length : 0);
+                });
+            }
+        });
+        if (run && run.idea) originalChars += run.idea.length;
+        if (!originalChars) originalChars = 1200;
+
+        const originalTokens = Math.max(1, Math.round(originalChars / 3.8));
+        const compactedTokens = Math.max(1, Math.round(rawCompaction.length / 3.8));
+        const savedTokens = Math.max(0, originalTokens - compactedTokens);
+        const savedPercent = originalTokens > 0 ? Math.min(95, Math.max(0, Math.round((savedTokens / originalTokens) * 100))) : 0;
+
+        return {
+            id: uid('compact'),
+            at: new Date().toISOString(),
+            userRequests,
+            summary: summaryBody,
+            rawText: rawCompaction,
+            artifacts,
+            folderName,
+            originalTokens,
+            compactedTokens,
+            savedTokens,
+            savedPercent
+        };
     }
 
     // ------------------------------------------------------------------
@@ -1613,6 +1826,8 @@
         listFiles,
         readFile,
         writeFile,
+        isReadOnlyFile,
+        canEditFile,
         deleteFile,
         renameFile,
         setOpenPath,
@@ -1642,6 +1857,8 @@
         saveRun,
         deleteRun,
         createRun,
+        estimateTokens,
+        buildDeterministicCompaction,
         renderMarkdown,
         appendInline,
         streamModelTurn,

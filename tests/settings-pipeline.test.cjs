@@ -208,15 +208,31 @@ function resetStores() {
 // ---------------------------------------------------------------------------
 
 resetStores();
-const schemaKeys = schema.allFields().map(f => f.key).sort();
+const schemaFields = schema.allFields();
+const schemaKeys = schemaFields.map(f => f.key).sort();
 const coreKeys = Object.keys(core.DEFAULT_SETTINGS).sort();
+
+// Duplicate keys are checked FIRST and separately. Two agents editing this repo
+// concurrently both added `contextCompression` / `autoCompactThreshold`, once
+// inline and once in a dedicated sub-page; the key-set comparison below did catch
+// it, but only as an unreadable 44-key string diff. Naming the duplicates is what
+// makes the failure diagnosable.
+const seen = new Set();
+const duplicates = [];
+schemaFields.forEach(field => {
+    if (seen.has(field.key)) duplicates.push(field.key);
+    seen.add(field.key);
+});
+assert.deepEqual(duplicates, [],
+    `settings schema declares duplicate keys: ${duplicates.join(', ')}`);
+
 assert.equal(schemaKeys.join(','), coreKeys.join(','),
     'settings.js schema and core.DEFAULT_SETTINGS disagree on the key set');
 assert.ok(schemaKeys.length >= 40, `expected a thorough settings surface, found ${schemaKeys.length}`);
 
 // Every default is inside its declared bounds (a default out of range would be
 // clamped away on first read, so the UI would never show the documented value).
-schema.allFields().forEach(field => {
+schemaFields.forEach(field => {
     const value = core.DEFAULT_SETTINGS[field.key];
     if (field.type === 'number' || field.type === 'range') {
         assert.ok(value >= field.min && value <= field.max,

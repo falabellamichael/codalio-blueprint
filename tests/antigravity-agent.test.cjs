@@ -30,8 +30,17 @@ function createElement(tagName) {
             this._text = String(v);
         },
         offsetParent: {},
-        value: '',
         disabled: false,
+        get value() {
+            if (this.tagName === 'SELECT') {
+                const sel = (this.children || []).find(c => c.selected);
+                return sel ? (sel.value || '') : (this._value !== undefined ? this._value : '');
+            }
+            return this._value !== undefined ? this._value : '';
+        },
+        set value(v) {
+            this._value = String(v);
+        },
         type: '',
         scrollTop: 0,
         scrollHeight: 0,
@@ -398,4 +407,69 @@ const clearAllBtn = historyPopover.querySelector('[data-cb-action="clear-all-his
 assert.ok(clearAllBtn, 'missing clear-all-history button in popover footer');
 console.log('✓ Chat History popover renders active runs, New Chat button, delete actions, and footer controls');
 
+// Test 12: Direct Folder Access & Project Files Selectors in Composer Quick Bar
+const testFolders = [
+    { id: 'f-1', name: 'Main App', createdAt: new Date().toISOString() },
+    { id: 'f-2', name: 'Backend API', createdAt: new Date().toISOString() }
+];
+const richAgentPage = ui.renderAgentPage({
+    messages: [],
+    selectedSkillId: 'prd-builder',
+    folders: testFolders,
+    activeFolderId: 'f-1',
+    folderFileCounts: { 'f-1': 3, 'f-2': 1 },
+    projectFiles: ['src/app.js', 'src/utils.js', 'docs/prd/notes.md'],
+    sourceFiles: [
+        { path: 'src/app.js', content: 'console.log("hello");' }
+    ]
+});
+
+const folderSelect = richAgentPage.querySelector('[data-cb-role="composer-folder-select"]');
+assert.ok(folderSelect, 'missing composer-folder-select dropdown in composer quick bar');
+const folderOpts = folderSelect.querySelectorAll('option');
+assert.ok(folderOpts.length >= 4, 'expected folder options including new and import actions');
+assert.equal(folderSelect.value, 'f-1', 'active folder f-1 should be selected');
+
+const importFolderBtn = richAgentPage.querySelector('[data-cb-action="open-folder"]');
+assert.ok(importFolderBtn, 'missing direct Import Folder action button in composer quick bar');
+
+const fileSelect = richAgentPage.querySelector('[data-cb-role="composer-file-select"]');
+assert.ok(fileSelect, 'missing composer-file-select dropdown in composer quick bar');
+const fileOpts = fileSelect.querySelectorAll('option');
+assert.ok(fileOpts.length >= 4, 'expected project file options');
+
+const addFileBtn = richAgentPage.querySelector('[data-cb-action="add-source-file"]');
+assert.ok(addFileBtn, 'missing direct Add File action button in composer quick bar');
+
+const filesTabBtn = richAgentPage.querySelector('[data-cb-action="go-files"]');
+assert.ok(filesTabBtn, 'missing direct Files Tab navigation button in composer quick bar');
+console.log('✓ Direct folder access, file selectors, and quick action buttons present in composer');
+
+// Test 13: Attached Files Bar and Waiting for Source Action Shortcuts
+const attachedBar = richAgentPage.querySelector('.cb-composer-attached');
+assert.ok(attachedBar, 'missing .cb-composer-attached bar when source files are attached');
+const attachedChips = attachedBar.querySelectorAll('.cb-attached-chip');
+assert.equal(attachedChips.length, 1, 'expected 1 attached file chip');
+const detachBtn = attachedBar.querySelector('[data-cb-action="detach-source-file"]');
+assert.ok(detachBtn, 'missing detach-source-file button in attached file chip');
+assert.equal(detachBtn.dataset.path, 'src/app.js', 'detach button should reference attached file path');
+
+const waitingStep = agent.makeStep({
+    kind: 'notice',
+    label: 'Waiting for source',
+    status: 'error',
+    summary: 'Code to PRD must read the actual code',
+    text: 'Attach the codebase you want documented.',
+    open: true,
+    error: 'No source attached. Add the files you want evaluated, then run this skill again.'
+});
+const waitingStepNode = ui.renderStep(waitingStep);
+const sourceActions = waitingStepNode.querySelector('.cb-step-source-actions');
+assert.ok(sourceActions, 'missing .cb-step-source-actions in Waiting for source step card');
+assert.ok(sourceActions.querySelector('[data-cb-action="add-source-file"]'), 'missing add-source-file button in waiting step');
+assert.ok(sourceActions.querySelector('[data-cb-action="open-folder"]'), 'missing open-folder button in waiting step');
+assert.ok(sourceActions.querySelector('[data-cb-action="go-files"]'), 'missing go-files button in waiting step');
+console.log('✓ Attached files bar and Waiting for Source action shortcuts verified');
+
 console.log('\nAll Anti-gravity agent capabilities verified successfully!');
+

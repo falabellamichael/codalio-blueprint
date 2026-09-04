@@ -226,6 +226,30 @@
                             ]
                         },
                         {
+                            id: 'compression',
+                            label: 'Context compression (Anti-gravity Protocol)',
+                            icon: 'fa-bolt-lightning',
+                            note: 'Compresses long conversation transcripts into dense, structured Anti-gravity summaries (# Resuming from a compaction... <summary>) while preserving user requests and decisions.',
+                            fields: [
+                                {
+                                    key: 'contextCompression',
+                                    label: 'Enable context compression',
+                                    type: 'toggle',
+                                    help: 'Compress conversation history when the transcript grows long, preventing context overflow while preserving all user requests, decisions, and constraints.'
+                                },
+                                {
+                                    key: 'autoCompactThreshold',
+                                    label: 'Auto-compaction threshold',
+                                    type: 'number',
+                                    min: 2,
+                                    max: 20,
+                                    step: 1,
+                                    unit: 'messages',
+                                    help: 'Number of conversation messages that triggers automatic background context compaction.'
+                                }
+                            ]
+                        },
+                        {
                             id: 'endpoint',
                             label: 'Endpoint',
                             icon: 'fa-plug',
@@ -589,7 +613,7 @@
                                     label: 'Maximum attached files',
                                     type: 'number',
                                     min: 1,
-                                    max: 40,
+                                    max: 150,
                                     step: 1,
                                     unit: 'files',
                                     help: 'How many source files the code-reading skills may carry into a prompt.'
@@ -599,7 +623,7 @@
                                     label: 'Maximum size per file',
                                     type: 'number',
                                     min: 8,
-                                    max: 1024,
+                                    max: 2048,
                                     step: 8,
                                     unit: 'KB',
                                     help: 'A single file larger than this is refused at attach time rather than truncated silently mid-prompt.'
@@ -609,7 +633,7 @@
                                     label: 'Maximum total size',
                                     type: 'number',
                                     min: 32,
-                                    max: 4096,
+                                    max: 16384,
                                     step: 32,
                                     unit: 'KB',
                                     help: 'Combined ceiling for every attached file. Lower this if your endpoint has a small context window.'

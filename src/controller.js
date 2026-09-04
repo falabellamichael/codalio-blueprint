@@ -24,14 +24,87 @@
     const ui = window.__codalioBlueprintUi;
     const MANIFEST = window.__codalioBlueprintManifest;
 
+    /**
+     * Say WHY Blueprint is not there, on the page itself.
+     *
+     * Both failure paths below used to log one console line and return, leaving a
+     * blank Advanced page with no visible explanation. That is what a user sees
+     * when SimpleRAG's own bundle fails to parse: the host never defines
+     * window.RAGWorkspaceExtensions, so Blueprint cannot register — and the reason
+     * is buried in DevTools.
+     *
+     * Styles are INLINE, not .cb- classes: if the host is broken the plug-in's own
+     * stylesheet may not have loaded either, and a diagnostic that depends on the
+     * thing it is reporting on would render unstyled. It appends to document.body
+     * rather than any host element, because the host shell may not exist.
+     */
+    function showBootFailure(reason, detail) {
+        try {
+            if (typeof document === 'undefined' || !document.body) return;
+            if (document.getElementById('codalio-blueprint-boot-failure')) return;
+
+            const panel = document.createElement('div');
+            panel.id = 'codalio-blueprint-boot-failure';
+            panel.setAttribute('role', 'alert');
+            panel.style.cssText = [
+                'margin:18px', 'padding:14px 16px', 'max-width:720px',
+                'border:1px solid #8a5a2b', 'border-left:4px solid #d08700',
+                'border-radius:8px', 'background:#2a2118', 'color:#f2e6d4',
+                "font:13px/1.55 'Segoe UI',system-ui,sans-serif",
+                'box-shadow:0 6px 22px rgba(0,0,0,.35)'
+            ].join(';');
+
+            const title = document.createElement('strong');
+            title.textContent = 'Codalio Blueprint did not load';
+            title.style.cssText = 'display:block;margin-bottom:6px;font-size:13.5px;color:#ffd591';
+            panel.appendChild(title);
+
+            const body = document.createElement('div');
+            body.textContent = reason;
+            panel.appendChild(body);
+
+            if (detail) {
+                const hint = document.createElement('div');
+                hint.textContent = detail;
+                hint.style.cssText = 'margin-top:8px;color:#c9b89f;font-size:12.5px';
+                panel.appendChild(hint);
+            }
+
+            document.body.appendChild(panel);
+        } catch (err) {
+            // A diagnostic must never become the failure it is reporting.
+            console.error('[codalio-blueprint] could not render the boot-failure panel:', err);
+        }
+    }
+
     if (!core || !skills || !agent || !ui || !MANIFEST) {
-        console.error('[codalio-blueprint] incomplete package: a required module did not load.');
+        const missing = [
+            !core && 'controller-core', !skills && 'skills', !agent && 'agent',
+            !ui && 'ui', !MANIFEST && 'manifest'
+        ].filter(Boolean);
+        console.error('[codalio-blueprint] incomplete package: a required module did not load.', missing);
+        showBootFailure(
+            'The Blueprint package is incomplete, so the page cannot start.',
+            `Missing module(s): ${missing.join(', ')}. Re-run the installer `
+            + '(python tools/blueprint.py install), then reload this page.'
+        );
         return;
     }
 
     const host = window.RAGWorkspaceExtensions;
     if (!host || typeof host.registerController !== 'function' || typeof host.registerManifest !== 'function') {
         console.error('[codalio-blueprint] the SimpleRAG extension host is unavailable.');
+        // Distinguish the two causes, because they need different fixes: a host
+        // that never loaded is usually SimpleRAG's own bundle failing to parse,
+        // which the console will already have reported above this line.
+        showBootFailure(
+            'SimpleRAG\'s extension host (window.RAGWorkspaceExtensions) is not available, '
+            + 'so Blueprint has nothing to register with.',
+            'This usually means SimpleRAG\'s own app.bundle.js failed to load or parse. '
+            + 'Check the console above for an earlier error in app.bundle.js, fix it, then '
+            + 'reload. If the console is clean, reinstall Blueprint with '
+            + '"python tools/blueprint.py install".'
+        );
         return;
     }
 
@@ -79,6 +152,7 @@
         toastTimer: null,
         pendingQuestion: null,
         isHistoryOpen: false,
+        compaction: null,
         currentRun: null,
         currentController: null,
         generation: 0,
@@ -99,7 +173,11 @@
         openFolder: () => pickFolderFromDisk(),
         selectFolder: folderId => selectFolder(folderId),
         renameFolder: folderId => openRenameFolderModal(folderId),
-        deleteFolder: folderId => confirmDeleteFolder(folderId)
+        deleteFolder: folderId => confirmDeleteFolder(folderId),
+        attachFile: path => attachExistingFile(path),
+        detachFile: path => detachSourceFile(path),
+        clearAttached: () => clearAttachedFiles(),
+        compactContext: opts => compactContext(opts)
     };
 
     // ------------------------------------------------------------------
@@ -310,10 +388,13 @@
                 return acc;
             }, {}),
             projectName: activeFolder ? activeFolder.name : runtime.projectName,
+            projectFiles: core.listFiles(),
             sourceFiles: runtime.sourceFiles,
             openPath: core.store.openPath,
             pendingQuestion: runtime.pendingQuestion,
             isHistoryOpen: Boolean(runtime.isHistoryOpen),
+            hasCompaction: Boolean(runtime.compaction || (runtime.currentRun && runtime.currentRun.compaction)),
+            compaction: runtime.compaction || (runtime.currentRun && runtime.currentRun.compaction) || null,
             run: runtime.currentRun,
             modal: runtime.modal,
             toast: runtime.toast,
@@ -857,10 +938,23 @@
 
     function rebuildMessagesFromRun(run) {
         runtime.messages = [];
-        if (!run) return;
+        if (!run) {
+            runtime.compaction = null;
+            return;
+        }
+        runtime.compaction = run.compaction || null;
         if (Array.isArray(run.messages) && run.messages.length) {
             runtime.messages = run.messages.map(item => Object.assign({}, item));
             return;
+        }
+        if (run.compaction) {
+            runtime.messages.push({
+                id: core.uid('msg'),
+                role: 'compaction',
+                at: run.compaction.at,
+                compaction: run.compaction,
+                text: `⚡ Context Compacted (${run.compaction.savedPercent}% reduction • ${run.compaction.originalTokens} → ${run.compaction.compactedTokens} tokens)`
+            });
         }
         if (run.idea) {
             runtime.messages.push({
@@ -895,6 +989,7 @@
         runtime.currentRun = null;
         runtime.activeRunId = '';
         runtime.messages = [];
+        runtime.compaction = null;
         runtime.pendingQuestion = null;
         runtime.isHistoryOpen = false;
         runtime.folder = 'cb-agent';
@@ -907,6 +1002,68 @@
         renderHostSurfaces();
         renderPage();
         focusComposer();
+    }
+
+    async function compactContext(options) {
+        if (runtime.busy) {
+            setToast('Cannot compact context while agent is busy.', 'warn');
+            return;
+        }
+        const opts = options || {};
+        const nonCompactionMessages = (runtime.messages || []).filter(m => m.role !== 'compaction');
+        if (nonCompactionMessages.length < 2 && !runtime.compaction) {
+            if (!opts.silent) setToast('Conversation history is too brief to compact.', 'info');
+            return;
+        }
+
+        const run = runtime.currentRun || (core.store && core.store.activeRunId && core.findRun(core.store.activeRunId));
+        const settings = core.readSettings();
+        const activeFolder = core.activeFolder();
+
+        if (!opts.silent) setToast('⚡ Compacting context using Anti-gravity protocol…', 'info', 3000);
+
+        const compaction = await agent.compressContext({
+            messages: runtime.messages,
+            run,
+            activeFolder,
+            settings,
+            useModel: opts.useModel !== false
+        });
+
+        if (!compaction) return;
+
+        if (run) {
+            run.compaction = compaction;
+            core.saveRun(run);
+        }
+        runtime.compaction = compaction;
+
+        const compactionMessage = {
+            id: core.uid('msg'),
+            role: 'compaction',
+            at: compaction.at,
+            compaction,
+            text: `⚡ Context Compacted (${compaction.savedPercent}% reduction • ${compaction.originalTokens} → ${compaction.compactedTokens} tokens)`
+        };
+
+        const recent = runtime.messages.slice(-1).filter(m => m.role !== 'compaction');
+        runtime.messages = [compactionMessage, ...recent];
+
+        saveCurrentRunMessages();
+        renderPage();
+        scrollTranscriptToEnd();
+
+        setToast(`⚡ Context compacted: ${compaction.savedPercent}% tokens saved (${compaction.compactedTokens} tokens retained).`, 'success', 5000);
+    }
+
+    function checkAutoCompaction() {
+        const settings = core.readSettings();
+        if (settings.contextCompression === false) return;
+        const threshold = Number(settings.autoCompactThreshold) || 6;
+        const count = (runtime.messages || []).filter(m => m.role !== 'compaction').length;
+        if (count >= threshold && !runtime.busy) {
+            void compactContext({ silent: true, useModel: false });
+        }
     }
 
     function startNewRun() {
@@ -1094,7 +1251,10 @@
             idea,
             answers: [],
             signal: abortController.signal,
-            requirementsText: idea
+            requirementsText: idea,
+            activeFolderId: runtime.activeFolderId || (core.store && core.store.activeFolderId),
+            sourceFiles: runtime.sourceFiles,
+            compaction: runtime.compaction || (run && run.compaction) || null
         };
 
         try {
@@ -1128,10 +1288,14 @@
             });
 
             if (stale()) return;
-            assistantMessage.paths = result.writtenPaths;
-            assistantMessage.text = result.writtenPaths.length
+            assistantMessage.paths = result.writtenPaths || run.writtenPaths || [];
+            assistantMessage.text = (result.writtenPaths && result.writtenPaths.length)
                 ? 'Run complete. Every document is in the project tree — review before treating it as final.'
                 : 'Run complete.';
+            if (result && result.status === 'gaps') {
+                assistantMessage.status = 'gaps';
+                assistantMessage.text = 'The document was written, but self-review found missing sections. You can click **Repair Gaps** on the review step above to complete them automatically.';
+            }
             runtime.projectName = run.projectName || runtime.projectName;
             setToast(`${skill.name} finished.`, 'success');
         } catch (error) {
@@ -1144,6 +1308,7 @@
                         : 'This skill needs an existing PRD. Run PRD Builder first, or add a PRD under docs/prd/.';
                 assistantMessage.canRetry = true;
                 if (error.code !== 'aborted') setToast(assistantMessage.text, 'warn');
+                else setToast('Run stopped.', 'info');
             } else {
                 const message = String((error && error.message) || 'The run failed.');
                 run.status = 'error';
@@ -1156,8 +1321,8 @@
         } finally {
             stopLiveTicker();
             if (!stale()) {
-                assistantMessage.busy = false;
                 runtime.busy = false;
+                assistantMessage.busy = false;
                 runtime.hint = '';
                 runtime.pendingQuestion = null;
                 runtime.currentController = null;
@@ -1167,6 +1332,7 @@
                 renderHostSurfaces();
                 renderPage();
                 scrollTranscriptToEnd();
+                checkAutoCompaction();
             }
         }
     }
@@ -1210,6 +1376,10 @@
             clearChat();
             return;
         }
+        if (firstToken === '/compact') {
+            await compactContext({ useModel: true });
+            return;
+        }
         if (firstToken === '/help') {
             const helpText = [
                 '**Anti-gravity Slash Commands:**',
@@ -1219,6 +1389,7 @@
                 '- `/arch <idea>` — Evaluate codebase architecture against requirements',
                 '- `/docs <idea>` — Generate backlog, API contract sketch, and onboarding docs',
                 '- `/code2prd` — Reverse-engineer a PRD from attached codebase',
+                '- `/compact` — Compact conversation context (Anti-gravity Protocol)',
                 '- `/clear` — Clear the transcript'
             ].join('\n');
             runtime.messages.push({
@@ -1311,10 +1482,11 @@
         renderPage();
 
         try {
+            const compactionPrefix = runtime.compaction ? (agent.formatCompactionPrompt(runtime.compaction) + '\n\n---\n\n') : '';
             await agent.runModelStep(step, {
                 systemPrompt: 'You are a product planning analyst revising one document. Return only the complete revised Markdown document, with no preamble and no commentary.',
                 prompt: [
-                    'Revise the document below according to the instruction, then return the COMPLETE revised document.',
+                    compactionPrefix + 'Revise the document below according to the instruction, then return the COMPLETE revised document.',
                     '',
                     'Rules:',
                     '- Keep the existing section structure unless the instruction asks to change it.',
@@ -1367,6 +1539,7 @@
                 loadRuns();
                 renderHostSurfaces();
                 renderPage();
+                checkAutoCompaction();
             }
         }
     }
@@ -1570,9 +1743,9 @@
         let result;
         try {
             result = await core.importFolder(files, pickedName, {
-                maxFileKb: settings.maxSourceFileKb,
-                maxFiles: settings.maxSourceFiles,
-                maxTotalKb: settings.maxSourceTotalKb
+                maxFileKb: Math.max(1024, Number(settings.maxSourceFileKb) || 512),
+                maxFiles: 1000,
+                maxTotalKb: 32768
             });
         } catch (error) {
             runtime.busyImport = false;
@@ -1664,6 +1837,61 @@
         core.deleteFile(path);
         noteFileDeleted(path);
         setToast(`Detached ${path}.`, 'info');
+        renderHostSurfaces();
+        renderPage();
+    }
+
+    function attachExistingFile(path) {
+        const cleanPath = String(path || '').replace(/^\/+/, '').trim();
+        if (!cleanPath) return false;
+        const record = core.readFile(cleanPath);
+        if (!record || typeof record.content !== 'string') {
+            setToast(`Could not read ${cleanPath}.`, 'error');
+            return false;
+        }
+        if (!record.content.trim()) {
+            setToast(`"${cleanPath}" is empty — nothing to attach.`, 'error');
+            return false;
+        }
+        if (record.content.length > ui.MAX_SOURCE_FILE_BYTES) {
+            setToast(`${cleanPath} is ${Math.round(record.content.length / 1024)} KB; the limit is ${Math.round(ui.MAX_SOURCE_FILE_BYTES / 1024)} KB.`, 'error');
+            return false;
+        }
+        if (runtime.sourceFiles.length >= ui.MAX_SOURCE_FILES) {
+            setToast(`At most ${ui.MAX_SOURCE_FILES} files can be attached. Detach one first.`, 'error');
+            return false;
+        }
+        const total = runtime.sourceFiles.reduce((sum, file) => sum + file.content.length, 0) + record.content.length;
+        if (total > ui.MAX_SOURCE_TOTAL_BYTES) {
+            setToast(`Attached source would exceed ${Math.round(ui.MAX_SOURCE_TOTAL_BYTES / 1024)} KB total.`, 'error');
+            return false;
+        }
+        if (runtime.sourceFiles.some(file => file.path === cleanPath)) {
+            setToast(`${cleanPath} is already attached to prompt context.`, 'info');
+            return false;
+        }
+        runtime.sourceFiles.push({ path: cleanPath, content: record.content });
+        setToast(`Attached ${cleanPath} to context.`, 'success');
+        renderHostSurfaces();
+        renderPage();
+        return true;
+    }
+
+    function detachSourceFile(path) {
+        const cleanPath = String(path || '').trim();
+        const initialLen = runtime.sourceFiles.length;
+        runtime.sourceFiles = runtime.sourceFiles.filter(file => file.path !== cleanPath);
+        if (runtime.sourceFiles.length < initialLen) {
+            setToast(`Detached ${cleanPath} from prompt context.`, 'info');
+            renderHostSurfaces();
+            renderPage();
+        }
+    }
+
+    function clearAttachedFiles() {
+        if (!runtime.sourceFiles.length) return;
+        runtime.sourceFiles = [];
+        setToast('Detached all source files from prompt context.', 'info');
         renderHostSurfaces();
         renderPage();
     }
@@ -1949,6 +2177,9 @@
                 return;
             case 'clear-chat':
                 clearChat();
+                return;
+            case 'compact-context':
+                void compactContext({ useModel: true });
                 return;
             case 'open-chat-run': {
                 const runId = target.dataset.runId;
@@ -2325,6 +2556,17 @@
             case 'add-source-file':
                 openAddSourceModal();
                 return;
+            case 'detach-source-file': {
+                const path = target.dataset.path || (target.closest('[data-path]')?.dataset.path) || '';
+                if (path) detachSourceFile(path);
+                return;
+            }
+            case 'clear-attached-files':
+                clearAttachedFiles();
+                return;
+            case 'go-files':
+                goToSection('cb-files');
+                return;
             case 'new-file':
                 openNewFileModal();
                 return;
@@ -2507,9 +2749,44 @@
     }
 
     function onChange(event) {
-        if (!isBlueprintPage() || !runtime.modal) return;
+        if (!isBlueprintPage()) return;
         const target = event.target;
-        if (!target || target.dataset.cbField !== 'file') return;
+        if (!target) return;
+
+        if (target.dataset.cbRole === 'composer-folder-select') {
+            const val = target.value;
+            if (val === '__new__') {
+                target.value = runtime.activeFolderId || core.DEFAULT_FOLDER_ID;
+                openNewFolderModal();
+                return;
+            }
+            if (val === '__import__') {
+                target.value = runtime.activeFolderId || core.DEFAULT_FOLDER_ID;
+                pickFolderFromDisk();
+                return;
+            }
+            if (val && val !== (runtime.activeFolderId || core.DEFAULT_FOLDER_ID)) {
+                selectFolder(val);
+            }
+            return;
+        }
+
+        if (target.dataset.cbRole === 'composer-file-select') {
+            const val = target.value;
+            if (val === '__add__') {
+                target.value = '';
+                openAddSourceModal();
+                return;
+            }
+            if (val) {
+                attachExistingFile(val);
+                target.value = '';
+            }
+            return;
+        }
+
+        if (!runtime.modal) return;
+        if (target.dataset.cbField !== 'file') return;
         const file = target.files && target.files[0];
         if (!file) return;
         if (file.size > ui.MAX_SOURCE_FILE_BYTES) {

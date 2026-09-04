@@ -176,6 +176,114 @@
         }
     }
 
+    // ------------------------------------------------------------------
+    // Anti-gravity Context Compression Protocol
+    // ------------------------------------------------------------------
+
+    function formatCompactionPrompt(compaction) {
+        if (!compaction || !compaction.rawText) return '';
+        return String(compaction.rawText).trim();
+    }
+
+    function injectCompactionIntoPrompt(prompt, compaction) {
+        if (!compaction || !compaction.rawText) return prompt;
+        const formatted = formatCompactionPrompt(compaction);
+        if (!formatted) return prompt;
+        return `${formatted}\n\n---\n\n${prompt}`;
+    }
+
+    /**
+     * Anti-gravity Context Compactor
+     *
+     * Synthesizes a dense, structured compaction adhering strictly to the Anti-gravity
+     * schema. Attempts a model turn if an endpoint is active, or relies deterministically
+     * on core.buildDeterministicCompaction.
+     */
+    async function compressContext(options) {
+        const opts = options || {};
+        const messages = Array.isArray(opts.messages) ? opts.messages : [];
+        const run = opts.run || null;
+        const settings = opts.settings || core.readSettings();
+        const activeFolder = opts.activeFolder || (core && core.activeFolder && core.activeFolder());
+        const signal = opts.signal;
+
+        const deterministic = core.buildDeterministicCompaction({
+            messages,
+            run,
+            activeFolder,
+            settings
+        });
+
+        if (!opts.useModel || !core.streamModelTurn || typeof core.streamModelTurn !== 'function') {
+            return deterministic;
+        }
+
+        try {
+            const compactorPrompt = [
+                'Compress the following user requests, agent execution steps, and planning history into a structured Anti-gravity compaction block.',
+                '',
+                'Follow this exact schema:',
+                '### 1. Task Overview',
+                '### 2. Progress',
+                '### 3. Key Findings & Decisions',
+                '### 4. Active Context',
+                '### 5. Next Steps',
+                '### 6. Commitments & Constraints',
+                '',
+                '## Raw History & User Requests:',
+                deterministic.userRequests.map((r, i) => `${i + 1}. ${r}`).join('\n'),
+                '',
+                '## Completed Artifacts & Details:',
+                deterministic.summary
+            ].join('\n');
+
+            let modelOutput = '';
+            await core.streamModelTurn({
+                systemPrompt: 'You are the Anti-gravity Context Compactor. Compress the conversation history into the Anti-gravity structured schema. Retain all user requests, decisions, and constraints. Return only the markdown sections.',
+                message: compactorPrompt,
+                maxOutputTokens: 2048,
+                temperature: 0.2,
+                signal
+            }, {
+                onDelta: (_d, full) => { modelOutput = full; }
+            });
+
+            if (modelOutput && modelOutput.includes('### 1. Task Overview')) {
+                const refinedSummary = modelOutput.trim();
+                const rawCompaction = [
+                    '# Resuming from a compaction',
+                    '',
+                    'You are continuing work on the task described above, but you have lost access to the full conversation history, and need to resume work efficiently using the progress summary below:',
+                    '',
+                    '# User Requests',
+                    'The following were user requests from the truncated conversation in chronological order:',
+                    deterministic.userRequests.map((req, idx) => `${idx + 1}. ${req}`).join('\n'),
+                    '',
+                    '<summary>',
+                    refinedSummary,
+                    '</summary>'
+                ].join('\n');
+
+                const originalTokens = deterministic.originalTokens;
+                const compactedTokens = Math.max(1, Math.round(rawCompaction.length / 3.8));
+                const savedTokens = Math.max(0, originalTokens - compactedTokens);
+                const savedPercent = originalTokens > 0 ? Math.min(95, Math.max(0, Math.round((savedTokens / originalTokens) * 100))) : 0;
+
+                return Object.assign({}, deterministic, {
+                    summary: refinedSummary,
+                    rawText: rawCompaction,
+                    compactedTokens,
+                    savedTokens,
+                    savedPercent
+                });
+            }
+        } catch (error) {
+            console.warn('[codalio-blueprint] model-assisted compaction deferred to deterministic engine', error);
+        }
+
+        return deterministic;
+    }
+
     /**
      * Collect the existing project documents a skill wants to read (e.g. a PRD
      * for doc-generation), newest first per folder.
@@ -216,10 +324,29 @@
         const cfg = settings || core.readSettings();
         if (cfg.includeSourceInPrompts === false) return [];
 
-        const attached = Array.isArray(projectState.sourceFiles) ? projectState.sourceFiles : [];
-        const maxFiles = Number(cfg.maxSourceFiles) || 12;
-        const maxFileBytes = (Number(cfg.maxSourceFileKb) || 120) * 1024;
-        const maxTotalBytes = (Number(cfg.maxSourceTotalKb) || 420) * 1024;
+        let attached = Array.isArray(projectState.sourceFiles) ? projectState.sourceFiles.filter(Boolean) : [];
+
+        // Standalone Direct Project Access:
+        // If no files were manually attached in the editor, automatically access the project
+        // files from the active project folder!
+        if (!attached.length && core && typeof core.listFiles === 'function') {
+            const activeFolderId = projectState.activeFolderId || (core.store && core.store.activeFolderId);
+            const folderFiles = core.listFiles(activeFolderId);
+            const targetFiles = folderFiles.length ? folderFiles : core.listFiles();
+
+            // Filter out generated docs, prioritize source code and project configs
+            const sourcePaths = targetFiles.filter(p => !p.startsWith('docs/'));
+            const finalPaths = sourcePaths.length ? sourcePaths : targetFiles;
+
+            attached = finalPaths.map(p => {
+                const rec = core.readFile(p);
+                return rec ? { path: rec.path, content: rec.content } : null;
+            }).filter(Boolean);
+        }
+
+        const maxFiles = Number(cfg.maxSourceFiles) || 50;
+        const maxFileBytes = (Number(cfg.maxSourceFileKb) || 500) * 1024;
+        const maxTotalBytes = (Number(cfg.maxSourceTotalKb) || 2048) * 1024;
 
         let total = 0;
         const selected = [];
@@ -482,6 +609,8 @@
             projectName: run.projectName
         };
 
+        const compaction = input.compaction || (run && run.compaction) || null;
+
         // ---- Clarifying questions (one at a time, as visible steps) ----
         const answers = await askClarifyingQuestions(
             run,
@@ -517,12 +646,14 @@
                 throw failure;
             }
             input.sourceFiles = attached;
+            const summaryPaths = attached.map(file => file.path);
+            const summaryText = summaryPaths.slice(0, 6).join(', ') + (summaryPaths.length > 6 ? ` (+${summaryPaths.length - 6} more)` : '');
             const listed = makeStep({
                 kind: 'notice',
-                label: `Reading ${attached.length} attached source file${attached.length === 1 ? '' : 's'}`,
-                summary: attached.map(file => file.path).join(', '),
+                label: `Reading ${attached.length} project source file${attached.length === 1 ? '' : 's'}`,
+                summary: summaryText,
                 status: 'done',
-                text: attached.map(file => `- \`${file.path}\` — ${file.lines} lines`).join('\n'),
+                text: attached.map(file => `- \`${file.path}\` — ${file.lines} lines (read-only)`).join('\n'),
                 open: false
             });
             emit(listed);
@@ -593,11 +724,12 @@
             render();
 
             const runLens = async (lens, step) => {
-                const prompt = lens.buildPrompt({
+                const rawPrompt = lens.buildPrompt({
                     idea: input.idea,
                     answers: input.answers,
                     requirementsText: input.requirementsText
                 });
+                const prompt = injectCompactionIntoPrompt(rawPrompt, compaction);
                 await runModelStep(step, {
                     prompt,
                     substatus: `Analyzing ${lens.label}…`,
@@ -662,7 +794,7 @@
             emit(step);
             render();
 
-            const prompt = phase.buildPrompt({
+            const rawPrompt = phase.buildPrompt({
                 idea: input.idea,
                 answers: input.answers,
                 requirementsText: input.requirementsText,
@@ -671,6 +803,7 @@
                 existingDocs: input.existingDocs,
                 sourceFiles: input.sourceFiles
             });
+            const prompt = injectCompactionIntoPrompt(rawPrompt, compaction);
 
             await runModelStep(step, {
                 prompt,
@@ -910,6 +1043,9 @@
         reviewDocument,
         systemPromptWith,
         promptPreview,
-        bounded
+        bounded,
+        formatCompactionPrompt,
+        injectCompactionIntoPrompt,
+        compressContext
     });
 }());
