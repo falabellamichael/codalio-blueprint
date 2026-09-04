@@ -299,4 +299,4 @@ The planning methodology, lens prompts, process flows, output contracts, documen
 
 The SimpleRAG plug-in — the page, tabbed workspace, step engine, agent runtime, file previewer, installer, stylesheet and tests — is by **Michael Anthony Falabella** (MIT).
 
-Both bodies of work are MIT licensed. See [LICENSE](LICENSE).
+Both bodies of work are MIT licensed. See [LICENSE](LICENSE), which is upstream's MIT text verbatim plus this fork's copyright line; the attribution detail — which part of the tree belongs to whom, and the Notepad++ layout-idea note — is in [NOTICE](NOTICE).

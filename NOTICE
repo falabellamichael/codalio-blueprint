@@ -1,0 +1,39 @@
+NOTICE — codalio-blueprint (SimpleRAG fork)
+
+This repository is a fork of https://github.com/codalio/codalio-blueprint.
+It contains two bodies of work, both licensed under the MIT License in the
+LICENSE file at the root of this repository.
+
+1. Upstream codalio-blueprint — Copyright (c) 2026 Codalio
+
+   The planning skill sources under skills/, the sample outputs under
+   examples/, and the vendor plugin manifests (.claude-plugin/,
+   .cursor-plugin/, .codex-plugin/, .antigravity-plugin/,
+   gemini-extension.json).
+
+   Codalio's copyright and permission notice is reproduced verbatim and
+   unmodified in LICENSE, as the MIT License requires for all copies and
+   substantial portions of the Software.
+
+2. The SimpleRAG plug-in added by this fork — Copyright (c) 2026 Michael
+   Anthony Falabella
+
+   The Blueprint page, tabbed workspace, agent runtime, file previewer,
+   installer, stylesheet and tests under src/, tests/ and tools/.
+
+   src/skills.js is an original executable port of the upstream skills. The
+   methodology, lens prompts, process flows, output contracts, document
+   templates and output paths it encodes are Codalio's and remain under
+   Codalio's copyright; the port's expression is this fork's.
+
+Neither body of work depends on the other at runtime. README.md describes which
+half of the tree does what, and how to pull upstream changes.
+
+THIRD-PARTY LAYOUT NOTE
+
+The file previewer under src/preview.js takes its LAYOUT IDEA — a line-number
+gutter, syntax colouring, and a status bar reporting Ln / Col — from Notepad++.
+Notepad++ is a GPL-licensed C++ Win32 desktop application with no browser
+component, so none of its source is used, adapted, or reproduced here; the
+previewer is original to this repository. The idea is credited in the source
+file and in README.md.
