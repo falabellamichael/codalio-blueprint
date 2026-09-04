@@ -178,6 +178,7 @@
         hint: '',
         showSettings: false,
         viewerMode: 'preview',
+        editingPath: null,
         expanded: new Set(['docs', 'docs/prd']),
         // Project folder roots are OPEN unless collapsed here, so the Project Files
         // pane shows files on arrival rather than a list of folder names.
@@ -189,6 +190,16 @@
         activeRunId: '',
         projectName: '',
         sourceFiles: [],
+        sourceFileMode: 'combine',
+        fileSelector: {
+            open: false,
+            selectedPaths: new Set(),
+            search: '',
+            category: 'all',
+            folderId: 'all',
+            previewPath: null,
+            reviewMode: 'combine'
+        },
         modal: null,
         toast: null,
         toastTimer: null,
@@ -821,7 +832,22 @@
         attachFile: path => attachExistingFile(path),
         detachFile: path => detachSourceFile(path),
         clearAttached: () => clearAttachedFiles(),
-        compactContext: opts => compactContext(opts)
+        compactContext: opts => compactContext(opts),
+        openFileSelector: opts => openFileSelectorOverlay(opts),
+        closeFileSelector: () => closeFileSelectorOverlay(),
+        toggleAttachedMode: () => toggleAttachedMode(),
+        fsoSetMode: mode => fsoSetMode(mode),
+        fsoToggleFile: (path, opts) => fsoToggleFile(path, opts),
+        fsoSelectAll: () => fsoSelectAllFiltered(),
+        fsoDeselectAll: () => fsoDeselectAll(),
+        fsoInvert: () => fsoInvertSelection(),
+        fsoFillBudget: () => fsoFillBudget(),
+        fsoSelectExt: ext => fsoSelectExt(ext),
+        fsoSelectDir: dir => fsoSelectDir(dir),
+        fsoDeselectDir: dir => fsoDeselectDir(dir),
+        fsoHandleBulkFiles: files => fsoHandleBulkFiles(files),
+        fsoConfirm: () => fsoConfirmSelection(),
+        fsoReviewNow: () => fsoReviewNow()
     };
 
     // ------------------------------------------------------------------
@@ -1190,6 +1216,7 @@
             viewerMode: runtime.workspace && core.store.openPath
                 ? wsViewerMode(core.store.openPath, settings, core.store.openFolderId)
                 : runtime.viewerMode,
+            editingPath: runtime.editingPath || null,
             expanded: runtime.expanded,
             collapsedRoots: runtime.collapsedRoots,
             selectedSkillId: runtime.selectedSkillId,
@@ -1210,6 +1237,14 @@
             projectName: activeFolder ? activeFolder.name : runtime.projectName,
             projectFiles: core.listFiles(activeFolder ? activeFolder.id : undefined),
             sourceFiles: activeSourceFiles(),
+            // Gemini's file selector overlay reads these two keys straight off the
+            // host-surface state (ui.renderFileSelectorOverlay at src/ui.js).
+            // Sol already owns runtime.fileSelector / runtime.sourceFileMode and
+            // every handler for them; only this snapshot handoff was missing, so
+            // without these keys the overlay renders from its internal defaults
+            // and search/category/bulk-selection state resets on every re-render.
+            sourceFileMode: runtime.sourceFileMode || 'combine',
+            fileSelector: runtime.fileSelector || null,
             openPath: core.store.openPath,
             openFolderId: core.store.openFolderId,
             pendingQuestion: runtime.pendingQuestion,
@@ -1242,9 +1277,18 @@
     function renderPage() {
         const elements = hostElements();
         if (!elements || !elements.settingsContainer) return;
+        if (!runtime.active) return;
         if (runtime.context && runtime.context.state && runtime.context.state.app !== APP_ID) return;
 
         const container = elements.settingsContainer;
+        let searchFocusPos = null;
+        if (runtime.fileSelector && runtime.fileSelector.open) {
+            const currentSearch = container.querySelector('[data-cb-role="fso-search"]');
+            if (currentSearch && document.activeElement === currentSearch) {
+                searchFocusPos = typeof currentSearch.selectionStart === 'number' ? currentSearch.selectionStart : currentSearch.value.length;
+            }
+        }
+
         const previousScroll = captureScroll();
         container.innerHTML = '';
 
@@ -1254,12 +1298,24 @@
         // The reading pane is the tabbed workspace: strip + active panel.
         container.appendChild(ui.renderWorkspace(snapshot));
 
+        if (runtime.fileSelector && runtime.fileSelector.open) {
+            container.appendChild(ui.renderFileSelectorOverlay(snapshot));
+            if (searchFocusPos !== null) {
+                const newSearch = container.querySelector('[data-cb-role="fso-search"]');
+                if (newSearch) {
+                    newSearch.focus();
+                    try { newSearch.setSelectionRange(searchFocusPos, searchFocusPos); } catch (_) {}
+                }
+            }
+        }
         if (runtime.modal) container.appendChild(ui.renderModal(snapshot));
         if (runtime.toast) container.appendChild(ui.renderToast(snapshot));
 
         restoreScroll(previousScroll);
         bindDividerDrag(container);
-        if (!runtime.busy && isAgentTabActive() && !runtime.modal) focusComposer(true);
+        if (!runtime.busy && isAgentTabActive() && !runtime.modal && (!runtime.fileSelector || !runtime.fileSelector.open)) {
+            focusComposer(true);
+        }
     }
 
     /**
@@ -1825,15 +1881,25 @@
         return (transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight) <= threshold;
     }
 
+    let scrollRaf = null;
     function scrollTranscriptToEnd(force = false) {
-        const elements = hostElements();
-        const transcript = elements && elements.settingsContainer
-            ? elements.settingsContainer.querySelector('[data-cb-role="transcript"]')
-            : null;
-        if (!transcript) return;
-        // Do not hijack the scroll position if user has scrolled away from the bottom to read
-        if (force || isTranscriptNearBottom(transcript)) {
-            transcript.scrollTop = transcript.scrollHeight;
+        if (!runtime.active) return;
+        const doScroll = () => {
+            scrollRaf = null;
+            const elements = hostElements();
+            const transcript = elements && elements.settingsContainer
+                ? elements.settingsContainer.querySelector('[data-cb-role="transcript"]')
+                : null;
+            if (!transcript) return;
+            if (force || isTranscriptNearBottom(transcript)) {
+                transcript.scrollTop = transcript.scrollHeight;
+            }
+        };
+        if (typeof requestAnimationFrame === 'function') {
+            if (scrollRaf) return;
+            scrollRaf = requestAnimationFrame(doScroll);
+        } else {
+            doScroll();
         }
     }
 
@@ -1843,6 +1909,7 @@
     }
 
     function renderHostSurfaces() {
+        if (!runtime.active) return;
         const render = runtime.context && runtime.context.render;
         if (!render) return;
         try {
@@ -2708,10 +2775,14 @@
         }
         if (!await ensureBackendIdle() || operationBusy()) return;
         const opts = options || {};
+        if (runtime.busy && !opts.allowBusy && opts.reason !== 'overflow-recovery') {
+            setToast('Cannot compact context while agent is busy.', 'warn');
+            return null;
+        }
         const nonCompactionMessages = (runtime.messages || []).filter(m => m.role !== 'compaction');
-        if (nonCompactionMessages.length < 2 && !runtime.compaction) {
+        if (nonCompactionMessages.length < 2 && !runtime.compaction && !opts.force) {
             if (!opts.silent) setToast('Conversation history is too brief to compact.', 'info');
-            return;
+            return null;
         }
 
         const run = runtime.currentRun || (core.store && core.store.activeRunId && core.findRun(core.store.activeRunId));
@@ -2831,14 +2902,47 @@
         }
     }
 
-    function checkAutoCompaction() {
+    async function checkAutoCompaction(options) {
+        const opts = options || {};
         const settings = core.readSettings();
-        if (settings.contextCompression === false) return;
+        if (settings.contextCompression === false && !opts.force) return null;
+
         const threshold = Number(settings.autoCompactThreshold) || 6;
-        const count = (runtime.messages || []).filter(m => m.role !== 'compaction').length;
-        if (count >= threshold && !operationBusy()) {
-            void compactContext({ silent: true, useModel: false });
+        const msgs = runtime.messages || [];
+
+        // Count uncompacted user/assistant messages AND tokens since the last
+        // compaction. Walking BACKWARDS to the compaction boundary matters:
+        // counting every non-compaction message in the whole transcript keeps
+        // rising after the first compaction, so the threshold would re-trigger
+        // forever and never reset. Sol's `operationBusy()` guard is kept for the
+        // automatic path because it also fences imports, not just model turns.
+        let uncompactedCount = 0;
+        let uncompactedTokens = 0;
+        for (let i = msgs.length - 1; i >= 0; i -= 1) {
+            const m = msgs[i];
+            if (!m) continue;
+            if (m.role === 'compaction' || m.compaction) break;
+            if (m.role === 'user' || m.role === 'assistant') {
+                uncompactedCount += 1;
+                uncompactedTokens += core.estimateTokens(m.text || '')
+                    + (Array.isArray(m.paths) ? m.paths.length * 80 : 0);
+            }
         }
+
+        const tokenBudgetExceeded = uncompactedTokens >= 2000;
+        const countThresholdExceeded = uncompactedCount >= threshold;
+
+        if (opts.force || tokenBudgetExceeded || countThresholdExceeded) {
+            if (!operationBusy() || opts.allowBusy || opts.reason === 'overflow-recovery') {
+                return await compactContext({
+                    silent: opts.silent !== undefined ? opts.silent : !opts.force,
+                    useModel: false,
+                    allowBusy: opts.allowBusy || opts.reason === 'overflow-recovery',
+                    reason: opts.reason || (tokenBudgetExceeded ? 'token-budget' : 'auto-threshold')
+                });
+            }
+        }
+        return null;
     }
 
     function scheduleAutoCompaction(run, expectedMessages, expectedGeneration) {
@@ -3044,6 +3148,7 @@
             activePhases.forEach(phase => {
                 if (phase.startedAt) phase.elapsedMs = now - phase.startedAt;
             });
+            if (!runtime.active || !isAgentTabActive()) return;
             const elements = hostElements();
             const container = elements && elements.settingsContainer;
             if (container) {
@@ -3070,7 +3175,7 @@
                     }
                 });
             }
-        }, 100);
+        }, 200);
     }
 
     function stopLiveTicker() {
@@ -3381,7 +3486,17 @@
                     bindAssistantSteps(run);
                     if (step.status === 'running') scrollTranscriptToEnd();
                 },
-                onStream: () => { if (!stale()) scrollTranscriptToEnd(); },
+                // The merge left a SECOND onStep key here from Gemini's side of the
+                // conflict. Duplicate keys in one object literal are legal JS, so
+                // the later one silently won — and it called isCancelled(), the
+                // cancellation helper Sol replaced with the generation counter.
+                // That threw a ReferenceError on every step. Sol's onStep above is
+                // the one to keep; onStream keeps Gemini's tab-visibility guard but
+                // uses stale() for cancellation.
+                onStream: () => {
+                    if (stale()) return;
+                    if (runtime.active && isAgentTabActive()) scrollTranscriptToEnd();
+                },
                 // Open an editor tab for each document the skill writes, per
                 // Settings -> Agent -> Planning -> "Open written documents".
                 onFileWritten: (path, folderId) => {
@@ -3486,6 +3601,7 @@
             if (shouldAutoCompact) {
                 scheduleAutoCompaction(run, autoCompactMessages, generation);
             }
+            checkAutoCompaction();
         }
         return true;
     }
@@ -3540,6 +3656,30 @@
             await compactContext({ useModel: true });
             return;
         }
+        if (firstToken === '/files' || firstToken === '/selector') {
+            openFileSelectorOverlay();
+            return;
+        }
+        if (firstToken === '/review') {
+            const focusPrompt = trimmed.slice(firstToken.length).trim();
+            runtime.selectedSkillId = 'arch-eval';
+            if (!runtime.sourceFiles.length) {
+                openFileSelectorOverlay({ search: focusPrompt });
+                setToast('Select the files you want to review.', 'info');
+                return;
+            }
+            const reviewText = focusPrompt || 'Conduct a comprehensive architecture and code quality review of the attached source files.';
+            runtime.messages.push({
+                id: core.uid('msg'),
+                role: 'user',
+                at: new Date().toISOString(),
+                text: trimmed
+            });
+            renderPage();
+            scrollTranscriptToEnd();
+            await runSelectedSkill(reviewText);
+            return;
+        }
         if (firstToken === '/help') {
             consumeComposer();
             const helpText = [
@@ -3550,6 +3690,8 @@
                 '- `/arch <idea>` — Evaluate codebase architecture against requirements',
                 '- `/docs <idea>` — Generate backlog, API contract sketch, and onboarding docs',
                 '- `/code2prd` — Reverse-engineer a PRD from attached codebase',
+                '- `/files` — Open File Selector & Review Manager overlay',
+                '- `/review <focus>` — Review attached files with Architecture Evaluation',
                 '- `/compact` — Compact conversation context (Anti-gravity Protocol)',
                 '- `/clear` — Clear the transcript'
             ].join('\n');
@@ -3826,7 +3968,7 @@
                     settings
                 ),
                 prompt: [
-                    compactionPrefix + 'Revise the document below according to the instruction, then return the COMPLETE revised document.',
+                    compactionPrefix + `You are revising ${target} for ${reviseRun.projectName || 'the project'}.`,
                     '',
                     'Rules:',
                     '- Keep the existing section structure unless the instruction asks to change it.',
@@ -4618,6 +4760,411 @@
         renderPage();
     }
 
+    // ------------------------------------------------------------------
+    // File Selector & Review Manager Overlay
+    // ------------------------------------------------------------------
+
+    function openFileSelectorOverlay(opts = {}) {
+        const currentPaths = (runtime.sourceFiles || []).map(f => f.path);
+        const selected = new Set(opts.selectedPaths || currentPaths);
+        runtime.fileSelector = {
+            open: true,
+            selectedPaths: selected,
+            search: opts.search || '',
+            category: opts.category || 'all',
+            folderId: opts.folderId || 'all',
+            previewPath: opts.previewPath || (currentPaths[0] || null),
+            reviewMode: opts.mode || runtime.sourceFileMode || 'combine'
+        };
+        if (opts.mode) runtime.sourceFileMode = opts.mode;
+        renderPage();
+    }
+
+    function closeFileSelectorOverlay() {
+        if (runtime.fileSelector) {
+            runtime.fileSelector.open = false;
+        }
+        renderPage();
+    }
+
+    function toggleAttachedMode() {
+        runtime.sourceFileMode = runtime.sourceFileMode === 'exclusive' ? 'combine' : 'exclusive';
+        if (runtime.fileSelector) {
+            runtime.fileSelector.reviewMode = runtime.sourceFileMode;
+        }
+        setToast(
+            runtime.sourceFileMode === 'exclusive'
+                ? 'Review strategy: Independent (strictly evaluates only your chosen files)'
+                : 'Review strategy: On top of Agent files (augments automatic workspace discovery)',
+            'info'
+        );
+        renderHostSurfaces();
+        renderPage();
+    }
+
+    function fsoSetMode(mode) {
+        if (mode === 'combine' || mode === 'exclusive') {
+            runtime.sourceFileMode = mode;
+            if (runtime.fileSelector) {
+                runtime.fileSelector.reviewMode = mode;
+            }
+            renderPage();
+        }
+    }
+
+    function fsoToggleFile(path, opts = {}) {
+        if (!runtime.fileSelector || !path) return;
+        const selected = runtime.fileSelector.selectedPaths instanceof Set
+            ? runtime.fileSelector.selectedPaths
+            : new Set(runtime.fileSelector.selectedPaths || []);
+
+        const filtered = fsoGetFilteredPaths();
+        const last = runtime.fileSelector.lastClickedPath;
+
+        if (opts.shiftKey && last && last !== path && filtered.includes(last) && filtered.includes(path)) {
+            const idx1 = filtered.indexOf(last);
+            const idx2 = filtered.indexOf(path);
+            const start = Math.min(idx1, idx2);
+            const end = Math.max(idx1, idx2);
+            const range = filtered.slice(start, end + 1);
+
+            range.forEach(p => selected.add(p));
+            runtime.fileSelector.lastClickedPath = path;
+            runtime.fileSelector.previewPath = path;
+            runtime.fileSelector.selectedPaths = selected;
+            renderPage();
+            return;
+        }
+
+        if (selected.has(path)) {
+            selected.delete(path);
+        } else {
+            selected.add(path);
+        }
+        runtime.fileSelector.lastClickedPath = path;
+        runtime.fileSelector.selectedPaths = selected;
+        runtime.fileSelector.previewPath = path;
+        renderPage();
+    }
+
+    function fsoTogglePreview(path) {
+        if (!runtime.fileSelector || !path) return;
+        if (runtime.fileSelector.previewPath === path) {
+            runtime.fileSelector.previewPath = null;
+        } else {
+            runtime.fileSelector.previewPath = path;
+        }
+        renderPage();
+    }
+
+    function fsoGetFilteredPaths() {
+        if (!runtime.fileSelector) return [];
+        const fso = runtime.fileSelector;
+        const allPaths = (core && typeof core.listFiles === 'function') ? core.listFiles() : [];
+        const CODE_EXTS = new Set(['js', 'jsx', 'ts', 'tsx', 'py', 'java', 'c', 'cpp', 'cs', 'go', 'rs', 'rb', 'php', 'sh', 'bash', 'ps1', 'sql', 'html', 'css']);
+        const DOCS_EXTS = new Set(['md', 'markdown', 'txt', 'rst', 'adoc', 'pdf']);
+        const CONFIG_EXTS = new Set(['json', 'yaml', 'yml', 'toml', 'ini', 'xml', 'env', 'config']);
+        const query = String(fso.search || '').trim().toLowerCase();
+        const selected = fso.selectedPaths instanceof Set ? fso.selectedPaths : new Set(fso.selectedPaths || []);
+
+        let searchMatcher = null;
+        if (query && (query.includes('*') || query.includes('?'))) {
+            try {
+                const esc = '^' + query.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$';
+                searchMatcher = new RegExp(esc, 'i');
+            } catch (_) {}
+        }
+
+        return allPaths.filter(p => {
+            if (query) {
+                const matches = searchMatcher ? searchMatcher.test(p) : p.toLowerCase().includes(query);
+                if (!matches) return false;
+            }
+            const rec = core && typeof core.readFile === 'function' ? core.readFile(p) : null;
+            const folder = rec && rec.folder ? rec.folder : (core ? core.DEFAULT_FOLDER_ID : 'default');
+            if (fso.folderId && fso.folderId !== 'all' && folder !== fso.folderId) return false;
+            const ext = p.split('.').pop().toLowerCase();
+            if (fso.category === 'code') return CODE_EXTS.has(ext);
+            if (fso.category === 'docs') return DOCS_EXTS.has(ext);
+            if (fso.category === 'config') return CONFIG_EXTS.has(ext);
+            if (fso.category === 'selected') return selected.has(p);
+            return true;
+        });
+    }
+
+    function fsoSelectAllFiltered() {
+        if (!runtime.fileSelector) return;
+        const selected = runtime.fileSelector.selectedPaths instanceof Set
+            ? runtime.fileSelector.selectedPaths
+            : new Set(runtime.fileSelector.selectedPaths || []);
+        const filtered = fsoGetFilteredPaths();
+        filtered.forEach(p => selected.add(p));
+        runtime.fileSelector.selectedPaths = selected;
+        renderPage();
+    }
+
+    function fsoDeselectAll() {
+        if (!runtime.fileSelector) return;
+        runtime.fileSelector.selectedPaths = new Set();
+        renderPage();
+    }
+
+    function fsoInvertSelection() {
+        if (!runtime.fileSelector) return;
+        const selected = runtime.fileSelector.selectedPaths instanceof Set
+            ? runtime.fileSelector.selectedPaths
+            : new Set(runtime.fileSelector.selectedPaths || []);
+        const filtered = fsoGetFilteredPaths();
+        filtered.forEach(p => {
+            if (selected.has(p)) selected.delete(p);
+            else selected.add(p);
+        });
+        runtime.fileSelector.selectedPaths = selected;
+        renderPage();
+    }
+
+    function fsoFillBudget() {
+        if (!runtime.fileSelector) return;
+        const selected = runtime.fileSelector.selectedPaths instanceof Set
+            ? runtime.fileSelector.selectedPaths
+            : new Set(runtime.fileSelector.selectedPaths || []);
+
+        const filtered = fsoGetFilteredPaths();
+        const limits = ui.sourceLimits ? ui.sourceLimits() : {
+            maxFiles: ui.MAX_SOURCE_FILES || 8,
+            maxTotalBytes: ui.MAX_SOURCE_TOTAL_BYTES || (160 * 1024),
+            maxFileBytes: ui.MAX_SOURCE_FILE_BYTES || (48 * 1024)
+        };
+
+        let currentBytes = 0;
+        selected.forEach(p => {
+            const rec = core && typeof core.readFile === 'function' ? core.readFile(p) : null;
+            if (rec && rec.content) currentBytes += rec.content.length;
+        });
+
+        let addedCount = 0;
+        for (const p of filtered) {
+            if (selected.has(p)) continue;
+            if (selected.size >= limits.maxFiles) break;
+
+            const rec = core && typeof core.readFile === 'function' ? core.readFile(p) : null;
+            if (!rec || typeof rec.content !== 'string' || !rec.content.trim()) continue;
+            const bytes = rec.content.length;
+            if (bytes > limits.maxFileBytes) continue;
+            if (currentBytes + bytes > limits.maxTotalBytes) continue;
+
+            selected.add(p);
+            currentBytes += bytes;
+            addedCount++;
+        }
+
+        runtime.fileSelector.selectedPaths = selected;
+        if (addedCount > 0) {
+            setToast(`Filled budget: added ${addedCount} file(s). Total: ${selected.size}/${limits.maxFiles} (${Math.round(currentBytes / 1024)} KB).`, 'success');
+        } else if (selected.size >= limits.maxFiles || currentBytes >= limits.maxTotalBytes) {
+            setToast(`Context budget is already full (${selected.size} files, ${Math.round(currentBytes / 1024)} KB).`, 'info');
+        } else {
+            setToast('No additional matching files fit within the budget limit.', 'info');
+        }
+        renderPage();
+    }
+
+    function fsoSelectExt(ext) {
+        if (!runtime.fileSelector || !ext) return;
+        const selected = runtime.fileSelector.selectedPaths instanceof Set
+            ? runtime.fileSelector.selectedPaths
+            : new Set(runtime.fileSelector.selectedPaths || []);
+
+        const allPaths = (core && typeof core.listFiles === 'function') ? core.listFiles() : [];
+        const targetExt = String(ext).toLowerCase().replace(/^\./, '');
+        const matching = allPaths.filter(p => p.toLowerCase().endsWith('.' + targetExt));
+        if (!matching.length) return;
+
+        const allSelected = matching.every(p => selected.has(p));
+        if (allSelected) {
+            matching.forEach(p => selected.delete(p));
+            setToast(`Deselected ${matching.length} *.${targetExt} file(s).`, 'info');
+        } else {
+            matching.forEach(p => selected.add(p));
+            setToast(`Selected all ${matching.length} *.${targetExt} file(s).`, 'success');
+        }
+        runtime.fileSelector.selectedPaths = selected;
+        renderPage();
+    }
+
+    function fsoSelectDir(dir) {
+        if (!runtime.fileSelector) return;
+        const selected = runtime.fileSelector.selectedPaths instanceof Set
+            ? runtime.fileSelector.selectedPaths
+            : new Set(runtime.fileSelector.selectedPaths || []);
+
+        const filtered = fsoGetFilteredPaths();
+        const targetDir = String(dir || '');
+        const matching = filtered.filter(p => {
+            if (!targetDir || targetDir === '(root)') {
+                return !p.includes('/');
+            }
+            return p.startsWith(targetDir);
+        });
+
+        matching.forEach(p => selected.add(p));
+        runtime.fileSelector.selectedPaths = selected;
+        setToast(`Selected ${matching.length} file(s) in ${targetDir || 'root'}.`, 'success');
+        renderPage();
+    }
+
+    function fsoDeselectDir(dir) {
+        if (!runtime.fileSelector) return;
+        const selected = runtime.fileSelector.selectedPaths instanceof Set
+            ? runtime.fileSelector.selectedPaths
+            : new Set(runtime.fileSelector.selectedPaths || []);
+
+        const targetDir = String(dir || '');
+        const toDelete = [];
+        selected.forEach(p => {
+            if (!targetDir || targetDir === '(root)') {
+                if (!p.includes('/')) toDelete.push(p);
+            } else if (p.startsWith(targetDir)) {
+                toDelete.push(p);
+            }
+        });
+
+        toDelete.forEach(p => selected.delete(p));
+        runtime.fileSelector.selectedPaths = selected;
+        setToast(`Deselected ${toDelete.length} file(s) in ${targetDir || 'root'}.`, 'info');
+        renderPage();
+    }
+
+    async function fsoHandleBulkFiles(fileList) {
+        if (!fileList || !fileList.length) return;
+        const files = Array.from(fileList);
+        const folder = runtime.fileSelector && runtime.fileSelector.folderId !== 'all'
+            ? runtime.fileSelector.folderId
+            : (runtime.activeFolderId || core.DEFAULT_FOLDER_ID);
+
+        let imported = 0;
+        let errors = 0;
+        const selected = runtime.fileSelector && runtime.fileSelector.selectedPaths instanceof Set
+            ? runtime.fileSelector.selectedPaths
+            : new Set((runtime.fileSelector && runtime.fileSelector.selectedPaths) || []);
+
+        for (const file of files) {
+            try {
+                const text = await new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onload = () => resolve(String(reader.result || ''));
+                    reader.onerror = () => reject(reader.error);
+                    reader.readAsText(file);
+                });
+
+                const rawPath = file.webkitRelativePath || file.name;
+                const cleanName = String(rawPath).replace(/^[\\/]+/, '').replace(/[\\:*?"<>|]/g, '/');
+                const projectPath = cleanName.includes('/') ? cleanName : `src/${cleanName}`;
+
+                core.writeFile(projectPath, text, {
+                    origin: 'imported',
+                    folder
+                });
+
+                selected.add(projectPath);
+                imported++;
+            } catch (err) {
+                console.warn('[Blueprint] Failed to read bulk file:', file.name, err);
+                errors++;
+            }
+        }
+
+        if (runtime.fileSelector) {
+            runtime.fileSelector.selectedPaths = selected;
+        }
+
+        if (imported > 0) {
+            setToast(`Imported and selected ${imported} file(s) from disk${errors > 0 ? ` (${errors} failed)` : ''}.`, 'success');
+        } else {
+            setToast('No files could be imported.', 'error');
+        }
+        renderHostSurfaces();
+        renderPage();
+    }
+
+    function fsoConfirmSelection() {
+        if (!runtime.fileSelector) return false;
+        const selected = runtime.fileSelector.selectedPaths instanceof Set
+            ? runtime.fileSelector.selectedPaths
+            : new Set(runtime.fileSelector.selectedPaths || []);
+
+        const newSourceFiles = [];
+        let totalBytes = 0;
+        const maxFiles = ui.MAX_SOURCE_FILES || 8;
+        const maxTotalBytes = ui.MAX_SOURCE_TOTAL_BYTES || (160 * 1024);
+        const maxFileBytes = ui.MAX_SOURCE_FILE_BYTES || (48 * 1024);
+        let skippedCount = 0;
+
+        for (const p of selected) {
+            const rec = core.readFile(p);
+            if (!rec || typeof rec.content !== 'string' || !rec.content.trim()) {
+                skippedCount++;
+                continue;
+            }
+            if (rec.content.length > maxFileBytes) {
+                skippedCount++;
+                continue;
+            }
+            if (newSourceFiles.length >= maxFiles || totalBytes + rec.content.length > maxTotalBytes) {
+                skippedCount++;
+                continue;
+            }
+            totalBytes += rec.content.length;
+            newSourceFiles.push({ path: p, content: rec.content });
+        }
+
+        runtime.sourceFiles = newSourceFiles;
+        runtime.fileSelector.open = false;
+
+        const modeLabel = runtime.sourceFileMode === 'exclusive' ? 'Independent' : 'On top of Agent files';
+        if (skippedCount > 0) {
+            setToast(`Attached ${newSourceFiles.length} file(s) (${skippedCount} skipped due to limits/empty). Mode: ${modeLabel}.`, 'warn');
+        } else {
+            setToast(`Attached ${newSourceFiles.length} file(s) to prompt context. Mode: ${modeLabel}.`, 'success');
+        }
+        renderHostSurfaces();
+        renderPage();
+        return true;
+    }
+
+    async function fsoReviewNow() {
+        if (!runtime.fileSelector) return;
+        const selected = runtime.fileSelector.selectedPaths instanceof Set
+            ? runtime.fileSelector.selectedPaths
+            : new Set(runtime.fileSelector.selectedPaths || []);
+
+        if (selected.size === 0 && runtime.sourceFileMode === 'exclusive') {
+            setToast('Please select at least one file to review in independent mode.', 'warn');
+            return;
+        }
+
+        fsoConfirmSelection();
+
+        runtime.selectedSkillId = 'arch-eval';
+        const skill = selectedSkill();
+        const modeLabel = runtime.sourceFileMode === 'exclusive' ? 'independent' : 'augmented';
+        const count = runtime.sourceFiles.length;
+
+        goToSection('cb-agent');
+
+        const promptText = `Conduct a comprehensive architecture and code quality review of the attached source files (${count} file${count === 1 ? '' : 's'} in ${modeLabel} mode). Identify structural patterns, potential anti-patterns or bugs, modularity, security considerations, and recommended improvements.`;
+
+        runtime.messages.push({
+            id: core.uid('msg'),
+            role: 'user',
+            at: new Date().toISOString(),
+            text: promptText
+        });
+        renderPage();
+        scrollTranscriptToEnd();
+        await runSelectedSkill(promptText);
+    }
+
     function openNewFileModal() {
         if (operationBusy()) {
             setToast('Finish the active operation before creating a file.', 'warn');
@@ -5360,11 +5907,148 @@
                 }
                 return;
             }
+            case 'edit-file': {
+                const path = target.dataset.path || core.store.openPath;
+                if (!path) return;
+                runtime.editingPath = path;
+                const ws = wsModule();
+                if (ws && runtime.workspace) {
+                    ws.setViewerMode(runtime.workspace, path, 'source');
+                    persistWorkspace();
+                } else {
+                    runtime.viewerMode = 'source';
+                }
+                renderPage();
+                return;
+            }
+            case 'save-file': {
+                const path = target.dataset.path || runtime.editingPath || core.store.openPath;
+                if (!path) return;
+                const container = hostElements()?.settingsContainer || document;
+                const ta = container.querySelector('.cb-preview-textarea');
+                const content = ta ? ta.value : (core.readFile(path)?.content || '');
+                core.writeFile(path, content, { userEdit: true });
+                runtime.editingPath = null;
+                setToast(`Saved ${path}.`, 'success');
+                renderPage();
+                return;
+            }
+            case 'cancel-edit-file': {
+                runtime.editingPath = null;
+                renderPage();
+                return;
+            }
+            case 'preview-edit': {
+                const path = target.dataset.path || core.store.openPath;
+                if (path) {
+                    runtime.editingPath = runtime.editingPath === path ? null : path;
+                    renderPage();
+                }
+                return;
+            }
+            case 'preview-save': {
+                const path = target.dataset.path || runtime.editingPath || core.store.openPath;
+                if (!path) return;
+                const container = hostElements()?.settingsContainer || document;
+                const ta = container.querySelector('.cb-preview-textarea');
+                const content = ta ? ta.value : (core.readFile(path)?.content || '');
+                core.writeFile(path, content, { userEdit: true });
+                runtime.editingPath = null;
+                setToast(`Saved ${path}.`, 'success');
+                renderPage();
+                return;
+            }
+            case 'preview-cancel': {
+                runtime.editingPath = null;
+                renderPage();
+                return;
+            }
             case 'rename-file':
                 openRenameModal(target.dataset.path || '', target.dataset.folderId || currentFolderId());
                 return;
             case 'delete-file':
                 confirmDeleteFile(target.dataset.path || '', target.dataset.folderId || currentFolderId());
+                return;
+            case 'open-file-selector':
+                openFileSelectorOverlay();
+                return;
+            case 'close-file-selector':
+                closeFileSelectorOverlay();
+                return;
+            case 'toggle-attached-mode':
+                toggleAttachedMode();
+                return;
+            case 'fso-set-mode':
+                fsoSetMode(target.dataset.mode);
+                return;
+            case 'fso-search-clear':
+                if (runtime.fileSelector) {
+                    runtime.fileSelector.search = '';
+                    renderPage();
+                }
+                return;
+            case 'fso-category':
+                if (runtime.fileSelector) {
+                    runtime.fileSelector.category = target.dataset.category || 'all';
+                    renderPage();
+                }
+                return;
+            case 'fso-toggle-file': {
+                const p = target.dataset.path || (target.closest('[data-path]') && target.closest('[data-path]').dataset.path);
+                if (p) fsoToggleFile(p, { shiftKey: Boolean(event && event.shiftKey) });
+                return;
+            }
+            case 'fso-select-all':
+                fsoSelectAllFiltered();
+                return;
+            case 'fso-fill-budget':
+                fsoFillBudget();
+                return;
+            case 'fso-deselect-all':
+                fsoDeselectAll();
+                return;
+            case 'fso-invert':
+                fsoInvertSelection();
+                return;
+            case 'fso-select-ext': {
+                const ext = target.dataset.ext || (target.closest('[data-ext]') && target.closest('[data-ext]').dataset.ext);
+                if (ext) fsoSelectExt(ext);
+                return;
+            }
+            case 'fso-select-dir': {
+                const dir = target.dataset.dir || (target.closest('[data-dir]') && target.closest('[data-dir]').dataset.dir);
+                fsoSelectDir(dir);
+                return;
+            }
+            case 'fso-deselect-dir': {
+                const dir = target.dataset.dir || (target.closest('[data-dir]') && target.closest('[data-dir]').dataset.dir);
+                fsoDeselectDir(dir);
+                return;
+            }
+            case 'fso-preview-file': {
+                const p = target.dataset.path || (target.closest('[data-path]') && target.closest('[data-path]').dataset.path);
+                if (p) fsoTogglePreview(p);
+                return;
+            }
+            case 'fso-bulk-upload-trigger': {
+                const container = hostElements()?.settingsContainer;
+                const input = container && container.querySelector('[data-cb-role="fso-bulk-file-input"]');
+                if (input) input.click();
+                return;
+            }
+            case 'fso-upload':
+                openAddSourceModal();
+                return;
+            case 'fso-paste':
+                openAddSourceModal();
+                return;
+            case 'fso-confirm':
+                fsoConfirmSelection();
+                return;
+            case 'fso-review-now':
+                void fsoReviewNow();
+                return;
+            case 'modal-body':
                 return;
             case 'add-source-file':
                 openAddSourceModal();
@@ -5563,6 +6247,13 @@
             runtime.draft = target.value;
             return;
         }
+        if (target && target.dataset && target.dataset.cbRole === 'fso-search') {
+            if (runtime.fileSelector) {
+                runtime.fileSelector.search = target.value;
+                renderPage();
+            }
+            return;
+        }
         if (target && target.dataset && target.dataset.cbSetting) {
             applySettingInput(target);
             return;
@@ -5665,6 +6356,22 @@
             return;
         }
 
+        if (target.dataset.cbRole === 'fso-folder') {
+            if (runtime.fileSelector) {
+                runtime.fileSelector.folderId = target.value;
+                renderPage();
+            }
+            return;
+        }
+
+        if (target.dataset.cbRole === 'fso-bulk-file-input') {
+            if (target.files && target.files.length) {
+                void fsoHandleBulkFiles(target.files);
+                target.value = '';
+            }
+            return;
+        }
+
         if (target.dataset.cbRole === 'composer-file-select') {
             const val = target.value;
             if (val === '__add__') {
@@ -5712,6 +6419,23 @@
             runtime.isHistoryOpen = false;
             renderPage();
             return;
+        }
+
+        if (runtime.fileSelector && runtime.fileSelector.open) {
+            if (event.key === 'Escape') {
+                event.preventDefault();
+                closeFileSelectorOverlay();
+                return;
+            }
+            if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+                event.preventDefault();
+                fsoConfirmSelection();
+                return;
+            }
+            if (event.key === 'Tab') {
+                trapFocus(event, '.cb-fso-modal');
+                return;
+            }
         }
 
         if (runtime.modal) {
@@ -5783,6 +6507,18 @@
                         setToast(`Downloaded ${record.path}.`, 'success');
                     }
                 },
+                isEditingFile: path => runtime.editingPath === path || Boolean(hostElements()?.settingsContainer?.querySelector('.cb-preview.cb-preview-editing')),
+                saveFile: path => {
+                    const targetPath = path || runtime.editingPath || core.store.openPath;
+                    if (!targetPath) return;
+                    const container = hostElements()?.settingsContainer || document;
+                    const ta = container.querySelector('.cb-preview-textarea');
+                    const content = ta ? ta.value : (core.readFile(targetPath)?.content || '');
+                    core.writeFile(targetPath, content, { userEdit: true });
+                    runtime.editingPath = null;
+                    setToast(`Saved ${targetPath}.`, 'success');
+                    renderPage();
+                },
                 focusSettingsSearch: () => {
                     const input = hostElements()?.settingsContainer?.querySelector('[data-cb-role="settings-search"]');
                     if (input) { try { input.focus({ preventScroll: true }); } catch (_) { input.focus(); } }
@@ -5843,15 +6579,17 @@
             ensureHostRecord();
             ensureWorkspace();
             loadRuns();
-            if (!runtime.messages.length && runtime.currentRun) rebuildMessagesFromRun(runtime.currentRun);
+            if (!runtime.busy && !runtime.messages.length && runtime.currentRun) rebuildMessagesFromRun(runtime.currentRun);
             // Do NOT force the Agent tab: restoreTabsOnLoad keeps whatever the
             // user had open. The folder is derived from the active tab instead.
             syncFolderFromTab();
-            runtime.hint = selectedSkill().tagline;
+            if (!runtime.busy) runtime.hint = selectedSkill().tagline;
+            bindAssistantSteps();
             // setApp() sets state.folder to 'all' before the page renders, so the
             // nav/list/ribbon surfaces must be refreshed once the section is known.
             renderHostSurfaces();
             renderPage();
+            if (isAgentTabActive()) scrollTranscriptToEnd();
         },
 
         deactivate() {
@@ -6080,7 +6818,9 @@
         listFiles: folderId => core.listFiles(folderId),
         readFile: (path, folderId) => core.readFile(path, folderId),
         listRuns: () => core.store.runs.map(run => ({ id: run.id, skill: run.skillId, status: run.status })),
-        isBusy: () => runtime.busy
+        isBusy: () => runtime.busy,
+        handlers,
+        controller
     });
 
     document.addEventListener('click', onClick);

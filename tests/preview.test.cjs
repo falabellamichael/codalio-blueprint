@@ -359,9 +359,40 @@ const emptyView = preview.renderPreview({ path: 'empty.md', content: '' }, {});
 assert.ok(emptyView, 'an empty document failed to render');
 assert.match(visibleText(emptyView), /Ln 1, Col 1/, 'an empty document reported no caret');
 
-console.log('preview.test.cjs: 15 groups passed');
+// 16. Edit mode affordance, editable textarea, and save callbacks.
+let savedPath = null;
+let savedContent = null;
+let editToggled = null;
+const editableView = preview.renderPreview({ path: 'src/main.js', content: 'console.log("hello");\n' }, {
+    onSave: (p, c) => { savedPath = p; savedContent = c; },
+    onEditChange: isEditing => { editToggled = isEditing; }
+});
+
+const editButton = editableView.querySelector('button[data-cb-action="preview-edit"]');
+const saveButton = editableView.querySelector('button[data-cb-action="preview-save"]');
+const cancelButton = editableView.querySelector('button[data-cb-action="preview-cancel"]');
+const textarea = editableView.querySelector('.cb-preview-textarea');
+
+assert.ok(editButton, 'missing edit button in toolbar');
+assert.ok(saveButton, 'missing save button in toolbar');
+assert.ok(cancelButton, 'missing cancel button in toolbar');
+assert.ok(textarea, 'missing textarea in preview editor');
+
+// Toggle edit mode
+editButton.click();
+assert.equal(editableView.className.includes('cb-preview-editing'), true, 'edit mode did not add .cb-preview-editing');
+assert.equal(editToggled, true, 'onEditChange was not notified of entering edit mode');
+
+// Mutate textarea and trigger save
+textarea.value = 'console.log("updated");\n// extra line\n';
+saveButton.click();
+assert.equal(savedPath, 'src/main.js', 'onSave received the wrong path');
+assert.equal(savedContent, 'console.log("updated");\n// extra line\n', 'onSave received the wrong content');
+
+console.log('preview.test.cjs: 16 groups passed');
 console.log(`  languages     : ${Object.keys(SAMPLES).length} tokenized losslessly`);
 console.log(`  hostile input : ${HOSTILE.length} shapes x ${HOSTILE_LANGUAGES.length} languages, all linear`);
 console.log(`  structure     : gutter, toolbar, status bar (Ln/Col, UTF-8, language)`);
 console.log(`  safety        : no innerHTML; markup preserved as text; fences honoured`);
+console.log(`  editing       : edit mode toggle, gutter sync, live textarea, save callbacks`);
 process.exit(0);

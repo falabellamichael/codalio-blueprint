@@ -476,6 +476,36 @@
             'Line numbers',
             ''
         ));
+
+        const isEditingInitial = Boolean(cfg.editing);
+        const editBtn = toggleButton(
+            'edit',
+            'fa-pen-to-square',
+            isEditingInitial,
+            'Edit file',
+            ''
+        );
+        editBtn.dataset.path = path;
+        tools.appendChild(editBtn);
+
+        const saveBtn = node('button', 'cb-preview-btn primary cb-preview-save-btn');
+        saveBtn.type = 'button';
+        saveBtn.dataset.cbAction = 'preview-save';
+        saveBtn.dataset.path = path;
+        saveBtn.setAttribute('aria-label', 'Save changes');
+        saveBtn.title = 'Save changes (Ctrl+S)';
+        saveBtn.appendChild(icon('fa-floppy-disk'));
+        tools.appendChild(saveBtn);
+
+        const cancelBtn = node('button', 'cb-preview-btn cb-preview-cancel-btn');
+        cancelBtn.type = 'button';
+        cancelBtn.dataset.cbAction = 'preview-cancel';
+        cancelBtn.dataset.path = path;
+        cancelBtn.setAttribute('aria-label', 'Discard edits');
+        cancelBtn.title = 'Discard edits';
+        cancelBtn.appendChild(icon('fa-xmark'));
+        tools.appendChild(cancelBtn);
+
         toolbar.appendChild(tools);
         wrap.appendChild(toolbar);
 
@@ -550,6 +580,20 @@
 
         scroll.appendChild(code);
         wrap.appendChild(scroll);
+
+        // ---- editor body (for editing mode) --------------------------
+        const editorContainer = node('div', 'cb-preview-editor');
+        const editorGutter = node('div', 'cb-preview-editor-gutter');
+        editorGutter.setAttribute('aria-hidden', 'true');
+
+        const textarea = node('textarea', 'cb-preview-textarea');
+        textarea.setAttribute('spellcheck', 'false');
+        textarea.setAttribute('aria-label', `Editing ${path}`);
+        textarea.value = raw;
+
+        editorContainer.appendChild(editorGutter);
+        editorContainer.appendChild(textarea);
+        wrap.appendChild(editorContainer);
 
         if (truncatedLines || truncatedChars) {
             const notice = node('div', 'cb-preview-truncated');
@@ -693,6 +737,127 @@
             if (row && typeof row.scrollIntoView === 'function') row.scrollIntoView({ block: 'center' });
         }
         reportCaret();
+
+        // ---- editor interaction --------------------------------------
+        let currentSavedContent = raw;
+
+        function updateEditorGutter() {
+            while (editorGutter.firstChild) {
+                editorGutter.removeChild(editorGutter.firstChild);
+            }
+            const editorLines = splitLines(textarea.value);
+            const count = Math.max(1, editorLines.length);
+            for (let i = 1; i <= count; i += 1) {
+                const ln = node('span', 'cb-preview-editor-ln', String(i));
+                editorGutter.appendChild(ln);
+            }
+        }
+
+        function updateEditorCaret() {
+            const val = textarea.value;
+            const selStart = textarea.selectionStart || 0;
+            const textBefore = val.slice(0, selStart);
+            const lineIndex = textBefore.split('\n').length;
+            const lastNewline = textBefore.lastIndexOf('\n');
+            const colIndex = selStart - (lastNewline === -1 ? 0 : lastNewline + 1) + 1;
+            caret.textContent = `Ln ${lineIndex}, Col ${colIndex}`;
+            const totalLines = val.split('\n').length;
+            length.textContent = `${totalLines.toLocaleString()} lines`;
+            chars.textContent = `${val.length.toLocaleString()} chars`;
+            const isDirty = textarea.value !== currentSavedContent;
+            selection.textContent = isDirty ? 'Unsaved changes (Ctrl+S to save)' : 'Editing';
+        }
+
+        textarea.addEventListener('scroll', () => {
+            editorGutter.scrollTop = textarea.scrollTop;
+        });
+
+        textarea.addEventListener('input', () => {
+            updateEditorGutter();
+            updateEditorCaret();
+        });
+        textarea.addEventListener('keyup', updateEditorCaret);
+        textarea.addEventListener('click', updateEditorCaret);
+
+        textarea.addEventListener('keydown', event => {
+            if (event.key === 'Tab') {
+                event.preventDefault();
+                const start = textarea.selectionStart || 0;
+                const end = textarea.selectionEnd || 0;
+                textarea.value = textarea.value.substring(0, start) + '    ' + textarea.value.substring(end);
+                textarea.selectionStart = textarea.selectionEnd = start + 4;
+                updateEditorGutter();
+                updateEditorCaret();
+            } else if ((event.ctrlKey || event.metaKey) && (event.key === 's' || event.key === 'S')) {
+                event.preventDefault();
+                doSave();
+            }
+        });
+
+        function doSave() {
+            const newContent = textarea.value;
+            currentSavedContent = newContent;
+            selection.textContent = 'Saved';
+            if (typeof cfg.onSave === 'function') {
+                try { cfg.onSave(path, newContent); } catch (_) {}
+            }
+            try {
+                wrap.dispatchEvent(new CustomEvent('cb-preview-save', {
+                    bubbles: true,
+                    detail: { path, content: newContent }
+                }));
+            } catch (_) {}
+            const coreModule = window.__codalioBlueprintCore;
+            if (coreModule && typeof coreModule.writeFile === 'function') {
+                coreModule.writeFile(path, newContent, { userEdit: true });
+            }
+        }
+
+        function toggleEdit(force) {
+            const willEdit = typeof force === 'boolean' ? force : !wrap.classList.contains('cb-preview-editing');
+            if (willEdit) {
+                wrap.classList.add('cb-preview-editing');
+                editBtn.classList.add('active');
+                editBtn.setAttribute('aria-pressed', 'true');
+                updateEditorGutter();
+                updateEditorCaret();
+                try { textarea.focus(); } catch (_) {}
+            } else {
+                wrap.classList.remove('cb-preview-editing');
+                editBtn.classList.remove('active');
+                editBtn.setAttribute('aria-pressed', 'false');
+                reportCaret();
+            }
+            if (typeof cfg.onEditChange === 'function') {
+                try { cfg.onEditChange(willEdit); } catch (_) {}
+            }
+        }
+
+        function cancelEdit() {
+            textarea.value = currentSavedContent;
+            toggleEdit(false);
+        }
+
+        editBtn.addEventListener('click', () => toggleEdit());
+        saveBtn.addEventListener('click', () => doSave());
+        cancelBtn.addEventListener('click', () => cancelEdit());
+
+        wrap.addEventListener('click', event => {
+            const btn = event.target && typeof event.target.closest === 'function' ? event.target.closest('button[data-cb-action]') : null;
+            if (!btn) return;
+            const action = btn.dataset.cbAction;
+            if (action === 'preview-edit') {
+                toggleEdit();
+            } else if (action === 'preview-save') {
+                doSave();
+            } else if (action === 'preview-cancel') {
+                cancelEdit();
+            }
+        });
+
+        if (isEditingInitial) {
+            toggleEdit(true);
+        }
 
         return wrap;
     }

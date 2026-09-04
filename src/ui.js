@@ -115,7 +115,10 @@
                 : section.id === 'cb-history'
                     ? state.runCount
                     : null;
-            host.addFolder(section.id, section.icon, section.label, count);
+            const iconName = (state && state.busy && section.id === 'cb-agent')
+                ? 'fa-circle-notch fa-spin'
+                : section.icon;
+            host.addFolder(section.id, iconName, section.label, count);
         });
     }
 
@@ -324,6 +327,7 @@
         tools.appendChild(iconButton('fa-folder-plus', 'new-folder', 'Create a new project folder'));
         tools.appendChild(iconButton('fa-folder-open', 'open-folder', 'Import a folder from disk'));
         tools.appendChild(iconButton('fa-file-circle-plus', 'add-source-file', 'Add a source file to the project'));
+        tools.appendChild(iconButton('fa-layer-group', 'open-file-selector', 'File Selector & Multi-File Review Manager'));
         tools.appendChild(iconButton('fa-file-pen', 'new-file', 'Create a Markdown file'));
         tools.appendChild(iconButton('fa-angles-down', 'expand-all', 'Expand every folder'));
         tools.appendChild(iconButton('fa-angles-up', 'collapse-all', 'Collapse every folder'));
@@ -650,18 +654,36 @@
             if (step.finishReason) outputHead.appendChild(node('span', 'cb-step-flag', `finish: ${step.finishReason}`));
             if (step.tokenCount) outputHead.appendChild(node('span', 'cb-step-flag', `${step.tokenCount} tokens`));
             outputBox.appendChild(outputHead);
-            if (step.streaming && step.liveElement) {
+            if ((step.streaming || isRunning) && step.liveElement) {
                 outputBox.appendChild(step.liveElement);
                 const cursor = node('span', 'cb-stream-cursor', '▋');
                 outputBox.appendChild(cursor);
             } else if (step.text) {
-                outputBox.appendChild(core.renderMarkdown(step.text));
+                if (step._renderedMarkdown && typeof step._renderedMarkdown.cloneNode === 'function' && step._renderedMarkdownText === step.text) {
+                    outputBox.appendChild(step._renderedMarkdown.cloneNode(true));
+                } else {
+                    const rendered = core.renderMarkdown(step.text);
+                    if (step.status === 'done') {
+                        step._renderedMarkdown = rendered;
+                        step._renderedMarkdownText = step.text;
+                    }
+                    outputBox.appendChild(rendered);
+                }
             } else {
                 outputBox.appendChild(node('p', 'cb-muted', isRunning ? 'Waiting for the first token…' : 'No output.'));
             }
             body.appendChild(outputBox);
         } else if (step.text) {
-            body.appendChild(core.renderMarkdown(step.text));
+            if (step._renderedMarkdown && typeof step._renderedMarkdown.cloneNode === 'function' && step._renderedMarkdownText === step.text) {
+                body.appendChild(step._renderedMarkdown.cloneNode(true));
+            } else {
+                const rendered = core.renderMarkdown(step.text);
+                if (step.status === 'done') {
+                    step._renderedMarkdown = rendered;
+                    step._renderedMarkdownText = step.text;
+                }
+                body.appendChild(rendered);
+            }
         }
 
         if (step.error) {
@@ -1254,6 +1276,14 @@
             addFileBtn.appendChild(node('span', null, 'Add File'));
             filesGroup.appendChild(addFileBtn);
 
+            const selectFilesBtn = node('button', 'cb-quick-action-btn');
+            selectFilesBtn.type = 'button';
+            selectFilesBtn.dataset.cbAction = 'open-file-selector';
+            selectFilesBtn.title = 'Open File Selector & Review Manager';
+            selectFilesBtn.appendChild(icon('fa-layer-group'));
+            selectFilesBtn.appendChild(node('span', null, 'Select Files…'));
+            filesGroup.appendChild(selectFilesBtn);
+
             const browseBtn = node('button', 'cb-quick-action-btn');
             browseBtn.type = 'button';
             browseBtn.dataset.cbAction = 'go-files';
@@ -1274,6 +1304,23 @@
             attachedLabel.appendChild(icon('fa-paperclip'));
             attachedLabel.appendChild(node('span', null, `Attached (${state.sourceFiles.length}):`));
             attachedBar.appendChild(attachedLabel);
+
+            const isExclusive = state.sourceFileMode === 'exclusive';
+            const modeBadge = node('button', 'cb-attached-mode-badge');
+            modeBadge.type = 'button';
+            modeBadge.dataset.cbAction = 'toggle-attached-mode';
+            modeBadge.title = 'Click to switch review strategy between Augmented and Independent';
+            modeBadge.appendChild(icon(isExclusive ? 'fa-filter' : 'fa-layer-group'));
+            modeBadge.appendChild(node('span', null, isExclusive ? 'Mode: Independent (Manual only)' : 'Mode: On top of Agent files'));
+            attachedBar.appendChild(modeBadge);
+
+            const manageBtn = node('button', 'cb-attached-manage-btn');
+            manageBtn.type = 'button';
+            manageBtn.dataset.cbAction = 'open-file-selector';
+            manageBtn.title = 'Open File Selector Overlay to add or modify files';
+            manageBtn.appendChild(icon('fa-pen-to-square'));
+            manageBtn.appendChild(node('span', null, 'Manage'));
+            attachedBar.appendChild(manageBtn);
 
             const chipList = node('div', 'cb-attached-list');
             state.sourceFiles.forEach(file => {
@@ -1468,6 +1515,31 @@
             title: toggle.title,
             dataset: { path: record.path, folderId: record.folder || '' }
         }));
+        // Edit/Save/Cancel (Gemini) with folderId on every dataset (Sol).
+        // Both are required: the edit affordance does not exist without
+        // Gemini's buttons, and multi-root support breaks without Sol's
+        // folderId — the controller resolves an edit against the wrong
+        // project root when two roots hold the same relative path.
+        const isEditing = state.editingPath === record.path;
+        if (isEditing) {
+            tools.appendChild(button('Save', 'fa-floppy-disk', 'save-file', {
+                compact: true,
+                primary: true,
+                title: 'Save changes to this file (Ctrl+S)',
+                dataset: { path: record.path, folderId: record.folder || '' }
+            }));
+            tools.appendChild(button('Cancel', 'fa-xmark', 'cancel-edit-file', {
+                compact: true,
+                title: 'Discard edits',
+                dataset: { path: record.path, folderId: record.folder || '' }
+            }));
+        } else {
+            tools.appendChild(button('Edit', 'fa-pen-to-square', 'edit-file', {
+                compact: true,
+                title: 'Edit this file',
+                dataset: { path: record.path, folderId: record.folder || '' }
+            }));
+        }
         tools.appendChild(button('Copy', 'fa-copy', 'copy-file', { compact: true, dataset: { path: record.path, folderId: record.folder || '' } }));
         tools.appendChild(button('Download', 'fa-download', 'download-file', { compact: true, dataset: { path: record.path, folderId: record.folder || '' } }));
         tools.appendChild(button('Rename', 'fa-pen', 'rename-file', { compact: true, dataset: { path: record.path, folderId: record.folder || '' } }));
@@ -1482,7 +1554,7 @@
         body.classList.add(`cb-reading-${settings.readingWidth || 'wide'}`);
 
         const preview = previewModule();
-        if (state.viewerMode === 'source') {
+        if (state.viewerMode === 'source' || isEditing) {
             if (preview) {
                 // The Notepad++-style view: line-number gutter, syntax colouring,
                 // and an Ln / Col status bar. Layout idea from Notepad++; the code
@@ -1490,7 +1562,8 @@
                 body.appendChild(preview.renderPreview(record, {
                     highlight: settings.syntaxHighlighting !== false,
                     wrap: settings.wrapLongLines !== false,
-                    gutter: settings.showLineNumbers !== false
+                    gutter: settings.showLineNumbers !== false,
+                    editing: isEditing
                 }));
             } else {
                 const pre = node('pre', 'cb-pre cb-viewer-source');
@@ -1740,6 +1813,467 @@
         return backdrop;
     }
 
+    function renderFileSelectorOverlay(state) {
+        const fso = state.fileSelector || {
+            open: true,
+            search: '',
+            category: 'all',
+            folderId: 'all',
+            selectedPaths: new Set(),
+            reviewMode: state.sourceFileMode || 'combine',
+            previewPath: null
+        };
+        const selectedPaths = fso.selectedPaths instanceof Set ? fso.selectedPaths : new Set(fso.selectedPaths || []);
+        const reviewMode = fso.reviewMode || state.sourceFileMode || 'combine';
+        const isCombine = reviewMode === 'combine';
+
+        const backdrop = node('div', 'cb-modal-backdrop cb-fso-backdrop');
+        backdrop.dataset.cbAction = 'close-file-selector';
+
+        const dialog = node('section', 'cb-modal cb-fso-modal');
+        dialog.setAttribute('role', 'dialog');
+        dialog.setAttribute('aria-modal', 'true');
+        dialog.dataset.cbAction = 'modal-body';
+
+        // Header
+        const header = node('header', 'cb-modal-header cb-fso-header');
+        header.appendChild(icon('fa-layer-group'));
+        const headerCopy = node('div', 'cb-fso-header-copy');
+        headerCopy.appendChild(node('h2', null, 'File Selector & Review Manager'));
+        headerCopy.appendChild(node('p', 'cb-fso-header-subtitle', 'Choose files to review independently or augment what the Agent chooses from the workspace.'));
+        header.appendChild(headerCopy);
+        header.appendChild(iconButton('fa-xmark', 'close-file-selector', 'Close'));
+        dialog.appendChild(header);
+
+        const body = node('div', 'cb-modal-body cb-fso-body');
+
+        // Review Strategy Section
+        const modeSection = node('div', 'cb-fso-mode-section');
+        modeSection.appendChild(node('span', 'cb-fso-section-label', 'Review Strategy:'));
+        const modeGroup = node('div', 'cb-fso-mode-group');
+
+        // Mode Card 1: Combine (On top of Agent files)
+        const combineCard = node('div', `cb-fso-mode-card cb-fso-mode-combine${isCombine ? ' cb-fso-mode-active' : ''}`);
+        combineCard.dataset.cbAction = 'fso-set-mode';
+        combineCard.dataset.mode = 'combine';
+        const combineRadio = node('span', 'cb-fso-mode-radio');
+        combineRadio.appendChild(icon(isCombine ? 'fa-circle-dot' : 'fa-circle'));
+        combineCard.appendChild(combineRadio);
+        const combineInfo = node('div', 'cb-fso-mode-info');
+        const combineTitleRow = node('div', 'cb-fso-mode-title-row');
+        combineTitleRow.appendChild(node('strong', 'cb-fso-mode-title', 'On top of Agent files'));
+        combineTitleRow.appendChild(node('span', 'cb-fso-mode-badge cb-fso-badge-primary', 'Augment / Recommended'));
+        combineInfo.appendChild(combineTitleRow);
+        combineInfo.appendChild(node('p', 'cb-fso-mode-desc', 'Your selected files are pinned with top priority in prompt context, and the Agent continues to auto-discover related workspace files up to the context budget.'));
+        combineCard.appendChild(combineInfo);
+        modeGroup.appendChild(combineCard);
+
+        // Mode Card 2: Exclusive (Review independently)
+        const exclusiveCard = node('div', `cb-fso-mode-card cb-fso-mode-exclusive${!isCombine ? ' cb-fso-mode-active' : ''}`);
+        exclusiveCard.dataset.cbAction = 'fso-set-mode';
+        exclusiveCard.dataset.mode = 'exclusive';
+        const exclusiveRadio = node('span', 'cb-fso-mode-radio');
+        exclusiveRadio.appendChild(icon(!isCombine ? 'fa-circle-dot' : 'fa-circle'));
+        exclusiveCard.appendChild(exclusiveRadio);
+        const exclusiveInfo = node('div', 'cb-fso-mode-info');
+        const exclusiveTitleRow = node('div', 'cb-fso-mode-title-row');
+        exclusiveTitleRow.appendChild(node('strong', 'cb-fso-mode-title', 'Review independently'));
+        exclusiveTitleRow.appendChild(node('span', 'cb-fso-mode-badge cb-fso-badge-warn', 'Manual Only / Strict'));
+        exclusiveInfo.appendChild(exclusiveTitleRow);
+        exclusiveInfo.appendChild(node('p', 'cb-fso-mode-desc', 'The Agent strictly evaluates ONLY your chosen files. All automatic workspace file discovery is bypassed.'));
+        exclusiveCard.appendChild(exclusiveInfo);
+        modeGroup.appendChild(exclusiveCard);
+
+        modeSection.appendChild(modeGroup);
+        body.appendChild(modeSection);
+
+        const allPaths = (core && typeof core.listFiles === 'function') ? core.listFiles() : (state.projectFiles || []);
+        const extCounts = {};
+        allPaths.forEach(p => {
+            const ext = p.split('.').pop().toLowerCase();
+            if (ext && ext !== p.toLowerCase()) {
+                extCounts[ext] = (extCounts[ext] || 0) + 1;
+            }
+        });
+        const sortedExts = Object.keys(extCounts).sort((a, b) => extCounts[b] - extCounts[a]);
+
+        // Toolbar: Search + Category chips + Folder select + Bulk buttons
+        const toolbar = node('div', 'cb-fso-toolbar');
+        const searchWrap = node('div', 'cb-fso-search-wrap');
+        searchWrap.appendChild(icon('fa-magnifying-glass'));
+        const searchInput = node('input', 'cb-input cb-fso-search-input');
+        searchInput.type = 'text';
+        searchInput.dataset.cbRole = 'fso-search';
+        searchInput.placeholder = 'Search or filter files by glob (e.g. *.js, src/**, config*)…';
+        searchInput.value = fso.search || '';
+        searchWrap.appendChild(searchInput);
+        if (fso.search) {
+            const clearBtn = node('button', 'cb-fso-clear-btn');
+            clearBtn.type = 'button';
+            clearBtn.dataset.cbAction = 'fso-search-clear';
+            clearBtn.title = 'Clear search';
+            clearBtn.appendChild(icon('fa-xmark'));
+            searchWrap.appendChild(clearBtn);
+        }
+        toolbar.appendChild(searchWrap);
+
+        const controlsRow = node('div', 'cb-fso-controls-row');
+        // Category Chips
+        const chipsWrap = node('div', 'cb-fso-categories');
+        const categories = [
+            { id: 'all', label: 'All Files' },
+            { id: 'code', label: 'Code' },
+            { id: 'docs', label: 'Docs & PRDs' },
+            { id: 'config', label: 'Config' },
+            { id: 'selected', label: `Selected (${selectedPaths.size})` }
+        ];
+        categories.forEach(cat => {
+            const chip = node('button', `cb-fso-chip${fso.category === cat.id ? ' active' : ''}`);
+            chip.type = 'button';
+            chip.dataset.cbAction = 'fso-category';
+            chip.dataset.category = cat.id;
+            chip.textContent = cat.label;
+            chipsWrap.appendChild(chip);
+        });
+        controlsRow.appendChild(chipsWrap);
+
+        // Folder filter
+        const folderSelect = node('select', 'cb-select cb-fso-folder-select');
+        folderSelect.dataset.cbRole = 'fso-folder';
+        const allFolderOpt = node('option');
+        allFolderOpt.value = 'all';
+        allFolderOpt.textContent = '📁 All Folders';
+        if (!fso.folderId || fso.folderId === 'all') allFolderOpt.selected = true;
+        folderSelect.appendChild(allFolderOpt);
+        (state.folders || []).forEach(f => {
+            const opt = node('option');
+            opt.value = f.id;
+            opt.textContent = `📁 ${f.name}`;
+            if (fso.folderId === f.id) opt.selected = true;
+            folderSelect.appendChild(opt);
+        });
+        controlsRow.appendChild(folderSelect);
+
+        // Bulk buttons
+        const bulkWrap = node('div', 'cb-fso-bulk-actions');
+        const selectAllBtn = node('button', 'cb-btn cb-fso-bulk-btn');
+        selectAllBtn.type = 'button';
+        selectAllBtn.dataset.cbAction = 'fso-select-all';
+        selectAllBtn.title = 'Select all filtered files';
+        selectAllBtn.appendChild(icon('fa-square-check'));
+        selectAllBtn.appendChild(node('span', null, 'Select All'));
+        bulkWrap.appendChild(selectAllBtn);
+
+        const fillBudgetBtn = node('button', 'cb-btn cb-fso-bulk-btn cb-fso-fill-budget-btn');
+        fillBudgetBtn.type = 'button';
+        fillBudgetBtn.dataset.cbAction = 'fso-fill-budget';
+        fillBudgetBtn.title = 'Auto-select files in order up to maximum context budget';
+        fillBudgetBtn.appendChild(icon('fa-bolt'));
+        fillBudgetBtn.appendChild(node('span', null, 'Fill Budget'));
+        bulkWrap.appendChild(fillBudgetBtn);
+
+        const deselectAllBtn = node('button', 'cb-btn cb-fso-bulk-btn');
+        deselectAllBtn.type = 'button';
+        deselectAllBtn.dataset.cbAction = 'fso-deselect-all';
+        deselectAllBtn.title = 'Deselect all files';
+        deselectAllBtn.appendChild(icon('fa-square'));
+        deselectAllBtn.appendChild(node('span', null, 'Deselect All'));
+        bulkWrap.appendChild(deselectAllBtn);
+
+        const invertBtn = node('button', 'cb-btn cb-fso-bulk-btn');
+        invertBtn.type = 'button';
+        invertBtn.dataset.cbAction = 'fso-invert';
+        invertBtn.title = 'Invert current selection';
+        invertBtn.appendChild(icon('fa-arrow-right-arrow-left'));
+        invertBtn.appendChild(node('span', null, 'Invert'));
+        bulkWrap.appendChild(invertBtn);
+
+        controlsRow.appendChild(bulkWrap);
+        toolbar.appendChild(controlsRow);
+
+        // Quick Extension Selector Pills
+        if (sortedExts.length > 1) {
+            const extsRow = node('div', 'cb-fso-ext-row');
+            extsRow.appendChild(node('span', 'cb-fso-ext-label', 'Select by type:'));
+            const extsPills = node('div', 'cb-fso-ext-pills');
+            sortedExts.slice(0, 8).forEach(ext => {
+                const filesWithExt = allPaths.filter(p => p.toLowerCase().endsWith('.' + ext));
+                const allSel = filesWithExt.length > 0 && filesWithExt.every(p => selectedPaths.has(p));
+                const someSel = !allSel && filesWithExt.some(p => selectedPaths.has(p));
+                const pill = node('button', `cb-fso-ext-pill${allSel ? ' active' : someSel ? ' partial' : ''}`);
+                pill.type = 'button';
+                pill.dataset.cbAction = 'fso-select-ext';
+                pill.dataset.ext = ext;
+                pill.title = `${allSel ? 'Deselect' : 'Select'} all *.${ext} files (${filesWithExt.length})`;
+                pill.appendChild(node('span', null, `*.${ext}`));
+                pill.appendChild(node('span', 'cb-fso-ext-count', String(extCounts[ext])));
+                extsPills.appendChild(pill);
+            });
+            extsRow.appendChild(extsPills);
+            toolbar.appendChild(extsRow);
+        }
+
+        body.appendChild(toolbar);
+
+        // File Filtering Logic
+        const CODE_EXTS = new Set(['js', 'jsx', 'ts', 'tsx', 'py', 'java', 'c', 'cpp', 'cs', 'go', 'rs', 'rb', 'php', 'sh', 'bash', 'ps1', 'sql', 'html', 'css']);
+        const DOCS_EXTS = new Set(['md', 'markdown', 'txt', 'rst', 'adoc', 'pdf']);
+        const CONFIG_EXTS = new Set(['json', 'yaml', 'yml', 'toml', 'ini', 'xml', 'env', 'config']);
+
+        const query = String(fso.search || '').trim().toLowerCase();
+        let searchMatcher = null;
+        if (query && (query.includes('*') || query.includes('?'))) {
+            try {
+                const esc = '^' + query.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$';
+                searchMatcher = new RegExp(esc, 'i');
+            } catch (_) {}
+        }
+
+        const filteredFiles = allPaths.map(p => {
+            const rec = core && typeof core.readFile === 'function' ? core.readFile(p) : null;
+            const content = rec && typeof rec.content === 'string' ? rec.content : '';
+            const ext = p.split('.').pop().toLowerCase();
+            const folder = rec && rec.folder ? rec.folder : (core ? core.DEFAULT_FOLDER_ID : 'default');
+            return {
+                path: p,
+                content,
+                bytes: content.length,
+                lines: content ? content.split('\n').length : 0,
+                ext,
+                folder
+            };
+        }).filter(item => {
+            // Search query / wildcard filter
+            if (query) {
+                const matches = searchMatcher ? searchMatcher.test(item.path) : item.path.toLowerCase().includes(query);
+                if (!matches) return false;
+            }
+
+            // Folder filter
+            if (fso.folderId && fso.folderId !== 'all' && item.folder !== fso.folderId) return false;
+
+            // Category filter
+            if (fso.category === 'code') return CODE_EXTS.has(item.ext);
+            if (fso.category === 'docs') return DOCS_EXTS.has(item.ext);
+            if (fso.category === 'config') return CONFIG_EXTS.has(item.ext);
+            if (fso.category === 'selected') return selectedPaths.has(item.path);
+            return true;
+        });
+
+        // Main Layout: Split list + preview drawer
+        const main = node('div', 'cb-fso-main');
+        const listWrap = node('div', 'cb-fso-list-wrap');
+
+        if (!filteredFiles.length) {
+            const empty = node('div', 'cb-fso-empty');
+            empty.appendChild(icon('fa-folder-open'));
+            empty.appendChild(node('span', null, query ? `No files matching "${fso.search}"` : 'No files in this view'));
+            listWrap.appendChild(empty);
+        } else {
+            const list = node('div', 'cb-fso-list');
+
+            // Group by directory if files span multiple directories
+            const dirGroups = new Map();
+            filteredFiles.forEach(file => {
+                const parts = file.path.split('/');
+                parts.pop();
+                const dir = parts.length ? parts.join('/') + '/' : '';
+                if (!dirGroups.has(dir)) dirGroups.set(dir, []);
+                dirGroups.get(dir).push(file);
+            });
+
+            const showDirHeaders = dirGroups.size > 1;
+
+            dirGroups.forEach((files, dir) => {
+                if (showDirHeaders) {
+                    const dirHeader = node('div', 'cb-fso-dir-header');
+                    const dirTitle = node('div', 'cb-fso-dir-title');
+                    dirTitle.appendChild(icon('fa-folder-open'));
+                    dirTitle.appendChild(node('span', null, `${dir || '(root)'} (${files.length} file${files.length === 1 ? '' : 's'})`));
+                    dirHeader.appendChild(dirTitle);
+
+                    const dirTools = node('div', 'cb-fso-dir-tools');
+                    const allDirSelected = files.every(f => selectedPaths.has(f.path));
+                    const selDirBtn = node('button', 'cb-fso-dir-btn');
+                    selDirBtn.type = 'button';
+                    selDirBtn.dataset.cbAction = allDirSelected ? 'fso-deselect-dir' : 'fso-select-dir';
+                    selDirBtn.dataset.dir = dir;
+                    selDirBtn.textContent = allDirSelected ? 'Deselect folder' : 'Select all in folder';
+                    dirTools.appendChild(selDirBtn);
+                    dirHeader.appendChild(dirTools);
+
+                    list.appendChild(dirHeader);
+                }
+
+                files.forEach(file => {
+                    const isSelected = selectedPaths.has(file.path);
+                    const isCurrentlyAttached = Array.isArray(state.sourceFiles) && state.sourceFiles.some(f => f.path === file.path);
+                    const isPreviewing = fso.previewPath === file.path;
+
+                    const row = node('div', `cb-fso-row${isSelected ? ' cb-fso-selected' : ''}${isPreviewing ? ' cb-fso-previewing' : ''}`);
+
+                    // Checkbox
+                    const cb = node('input', 'cb-fso-checkbox');
+                    cb.type = 'checkbox';
+                    cb.checked = isSelected;
+                    cb.dataset.cbAction = 'fso-toggle-file';
+                    cb.dataset.path = file.path;
+                    row.appendChild(cb);
+
+                    // File icon
+                    const fileIco = icon(fileIconFor(file.path));
+                    fileIco.className = `cb-fso-icon ${fileIco.className}`;
+                    row.appendChild(fileIco);
+
+                    // Path & Name
+                    const details = node('div', 'cb-fso-details');
+                    details.dataset.cbAction = 'fso-toggle-file';
+                    details.dataset.path = file.path;
+                    const pathBox = node('div', 'cb-fso-path');
+                    const parts = file.path.split('/');
+                    const filename = parts.pop();
+                    const dirPath = parts.length ? parts.join('/') + '/' : '';
+                    if (dirPath) pathBox.appendChild(node('span', 'cb-fso-dir', dirPath));
+                    pathBox.appendChild(node('strong', 'cb-fso-name', filename));
+                    details.appendChild(pathBox);
+                    row.appendChild(details);
+
+                    // Meta badges (size, lines)
+                    const meta = node('div', 'cb-fso-meta');
+                    meta.appendChild(node('span', 'cb-fso-size', `${Math.round(file.bytes / 1024)} KB`));
+                    meta.appendChild(node('span', 'cb-fso-lines', `${file.lines} lines`));
+                    if (isCurrentlyAttached) {
+                        meta.appendChild(node('span', 'cb-fso-badge cb-fso-badge-attached', 'Attached'));
+                    }
+                    row.appendChild(meta);
+
+                    // Preview Button
+                    const previewBtn = node('button', 'cb-fso-preview-btn');
+                    previewBtn.type = 'button';
+                    previewBtn.dataset.cbAction = 'fso-preview-file';
+                    previewBtn.dataset.path = file.path;
+                    previewBtn.title = isPreviewing ? 'Hide preview' : 'Inspect file content';
+                    previewBtn.appendChild(icon(isPreviewing ? 'fa-eye-slash' : 'fa-eye'));
+                    row.appendChild(previewBtn);
+
+                    list.appendChild(row);
+                });
+            });
+
+            const hint = node('div', 'cb-fso-dropzone-hint');
+            hint.appendChild(icon('fa-lightbulb'));
+            hint.appendChild(node('span', null, 'Tip: Shift-click to select ranges of files in bulk • Click "Fill Budget" to auto-select up to the context limit'));
+            listWrap.appendChild(hint);
+
+            listWrap.appendChild(list);
+        }
+        main.appendChild(listWrap);
+
+        // Optional Preview Drawer
+        if (fso.previewPath) {
+            const previewRecord = core && typeof core.readFile === 'function' ? core.readFile(fso.previewPath) : null;
+            if (previewRecord) {
+                const drawer = node('div', 'cb-fso-preview-drawer');
+                const drawerHead = node('div', 'cb-fso-preview-header');
+                const drawerTitle = node('div', 'cb-fso-preview-title');
+                drawerTitle.appendChild(icon(fileIconFor(fso.previewPath)));
+                drawerTitle.appendChild(node('strong', null, fso.previewPath));
+                drawerHead.appendChild(drawerTitle);
+
+                const drawerTools = node('div', 'cb-fso-preview-tools');
+                const isSelected = selectedPaths.has(fso.previewPath);
+                const toggleBtn = node('button', 'cb-btn');
+                toggleBtn.type = 'button';
+                toggleBtn.dataset.cbAction = 'fso-toggle-file';
+                toggleBtn.dataset.path = fso.previewPath;
+                toggleBtn.appendChild(icon(isSelected ? 'fa-check' : 'fa-plus'));
+                toggleBtn.appendChild(node('span', null, isSelected ? 'Selected' : 'Select'));
+                drawerTools.appendChild(toggleBtn);
+
+                const closePrevBtn = node('button', 'cb-icon-btn');
+                closePrevBtn.type = 'button';
+                closePrevBtn.dataset.cbAction = 'fso-preview-file';
+                closePrevBtn.dataset.path = fso.previewPath;
+                closePrevBtn.appendChild(icon('fa-xmark'));
+                drawerTools.appendChild(closePrevBtn);
+
+                drawerHead.appendChild(drawerTools);
+                drawer.appendChild(drawerHead);
+
+                const drawerBody = node('div', 'cb-fso-preview-body');
+                const pre = node('pre', 'cb-fso-preview-code');
+                pre.appendChild(node('code', null, previewRecord.content || '(empty file)'));
+                drawerBody.appendChild(pre);
+                drawer.appendChild(drawerBody);
+
+                main.appendChild(drawer);
+            }
+        }
+
+        body.appendChild(main);
+
+        // Quick add buttons
+        const quickAdd = node('div', 'cb-fso-quick-add');
+        const uploadBtn = node('button', 'cb-btn');
+        uploadBtn.type = 'button';
+        uploadBtn.dataset.cbAction = 'fso-bulk-upload-trigger';
+        uploadBtn.appendChild(icon('fa-file-arrow-up'));
+        uploadBtn.appendChild(node('span', null, 'Upload Multiple Files from Disk…'));
+        quickAdd.appendChild(uploadBtn);
+
+        const pasteBtn = node('button', 'cb-btn');
+        pasteBtn.type = 'button';
+        pasteBtn.dataset.cbAction = 'fso-paste';
+        pasteBtn.appendChild(icon('fa-paste'));
+        pasteBtn.appendChild(node('span', null, 'Paste New File…'));
+        quickAdd.appendChild(pasteBtn);
+        body.appendChild(quickAdd);
+
+        const bulkFileInput = node('input', 'cb-fso-bulk-file-input');
+        bulkFileInput.type = 'file';
+        bulkFileInput.multiple = true;
+        bulkFileInput.dataset.cbRole = 'fso-bulk-file-input';
+        bulkFileInput.accept = '.py,.js,.jsx,.ts,.tsx,.json,.md,.css,.html,.txt,.yaml,.yml,.toml,.sh,.ps1,.sql';
+        dialog.appendChild(bulkFileInput);
+
+        dialog.appendChild(body);
+
+        // Footer: Stats & Actions
+        const footer = node('footer', 'cb-modal-footer cb-fso-footer');
+
+        // Selection metrics
+        let totalSelectedBytes = 0;
+        selectedPaths.forEach(p => {
+            const rec = core && typeof core.readFile === 'function' ? core.readFile(p) : null;
+            if (rec && rec.content) totalSelectedBytes += rec.content.length;
+        });
+        const limits = sourceLimits();
+        const estTokens = Math.round(totalSelectedBytes / 3.8);
+
+        const stats = node('div', 'cb-fso-stats');
+        stats.appendChild(node('span', 'cb-fso-stat-count', `Selected: ${selectedPaths.size} file${selectedPaths.size === 1 ? '' : 's'}`));
+        stats.appendChild(node('span', 'cb-fso-stat-size', `• ${Math.round(totalSelectedBytes / 1024)} KB`));
+        stats.appendChild(node('span', 'cb-fso-stat-tokens', `(~${estTokens.toLocaleString()} tokens)`));
+
+        const isOverBudget = selectedPaths.size > limits.maxFiles || totalSelectedBytes > limits.maxTotalBytes;
+        const budgetBadge = node('span', `cb-fso-budget-badge ${isOverBudget ? 'cb-fso-badge-warn' : 'cb-fso-badge-primary'}`);
+        budgetBadge.textContent = isOverBudget
+            ? `⚠️ Exceeds budget (${selectedPaths.size}/${limits.maxFiles} files, ${Math.round(totalSelectedBytes / 1024)}/${Math.round(limits.maxTotalBytes / 1024)} KB)`
+            : `Within context limit (${selectedPaths.size}/${limits.maxFiles} files)`;
+        stats.appendChild(budgetBadge);
+        footer.appendChild(stats);
+
+        const actions = node('div', 'cb-fso-actions');
+        actions.appendChild(button('Cancel', '', 'close-file-selector'));
+        actions.appendChild(button('Attach to Context', 'fa-paperclip', 'fso-confirm'));
+        actions.appendChild(button('Review Selected Files Now', 'fa-rocket', 'fso-review-now', { primary: true }));
+        footer.appendChild(actions);
+
+        dialog.appendChild(footer);
+        backdrop.appendChild(dialog);
+        return backdrop;
+    }
+
     function renderToast(state) {
         const toast = node('div', `cb-toast cb-toast-${state.toast.tone || 'info'}`);
         toast.setAttribute('role', 'status');
@@ -1778,6 +2312,7 @@
         renderStep,
         renderMessage,
         renderModal,
+        renderFileSelectorOverlay,
         renderToast,
         statusIcon
     });
