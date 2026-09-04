@@ -1,20 +1,3 @@
-This repository is a fork of https://github.com/codalio/codalio-blueprint and
-contains two bodies of work, both licensed under the MIT License reproduced below.
-
-  1. The upstream codalio-blueprint planning skills — the skill sources under
-     skills/, the sample output under examples/, and the vendor plugin manifests
-     (.claude-plugin/, .cursor-plugin/, .codex-plugin/, .antigravity-plugin/,
-     gemini-extension.json).
-     Copyright (c) 2026 Codalio
-
-  2. The SimpleRAG plug-in added by this fork — the Blueprint page, tabbed
-     workspace, agent runtime, file previewer, installer, stylesheet and tests,
-     all under src/, tests/ and tools/. src/skills.js is an original executable
-     port of the upstream skills and remains the copyright of Codalio in its
-     methodology, lens prompts, process flows, output contracts, document
-     templates and output paths.
-     Copyright (c) 2026 Michael Anthony Falabella
-
 MIT License
 
 Copyright (c) 2026 Codalio
@@ -37,3 +20,29 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+Notes on this fork
+
+This repository is a fork of https://github.com/codalio/codalio-blueprint and
+contains two bodies of work, both under the MIT License above.
+
+1. Upstream codalio-blueprint, Copyright (c) 2026 Codalio: the planning skill
+   sources under skills/, the sample outputs under examples/, and the vendor
+   plugin manifests (.claude-plugin/, .cursor-plugin/, .codex-plugin/,
+   .antigravity-plugin/, gemini-extension.json). Codalio's copyright and
+   permission notice is reproduced verbatim and unmodified above, as the MIT
+   License requires for all copies and substantial portions of the Software.
+
+2. The SimpleRAG plug-in added by this fork, Copyright (c) 2026 Michael Anthony
+   Falabella: the Blueprint page, tabbed workspace, agent runtime, file
+   previewer, installer, stylesheet and tests under src/, tests/ and tools/.
+
+   src/skills.js is an original executable port of the upstream skills. The
+   methodology, lens prompts, process flows, output contracts, document
+   templates and output paths it encodes are Codalio's and remain under
+   Codalio's copyright; the port's expression is this fork's.
+
+Neither body of work depends on the other at runtime. See README.md for which
+half of the tree does what, and for how to pull upstream changes.
