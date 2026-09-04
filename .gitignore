@@ -1,9 +1,44 @@
+# ---- upstream codalio-blueprint ----
+
 # internal planning docs
 docs/
 
+npm-debug.log*
+
+# ---- SimpleRAG plug-in (this fork) ----
+
+# Build output
+dist/
+*.zip
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Local test scratch
+tests/_dbg*
+tools/_dbg*
+tools/_probe*
+tools/_diagnose*
+tools/_fix*
+tools/_refactor*
+tools/_wire*
+gui*.html
+registry.json
+*.tmp
+
+# ---- both ----
+
 # node
 node_modules/
-npm-debug.log*
 
 # OS
 .DS_Store
+Thumbs.db

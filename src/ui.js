@@ -1,0 +1,1690 @@
+/*
+ * Codalio Blueprint — page UI.
+ *
+ * Renders into SimpleRAG's native three-pane shell exactly like the bundled
+ * Calendar page does: nav folders on the left, a contextual list pane, and the
+ * main reading pane. The main pane carries the one big Cursor-style chat with
+ * its visible step timeline and composer, plus the project document viewer.
+ *
+ * Builds DOM nodes only — model text never goes through innerHTML.
+ */
+(function defineBlueprintUi() {
+    'use strict';
+
+    if (window.__codalioBlueprintUi) return;
+
+    const core = window.__codalioBlueprintCore;
+    const skills = window.__codalioBlueprintSkills;
+    // Both load after ui.js; resolved lazily so load order cannot break the page.
+    const workspaceModule = () => window.__codalioBlueprintWorkspace;
+    const settingsPage = () => window.__codalioBlueprintSettingsPage;
+
+    // Fallbacks only. The live limits come from Settings -> Source files, so
+    // changing them there actually changes what the attach dialog allows.
+    const MAX_SOURCE_FILE_BYTES = 500 * 1024;
+    const MAX_SOURCE_FILES = 50;
+    const MAX_SOURCE_TOTAL_BYTES = 2048 * 1024;
+    const MAX_FILE_NAME_LENGTH = 140;
+
+    function sourceLimits() {
+        let settings = null;
+        try { settings = core.readSettings(); } catch (_) { settings = null; }
+        if (!settings) {
+            return {
+                maxFiles: MAX_SOURCE_FILES,
+                maxFileBytes: MAX_SOURCE_FILE_BYTES,
+                maxTotalBytes: MAX_SOURCE_TOTAL_BYTES
+            };
+        }
+        return {
+            maxFiles: Number(settings.maxSourceFiles) || MAX_SOURCE_FILES,
+            maxFileBytes: (Number(settings.maxSourceFileKb) || 120) * 1024,
+            maxTotalBytes: (Number(settings.maxSourceTotalKb) || 420) * 1024
+        };
+    }
+
+    const SECTIONS = [
+        { id: 'cb-agent', icon: 'fa-robot', label: 'Agent' },
+        { id: 'cb-files', icon: 'fa-folder-tree', label: 'Project Files' },
+        { id: 'cb-history', icon: 'fa-clock-rotate-left', label: 'Runs' },
+        { id: 'cb-settings', icon: 'fa-sliders', label: 'Settings' }
+    ];
+
+    // ------------------------------------------------------------------
+    // Element helpers
+    // ------------------------------------------------------------------
+
+    function node(tag, className, text) {
+        const element = document.createElement(tag);
+        if (className) element.className = className;
+        if (text !== undefined && text !== null) element.textContent = String(text);
+        return element;
+    }
+
+    function icon(name, extra) {
+        const element = document.createElement('i');
+        element.className = `fas ${name}${extra ? ` ${extra}` : ''}`;
+        element.setAttribute('aria-hidden', 'true');
+        return element;
+    }
+
+    function button(label, iconName, action, options) {
+        const opts = options || {};
+        const element = node('button', `cb-btn${opts.primary ? ' primary' : ''}${opts.danger ? ' danger' : ''}${opts.compact ? ' compact' : ''}`);
+        element.type = 'button';
+        element.dataset.cbAction = action;
+        if (iconName) element.appendChild(icon(iconName));
+        element.appendChild(node('span', null, label));
+        if (opts.title) element.title = opts.title;
+        if (opts.disabled) element.disabled = true;
+        if (opts.dataset) {
+            Object.entries(opts.dataset).forEach(([key, value]) => { element.dataset[key] = String(value); });
+        }
+        return element;
+    }
+
+    function iconButton(iconName, action, title, dataset) {
+        const element = node('button', 'cb-icon-btn');
+        element.type = 'button';
+        element.dataset.cbAction = action;
+        element.title = title;
+        element.setAttribute('aria-label', title);
+        element.appendChild(icon(iconName));
+        if (dataset) {
+            Object.entries(dataset).forEach(([key, value]) => { element.dataset[key] = String(value); });
+        }
+        return element;
+    }
+
+    function fileIconFor(name) {
+        const lower = String(name || '').toLowerCase();
+        if (lower.endsWith('.md') || lower.endsWith('.markdown')) return 'fa-file-lines';
+        if (/\.(json|py|js|jsx|ts|tsx|css|html|sh|ps1|ya?ml|toml)$/.test(lower)) return 'fa-file-code';
+        if (/\.(png|jpe?g|gif|svg|webp)$/.test(lower)) return 'fa-file-image';
+        return 'fa-file';
+    }
+
+    // ------------------------------------------------------------------
+    // Nav pane
+    // ------------------------------------------------------------------
+
+    function renderNav(state, host) {
+        SECTIONS.forEach(section => {
+            const count = section.id === 'cb-files'
+                ? core.listFiles().length
+                : section.id === 'cb-history'
+                    ? state.runCount
+                    : null;
+            host.addFolder(section.id, section.icon, section.label, count);
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // Ribbon
+    // ------------------------------------------------------------------
+
+    function renderRibbon(state, host) {
+        if (state.folder === 'cb-agent') {
+            host.addBtn('cb-run-new', 'fa-plus', 'New Run', true, () => state.handlers.newRun());
+            host.addSep();
+            if (state.busy) {
+                host.addBtn('cb-run-stop', 'fa-stop', 'Stop', false, () => state.handlers.stopRun());
+            } else {
+                host.addBtn('cb-run-resume', 'fa-play', 'Run', false, () => state.handlers.focusComposer());
+            }
+            host.addSep();
+            host.addBtn('cb-open-files', 'fa-folder-tree', 'Files', false, () => state.handlers.goSection('cb-files'));
+            host.addBtn('cb-open-settings', 'fa-sliders', 'Settings', false, () => state.handlers.goSection('cb-settings'));
+            return;
+        }
+        if (state.folder === 'cb-files') {
+            host.addBtn('cb-new-folder', 'fa-folder-plus', 'New Folder', true, () => state.handlers.newFolder());
+            host.addBtn('cb-open-folder', 'fa-folder-open', 'Open Folder', true, () => state.handlers.openFolder());
+            host.addSep();
+            host.addBtn('cb-add-source', 'fa-file-circle-plus', 'Add Source File', false, () => state.handlers.addSourceFile());
+            host.addBtn('cb-new-file', 'fa-file-pen', 'New Markdown', false, () => state.handlers.newFile());
+            host.addSep();
+            host.addBtn('cb-export-project', 'fa-file-zipper', 'Download All', false, () => state.handlers.exportProject());
+            host.addBtn('cb-open-agent', 'fa-robot', 'Agent', false, () => state.handlers.goSection('cb-agent'));
+            return;
+        }
+        if (state.folder === 'cb-history') {
+            host.addBtn('cb-history-refresh', 'fa-rotate', 'Refresh', false, () => state.handlers.render());
+            host.addBtn('cb-clear-history', 'fa-trash-can', 'Clear Runs', false, () => state.handlers.clearHistory());
+            return;
+        }
+        if (state.folder === 'cb-settings') {
+            host.addBtn('cb-open-agent', 'fa-robot', 'Back to Agent', true, () => state.handlers.goSection('cb-agent'));
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // List pane (contextual: skills, file tree, runs, settings summary)
+    // ------------------------------------------------------------------
+
+    function renderList(state, listTitle, listContent) {
+        listContent.innerHTML = '';
+        if (state.folder === 'cb-files') {
+            listTitle.textContent = 'Project Files';
+            listContent.appendChild(renderFileTree(state));
+            return;
+        }
+        if (state.folder === 'cb-history') {
+            listTitle.textContent = 'Runs';
+            listContent.appendChild(renderRunList(state));
+            return;
+        }
+        if (state.folder === 'cb-settings') {
+            listTitle.textContent = 'Settings';
+            const page = settingsPage();
+            if (page) {
+                listContent.appendChild(page.renderSettingsNav(state));
+            } else {
+                listContent.appendChild(renderSettingsSummary(state));
+            }
+            return;
+        }
+        listTitle.textContent = 'Blueprint Skills';
+        listContent.appendChild(renderSkillList(state));
+    }
+
+    function renderSkillList(state) {
+        const wrap = node('div', 'cb-skill-list');
+        skills.SKILLS.forEach(skill => {
+            const card = node('button', `cb-skill-card${state.selectedSkillId === skill.id ? ' selected' : ''}`);
+            card.type = 'button';
+            card.dataset.cbAction = 'pick-skill';
+            card.dataset.skillId = skill.id;
+            const head = node('div', 'cb-skill-card-head');
+            head.appendChild(icon(skill.icon));
+            head.appendChild(node('strong', null, skill.name));
+            card.appendChild(head);
+            card.appendChild(node('p', 'cb-skill-tagline', skill.tagline));
+            const badges = node('div', 'cb-skill-badges');
+            if (skill.multiLens) badges.appendChild(node('span', 'cb-badge cb-badge-lens', '3 lenses'));
+            if (skill.requiresSource) badges.appendChild(node('span', 'cb-badge cb-badge-source', 'needs source'));
+            if (skill.requiresPrd) badges.appendChild(node('span', 'cb-badge cb-badge-prd', 'needs PRD'));
+            if (badges.childElementCount) card.appendChild(badges);
+            wrap.appendChild(card);
+        });
+        const note = node('p', 'cb-list-note');
+        note.appendChild(icon('fa-circle-info'));
+        note.appendChild(node('span', null, 'Pick a skill, describe your idea in the chat, and press Send. Blueprint runs every step visibly.'));
+        wrap.appendChild(note);
+        return wrap;
+    }
+
+    function buildTree(paths) {
+        const root = { name: '', path: '', folders: new Map(), files: [] };
+        paths.forEach(path => {
+            const parts = path.split('/').filter(Boolean);
+            const fileName = parts.pop();
+            let current = root;
+            let walked = [];
+            parts.forEach(part => {
+                walked = walked.concat([part]);
+                if (!current.folders.has(part)) {
+                    current.folders.set(part, { name: part, path: walked.join('/'), folders: new Map(), files: [] });
+                }
+                current = current.folders.get(part);
+            });
+            current.files.push({ name: fileName, path });
+        });
+        return root;
+    }
+
+    function renderTreeBranch(branch, state, depth) {
+        const fragment = document.createDocumentFragment();
+        const indent = Number(state.treeIndentPx) || 13;
+        [...branch.folders.values()]
+            .sort((a, b) => a.name.localeCompare(b.name))
+            .forEach(folder => {
+                const isOpen = state.expanded.has(folder.path);
+                const row = node('div', 'cb-tree-row cb-tree-folder');
+                row.style.paddingLeft = `${8 + depth * indent}px`;
+                row.dataset.cbAction = 'toggle-folder';
+                row.dataset.path = folder.path;
+                row.setAttribute('role', 'treeitem');
+                row.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+                row.tabIndex = 0;
+                row.appendChild(icon(isOpen ? 'fa-folder-open' : 'fa-folder'));
+                row.appendChild(node('span', 'cb-tree-name', folder.name));
+                fragment.appendChild(row);
+                if (isOpen) fragment.appendChild(renderTreeBranch(folder, state, depth + 1));
+            });
+        branch.files
+            .slice()
+            .sort((a, b) => a.name.localeCompare(b.name))
+            .forEach(file => {
+                const row = node('div', `cb-tree-row cb-tree-file${state.openPath === file.path ? ' selected' : ''}`);
+                row.style.paddingLeft = `${11 + depth * indent}px`;
+                row.dataset.cbAction = 'open-file';
+                row.dataset.path = file.path;
+                row.setAttribute('role', 'treeitem');
+                row.setAttribute('aria-selected', state.openPath === file.path ? 'true' : 'false');
+                row.tabIndex = 0;
+                row.title = file.path;
+                row.appendChild(icon(fileIconFor(file.name)));
+                row.appendChild(node('span', 'cb-tree-name', file.name));
+                if (state.showFileMeta !== false) {
+                    const record = core.readFile(file.path);
+                    if (record) {
+                        row.appendChild(node('span', 'cb-tree-meta', `${(record.content.length / 1024).toFixed(1)} KB`));
+                    }
+                }
+                fragment.appendChild(row);
+            });
+        return fragment;
+    }
+
+    /**
+     * Key used in `state.collapsedRoots` for a PROJECT folder root. Roots are open
+     * unless the user collapsed them — opening Project Files should show files, not
+     * a list of folder names to click through first. Tracked in its own Set rather
+     * than inverted inside `expanded`, so "expand all" and "collapse all" can both
+     * be expressed without fighting a default.
+     */
+    function folderRootKey(folderId) {
+        return `folder:${folderId}`;
+    }
+
+    /**
+     * The Project Files sidebar, as a multi-root explorer.
+     *
+     * Every project folder is a root and every root lists all of its own
+     * documents, so the whole project is visible at once. The ACTIVE folder is
+     * where a new document lands; it is marked, but it does not filter the view.
+     */
+    function renderFileTree(state) {
+        const wrap = node('div', 'cb-tree-wrap');
+
+        const folders = state.folders || core.listFolders();
+        const activeFolderId = state.activeFolderId || core.DEFAULT_FOLDER_ID;
+        const counts = state.folderFileCounts || {};
+        const expanded = state.expanded || new Set();
+        // Roots are open unless explicitly collapsed; directories inside a root
+        // still follow `expanded`, which defaults to closed.
+        const collapsedRoots = state.collapsedRoots || new Set();
+        const indent = Number(state.treeIndentPx) || 13;
+
+        // ---- header ---------------------------------------------------
+        const header = node('div', 'cb-tree-header');
+        header.appendChild(node('strong', null, 'Project Files'));
+        const tools = node('div', 'cb-tree-tools');
+        tools.appendChild(iconButton('fa-folder-plus', 'new-folder', 'Create a new project folder'));
+        tools.appendChild(iconButton('fa-folder-open', 'open-folder', 'Import a folder from disk'));
+        tools.appendChild(iconButton('fa-file-circle-plus', 'add-source-file', 'Add a source file to the project'));
+        tools.appendChild(iconButton('fa-file-pen', 'new-file', 'Create a Markdown file'));
+        tools.appendChild(iconButton('fa-angles-down', 'expand-all', 'Expand every folder'));
+        tools.appendChild(iconButton('fa-angles-up', 'collapse-all', 'Collapse every folder'));
+        header.appendChild(tools);
+        wrap.appendChild(header);
+
+        const totalFiles = core.listFiles().length;
+        const summary = node('div', 'cb-tree-summary');
+        summary.appendChild(node('span', null,
+            `${folders.length} folder${folders.length === 1 ? '' : 's'} · ${totalFiles} file${totalFiles === 1 ? '' : 's'}`));
+        const activeFolder = folders.find(folder => folder.id === activeFolderId) || null;
+        if (activeFolder) {
+            summary.appendChild(node('em', null, `new files go to ${activeFolder.name}`));
+        }
+        wrap.appendChild(summary);
+
+        // ---- one root per project folder ------------------------------
+        const tree = node('div', 'cb-tree cb-tree-multiroot');
+        tree.setAttribute('role', 'tree');
+        tree.setAttribute('aria-label', 'All project folders and files');
+
+        folders.forEach(folder => {
+            const isActive = folder.id === activeFolderId;
+            // Open unless the user collapsed it, so the pane shows files on arrival.
+            const isOpen = !collapsedRoots.has(folderRootKey(folder.id));
+            const fileCount = counts[folder.id] !== undefined ? counts[folder.id] : core.folderFileCount(folder.id);
+
+            const row = node('div', `cb-tree-row cb-tree-root${isActive ? ' active' : ''}${isOpen ? ' open' : ''}`);
+            row.style.paddingLeft = '8px';
+            row.dataset.cbAction = 'toggle-folder-root';
+            row.dataset.folderId = folder.id;
+            row.setAttribute('role', 'treeitem');
+            row.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+            row.setAttribute('aria-selected', isActive ? 'true' : 'false');
+            row.tabIndex = 0;
+            row.title = `${folder.name} — ${fileCount} file(s)`
+                + (isActive ? ' · new files are created here' : ' · click to expand or collapse')
+                + (folder.origin === 'imported' ? ' · imported from disk' : '');
+
+            row.appendChild(icon(isOpen ? 'fa-folder-open' : 'fa-folder'));
+            const nameWrap = node('span', 'cb-tree-name');
+            nameWrap.appendChild(node('span', null, folder.name));
+            if (isActive) nameWrap.appendChild(node('span', 'cb-root-badge', 'target'));
+            row.appendChild(nameWrap);
+            row.appendChild(node('span', 'cb-tree-meta', String(fileCount)));
+
+            // Folder actions live on the root row. They are separate buttons with
+            // their own data-cb-action, and findAction() resolves the closest
+            // ancestor with an action — so clicking one of these never also toggles
+            // the root.
+            const rowTools = node('span', 'cb-tree-rowtools');
+            if (!isActive) {
+                rowTools.appendChild(iconButton('fa-bullseye', 'select-folder',
+                    `Create new files in ${folder.name}`, { folderId: folder.id }));
+            }
+            if (folder.id !== core.DEFAULT_FOLDER_ID) {
+                rowTools.appendChild(iconButton('fa-pen', 'rename-folder', `Rename ${folder.name}`, { folderId: folder.id }));
+                rowTools.appendChild(iconButton('fa-trash', 'delete-folder', `Delete ${folder.name}`, { folderId: folder.id }));
+            }
+            if (rowTools.childElementCount) row.appendChild(rowTools);
+
+            tree.appendChild(row);
+
+            if (!isOpen) return;
+
+            const paths = core.listFiles(folder.id);
+            if (!paths.length) {
+                const none = node('div', 'cb-tree-none');
+                none.style.paddingLeft = `${8 + indent}px`;
+                none.appendChild(node('span', null, 'No files in this folder yet.'));
+                tree.appendChild(none);
+                return;
+            }
+            // Nested one level under the root, so the hierarchy reads
+            // project folder -> directory -> file.
+            tree.appendChild(renderTreeBranch(buildTree(paths), state, 1));
+        });
+
+        // A store with no folders at all cannot happen (the default folder is
+        // always recreated on read), but render something rather than a blank pane.
+        if (!folders.length) {
+            const empty = node('div', 'cb-tree-empty');
+            empty.appendChild(icon('fa-folder-open'));
+            empty.appendChild(node('span', null, 'No project folders.'));
+            tree.appendChild(empty);
+        }
+        wrap.appendChild(tree);
+
+        // ---- attached source files ------------------------------------
+        const source = state.sourceFiles || [];
+        if (source.length) {
+            const attached = node('div', 'cb-attached');
+            attached.appendChild(node('span', 'cb-attached-label', `Attached for the model (${source.length})`));
+            const list = node('ul');
+            source.forEach(file => {
+                const item = node('li');
+                item.appendChild(icon('fa-paperclip'));
+                item.appendChild(node('span', null, file.path));
+                item.appendChild(node('em', null, `${Math.round(file.content.length / 1024)} KB`));
+                item.appendChild(iconButton('fa-xmark', 'remove-source-file', `Detach ${file.path}`, { path: file.path }));
+                list.appendChild(item);
+            });
+            attached.appendChild(list);
+            wrap.appendChild(attached);
+        }
+        return wrap;
+    }
+
+    function renderRunList(state) {
+        const wrap = node('div', 'cb-run-list');
+        const runs = state.runs || [];
+        if (!runs.length) {
+            const empty = node('div', 'cb-tree-empty');
+            empty.appendChild(icon('fa-clock-rotate-left'));
+            empty.appendChild(node('span', null, 'No runs yet.'));
+            empty.appendChild(node('p', null, 'Every Blueprint run is kept here with its full step trace.'));
+            wrap.appendChild(empty);
+            return wrap;
+        }
+        runs.forEach(run => {
+            const item = node('button', `cb-run-item${state.activeRunId === run.id ? ' selected' : ''}`);
+            item.type = 'button';
+            item.dataset.cbAction = 'open-run';
+            item.dataset.runId = run.id;
+            const head = node('div', 'cb-run-item-head');
+            head.appendChild(icon(statusIcon(run.status)));
+            head.appendChild(node('strong', null, run.title || run.skillName));
+            item.appendChild(head);
+            item.appendChild(node('span', 'cb-run-item-meta', `${run.skillName} · ${core.formatClock(run.createdAt)}`));
+            if (run.projectName) item.appendChild(node('em', 'cb-run-item-project', run.projectName));
+            if (run.writtenPaths && run.writtenPaths.length) {
+                const paths = node('span', 'cb-run-item-paths');
+                paths.appendChild(icon('fa-file-lines'));
+                paths.appendChild(node('span', null, `${run.writtenPaths.length} written`));
+                item.appendChild(paths);
+            }
+            wrap.appendChild(item);
+        });
+        return wrap;
+    }
+
+    function statusIcon(status) {
+        if (status === 'done') return 'fa-circle-check';
+        if (status === 'error') return 'fa-circle-exclamation';
+        if (status === 'stopped') return 'fa-circle-stop';
+        if (status === 'running') return 'fa-circle-notch fa-spin';
+        return 'fa-circle-dot';
+    }
+
+    function renderSettingsSummary(state) {
+        const settings = core.readSettings();
+        const wrap = node('div', 'cb-settings-summary');
+        const rows = [
+            ['Lens concurrency', settings.concurrency === 'parallel' ? 'Parallel' : 'Sequential'],
+            ['Clarifying questions', settings.askClarifyingQuestions ? 'On' : 'Off'],
+            ['Auto-open documents', settings.autoOpenWrittenDocument ? 'On' : 'Off'],
+            ['Lens tokens', String(settings.lensMaxOutputTokens)],
+            ['Document tokens', String(settings.documentMaxOutputTokens)],
+            ['Temperature', String(settings.temperature)]
+        ];
+        rows.forEach(([label, value]) => {
+            const row = node('div', 'cb-summary-row');
+            row.appendChild(node('span', null, label));
+            row.appendChild(node('strong', null, value));
+            wrap.appendChild(row);
+        });
+        const open = button('Open full settings', 'fa-sliders', 'go-settings-full', { primary: true });
+        wrap.appendChild(open);
+        void state;
+        return wrap;
+    }
+
+    // ------------------------------------------------------------------
+    // Step timeline — the visible Cursor-style agent trace
+    // ------------------------------------------------------------------
+
+    const STATUS_ICONS = {
+        pending: 'fa-circle-dot',
+        running: 'fa-circle-notch fa-spin',
+        done: 'fa-circle-check',
+        error: 'fa-circle-exclamation',
+        skipped: 'fa-circle-minus'
+    };
+
+    function renderStep(step) {
+        const isRunning = step.status === 'running';
+        const wrap = node('div', `cb-step cb-step-${step.status || 'pending'}${isRunning ? ' cb-step-active' : ''}`);
+        wrap.dataset.stepId = step.id;
+        wrap.dataset.cbStep = 'step';
+
+        const head = node('button', 'cb-step-head');
+        head.type = 'button';
+        head.dataset.cbAction = 'toggle-step';
+        head.dataset.stepId = step.id;
+        head.setAttribute('aria-expanded', step.open ? 'true' : 'false');
+        head.appendChild(icon(STATUS_ICONS[step.status] || STATUS_ICONS.pending));
+
+        const titleWrap = node('div', 'cb-step-title');
+        titleWrap.appendChild(node('strong', null, step.label));
+        if (isRunning && step.substatus) {
+            const substatusNode = node('span', 'cb-step-substatus');
+            substatusNode.appendChild(icon('fa-arrow-right-long'));
+            substatusNode.appendChild(node('span', null, step.substatus));
+            titleWrap.appendChild(substatusNode);
+        } else if (step.summary) {
+            titleWrap.appendChild(node('span', 'cb-step-summary', step.summary));
+        }
+        head.appendChild(titleWrap);
+
+        if (isRunning && step.tokensPerSec) {
+            head.appendChild(node('span', 'cb-step-tps', `${step.tokensPerSec} tok/s`));
+        }
+
+        if (step.elapsedMs || isRunning) {
+            head.appendChild(node('time', `cb-step-time${isRunning ? ' cb-step-time-live' : ''}`, `${((step.elapsedMs || 0) / 1000).toFixed(1)}s`));
+        }
+
+        if (isRunning) {
+            head.appendChild(node('span', 'cb-step-pulse'));
+        }
+
+        head.appendChild(icon(step.open ? 'fa-chevron-up' : 'fa-chevron-down'));
+        wrap.appendChild(head);
+
+        if (!step.open) return wrap;
+
+        const body = node('div', 'cb-step-body');
+
+        // ---- Thinking Process Drawer (Anti-gravity reasoning trace) ----
+        if (step.thinking || (isRunning && step.liveThinkingElement)) {
+            const thinkingBox = node('details', 'cb-step-block cb-step-thinking');
+            if (isRunning) thinkingBox.open = true;
+            const thinkSummary = node('summary', 'cb-thinking-summary');
+            thinkSummary.appendChild(icon('fa-brain', isRunning ? 'cb-brain-pulse' : ''));
+            thinkSummary.appendChild(node('span', null, 'Thinking & Reasoning Trace'));
+            const tokens = Math.round(((step.thinking && step.thinking.length) || 0) / 3.8);
+            if (tokens > 0) {
+                thinkSummary.appendChild(node('span', 'cb-step-flag', `${tokens} tokens`));
+            }
+            thinkingBox.appendChild(thinkSummary);
+
+            if (isRunning && step.liveThinkingElement) {
+                thinkingBox.appendChild(step.liveThinkingElement);
+            } else {
+                const thinkPre = node('pre', 'cb-pre cb-thinking-pre');
+                thinkPre.appendChild(node('code', null, step.thinking || ''));
+                thinkingBox.appendChild(thinkPre);
+            }
+            body.appendChild(thinkingBox);
+        }
+
+        if (step.kind === 'question') {
+            body.appendChild(node('p', 'cb-step-question', step.question || ''));
+            if (step.options && step.options.length) {
+                const options = node('div', 'cb-step-options');
+                step.options.forEach(option => {
+                    const chip = node('button', 'cb-chip cb-chip-primary');
+                    chip.type = 'button';
+                    chip.dataset.cbAction = 'answer-question';
+                    chip.dataset.stepId = step.id;
+                    chip.dataset.answer = option;
+                    chip.textContent = option;
+                    options.appendChild(chip);
+                });
+                body.appendChild(options);
+            }
+            if (isRunning && !step.answered) {
+                const inlineBox = node('div', 'cb-step-inline-answer');
+                const inlineInput = node('input', 'cb-input cb-step-inline-input');
+                inlineInput.type = 'text';
+                inlineInput.placeholder = 'Type your answer here…';
+                inlineInput.dataset.cbRole = 'inline-answer-input';
+                inlineInput.dataset.stepId = step.id;
+                inlineBox.appendChild(inlineInput);
+
+                const inlineBtn = node('button', 'cb-btn primary cb-step-inline-btn');
+                inlineBtn.type = 'button';
+                inlineBtn.dataset.cbAction = 'submit-inline-answer';
+                inlineBtn.dataset.stepId = step.id;
+                inlineBtn.appendChild(icon('fa-paper-plane'));
+                inlineBtn.appendChild(node('span', null, 'Answer'));
+                inlineBox.appendChild(inlineBtn);
+                body.appendChild(inlineBox);
+            }
+            if (step.answered) {
+                const answer = node('p', 'cb-step-answer');
+                answer.appendChild(icon('fa-reply'));
+                answer.appendChild(node('span', null, step.answered));
+                body.appendChild(answer);
+            }
+        } else if (step.kind === 'lens' || step.kind === 'phase' || step.kind === 'document') {
+            if (step.promptPreview) {
+                const promptBox = node('details', 'cb-step-block');
+                const summary = node('summary');
+                summary.appendChild(icon('fa-terminal'));
+                summary.appendChild(node('span', null, 'Prompt sent to the model'));
+                promptBox.appendChild(summary);
+                const pre = node('pre', 'cb-pre');
+                pre.appendChild(node('code', null, step.promptPreview));
+                promptBox.appendChild(pre);
+                body.appendChild(promptBox);
+            }
+            const outputBox = node('div', 'cb-step-block');
+            const outputHead = node('div', 'cb-step-block-head');
+            outputHead.appendChild(icon('fa-align-left'));
+            outputHead.appendChild(node('span', null, isRunning ? 'Model output (streaming…)' : 'Model output'));
+            if (step.finishReason) outputHead.appendChild(node('span', 'cb-step-flag', `finish: ${step.finishReason}`));
+            if (step.tokenCount) outputHead.appendChild(node('span', 'cb-step-flag', `${step.tokenCount} tokens`));
+            outputBox.appendChild(outputHead);
+            if (step.streaming && step.liveElement) {
+                outputBox.appendChild(step.liveElement);
+                const cursor = node('span', 'cb-stream-cursor', '▋');
+                outputBox.appendChild(cursor);
+            } else if (step.text) {
+                outputBox.appendChild(core.renderMarkdown(step.text));
+            } else {
+                outputBox.appendChild(node('p', 'cb-muted', isRunning ? 'Waiting for the first token…' : 'No output.'));
+            }
+            body.appendChild(outputBox);
+        } else if (step.text) {
+            body.appendChild(core.renderMarkdown(step.text));
+        }
+
+        if (step.error) {
+            const errorBox = node('div', 'cb-step-errbox');
+            errorBox.appendChild(icon('fa-triangle-exclamation'));
+            errorBox.appendChild(node('span', null, step.error));
+            body.appendChild(errorBox);
+
+            if (step.label === 'Waiting for source' || (typeof step.error === 'string' && step.error.indexOf('No source attached') >= 0)) {
+                const actionRow = node('div', 'cb-step-source-actions');
+                const addFileBtn = node('button', 'cb-btn primary cb-step-action-btn');
+                addFileBtn.type = 'button';
+                addFileBtn.dataset.cbAction = 'add-source-file';
+                addFileBtn.appendChild(icon('fa-file-circle-plus'));
+                addFileBtn.appendChild(node('span', null, 'Add Source File'));
+                actionRow.appendChild(addFileBtn);
+
+                const importFolderBtn = node('button', 'cb-btn cb-step-action-btn');
+                importFolderBtn.type = 'button';
+                importFolderBtn.dataset.cbAction = 'open-folder';
+                importFolderBtn.appendChild(icon('fa-folder-open'));
+                importFolderBtn.appendChild(node('span', null, 'Import Folder'));
+                actionRow.appendChild(importFolderBtn);
+
+                const filesTabBtn = node('button', 'cb-btn cb-step-action-btn');
+                filesTabBtn.type = 'button';
+                filesTabBtn.dataset.cbAction = 'go-files';
+                filesTabBtn.appendChild(icon('fa-folder-tree'));
+                filesTabBtn.appendChild(node('span', null, 'Project Files'));
+                actionRow.appendChild(filesTabBtn);
+
+                body.appendChild(actionRow);
+            }
+        }
+
+        wrap.appendChild(body);
+        return wrap;
+    }
+
+    // ------------------------------------------------------------------
+    // Transcript — the one big chat
+    // ------------------------------------------------------------------
+
+    function renderCompactionCard(message) {
+        const compaction = message.compaction || {};
+        const wrap = node('div', 'cb-msg cb-msg-compaction');
+        wrap.dataset.messageId = message.id;
+
+        const card = node('div', 'cb-compaction-card');
+        card.setAttribute('role', 'region');
+        card.setAttribute('aria-label', 'Context Compaction');
+
+        const head = node('div', 'cb-compaction-head');
+        const titleArea = node('div', 'cb-compaction-title');
+        titleArea.appendChild(icon('fa-bolt-lightning'));
+        titleArea.appendChild(node('strong', null, '⚡ Context Compacted (Anti-gravity Protocol)'));
+        head.appendChild(titleArea);
+
+        const metrics = node('div', 'cb-compaction-metrics');
+        const reqCount = Array.isArray(compaction.userRequests) ? compaction.userRequests.length : 1;
+        const savedPercent = compaction.savedPercent || 0;
+        const origTokens = compaction.originalTokens || 0;
+        const compTokens = compaction.compactedTokens || 0;
+
+        const pillReq = node('span', 'cb-compaction-pill', `Preserved ${reqCount} user goal${reqCount === 1 ? '' : 's'}`);
+        const pillSaved = node('span', 'cb-compaction-pill highlight', `${savedPercent}% reduction (${origTokens} → ${compTokens} tokens)`);
+        metrics.appendChild(pillReq);
+        metrics.appendChild(pillSaved);
+        head.appendChild(metrics);
+
+        card.appendChild(head);
+
+        const details = node('details', 'cb-compaction-details');
+        const summaryTag = node('summary', 'cb-compaction-summary-btn', 'View Anti-gravity Structured Summary');
+        details.appendChild(summaryTag);
+
+        const body = node('div', 'cb-compaction-body');
+        if (compaction.summary) {
+            body.appendChild(core.renderMarkdown(compaction.summary));
+        } else if (message.text) {
+            body.appendChild(core.renderMarkdown(message.text));
+        }
+        details.appendChild(body);
+        card.appendChild(details);
+
+        wrap.appendChild(card);
+        return wrap;
+    }
+
+    function renderMessage(message) {
+        if (message.role === 'compaction' || message.compaction) {
+            return renderCompactionCard(message);
+        }
+        const wrap = node('div', `cb-msg cb-msg-${message.role}`);
+        wrap.dataset.messageId = message.id;
+
+        const head = node('div', 'cb-msg-head');
+        head.appendChild(icon(message.role === 'user' ? 'fa-user' : 'fa-compass-drafting'));
+        head.appendChild(node('strong', null, message.role === 'user' ? 'You' : 'Blueprint'));
+        if (message.skillName) head.appendChild(node('span', 'cb-msg-skill', message.skillName));
+        head.appendChild(node('time', null, core.formatClock(message.at)));
+        wrap.appendChild(head);
+
+        if (message.text) wrap.appendChild(core.renderMarkdown(message.text));
+
+        if (Array.isArray(message.steps) && message.steps.length) {
+            const timeline = node('div', 'cb-timeline');
+            timeline.dataset.cbRole = 'timeline';
+            timeline.setAttribute('role', 'list');
+            timeline.setAttribute('aria-label', 'Agent steps');
+            message.steps.forEach(step => {
+                const stepNode = renderStep(step);
+                stepNode.setAttribute('role', 'listitem');
+                timeline.appendChild(stepNode);
+            });
+            wrap.appendChild(timeline);
+        }
+
+        if (message.paths && message.paths.length) {
+            const written = node('div', 'cb-written');
+            const writtenHeader = node('div', 'cb-written-header');
+            writtenHeader.appendChild(icon('fa-box-archive'));
+            writtenHeader.appendChild(node('span', 'cb-written-label', 'Written to project:'));
+            written.appendChild(writtenHeader);
+
+            const grid = node('div', 'cb-written-grid');
+            message.paths.forEach(path => {
+                const card = node('div', 'cb-artifact-card');
+                const fileHead = node('div', 'cb-artifact-head');
+                fileHead.appendChild(icon(fileIconFor(path)));
+                fileHead.appendChild(node('strong', 'cb-artifact-path', path));
+                card.appendChild(fileHead);
+
+                const chip = node('button', 'cb-path-chip cb-artifact-chip');
+                chip.type = 'button';
+                chip.dataset.cbAction = 'open-file';
+                chip.dataset.path = path;
+                chip.appendChild(icon('fa-file-arrow-down'));
+                chip.appendChild(node('span', null, path));
+                card.appendChild(chip);
+
+                grid.appendChild(card);
+            });
+            written.appendChild(grid);
+            wrap.appendChild(written);
+        }
+
+        const actions = node('div', 'cb-msg-actions');
+        if (message.role === 'assistant') {
+            if (message.text) actions.appendChild(button('Copy', 'fa-copy', 'copy-message', { compact: true, dataset: { messageId: message.id } }));
+            if (message.canRetry && !message.busy) {
+                actions.appendChild(button('Retry', 'fa-rotate-right', 'retry-message', { compact: true, dataset: { messageId: message.id } }));
+            }
+            actions.appendChild(button('Revise', 'fa-pen', 'revise-message', { compact: true, dataset: { messageId: message.id } }));
+        }
+        if (actions.childElementCount) wrap.appendChild(actions);
+        return wrap;
+    }
+
+    // ------------------------------------------------------------------
+    // Pipeline stepper — Anti-gravity progress tracking
+    // ------------------------------------------------------------------
+
+    function renderPipeline(pipeline) {
+        if (!Array.isArray(pipeline) || !pipeline.length) return null;
+        const bar = node('div', 'cb-pipeline');
+        bar.setAttribute('role', 'region');
+        bar.setAttribute('aria-label', 'Agent pipeline');
+        pipeline.forEach((item, index) => {
+            const isRunning = item.status === 'running';
+            const isDone = item.status === 'done';
+            const stepItem = node('div', `cb-pipeline-step cb-pipeline-${item.status || 'pending'}${isRunning ? ' active' : ''}`);
+            const iconName = isDone ? 'fa-circle-check' : isRunning ? 'fa-circle-notch fa-spin' : 'fa-circle-dot';
+            stepItem.appendChild(icon(iconName));
+            stepItem.appendChild(node('span', 'cb-pipeline-label', item.label));
+            bar.appendChild(stepItem);
+            if (index < pipeline.length - 1) {
+                const sep = node('span', 'cb-pipeline-sep');
+                sep.appendChild(icon('fa-chevron-right'));
+                bar.appendChild(sep);
+            }
+        });
+        return bar;
+    }
+
+    // ------------------------------------------------------------------
+    // Main pane
+    // ------------------------------------------------------------------
+
+    function renderAgentPage(state) {
+        const wrap = node('div', 'cb-agent');
+
+        const header = node('header', 'cb-agent-header');
+        const title = node('div', 'cb-agent-title');
+        title.appendChild(icon('fa-compass-drafting'));
+        title.appendChild(node('h2', null, state.run && state.run.title ? state.run.title : 'Blueprint planning agent'));
+        if (state.run) {
+            title.appendChild(node('span', `cb-run-status cb-run-${state.run.status}`, state.run.status));
+        }
+        header.appendChild(title);
+
+        const actions = node('div', 'cb-agent-header-actions');
+        const skillLabel = node('div', 'cb-agent-skill');
+        skillLabel.appendChild(icon(skills.getSkill(state.selectedSkillId)?.icon || 'fa-wand-magic-sparkles'));
+        skillLabel.appendChild(node('span', null, skills.getSkill(state.selectedSkillId)?.name || 'No skill selected'));
+        actions.appendChild(skillLabel);
+
+        const historyBtn = node('button', `cb-icon-btn cb-header-icon-btn${state.isHistoryOpen ? ' active' : ''}`);
+        historyBtn.type = 'button';
+        historyBtn.dataset.cbAction = 'toggle-chat-history';
+        historyBtn.title = 'Chat history';
+        historyBtn.setAttribute('aria-label', 'Chat history');
+        historyBtn.appendChild(icon('fa-clock-rotate-left'));
+        actions.appendChild(historyBtn);
+
+        const compactBtn = node('button', `cb-icon-btn cb-header-icon-btn${state.hasCompaction ? ' active' : ''}`);
+        compactBtn.type = 'button';
+        compactBtn.dataset.cbAction = 'compact-context';
+        compactBtn.title = 'Compact Context (Anti-gravity Protocol)';
+        compactBtn.setAttribute('aria-label', 'Compact Context');
+        compactBtn.appendChild(icon('fa-bolt-lightning'));
+        actions.appendChild(compactBtn);
+
+        const clearBtn = node('button', 'cb-icon-btn cb-header-icon-btn');
+        clearBtn.type = 'button';
+        clearBtn.dataset.cbAction = 'clear-chat';
+        clearBtn.title = 'Clear chat (New conversation)';
+        clearBtn.setAttribute('aria-label', 'Clear chat');
+        clearBtn.appendChild(icon('fa-broom'));
+        actions.appendChild(clearBtn);
+
+        header.appendChild(actions);
+        wrap.appendChild(header);
+
+        if (state.isHistoryOpen) {
+            wrap.appendChild(renderChatHistoryFlyout(state));
+        }
+
+        if (state.run && Array.isArray(state.run.pipeline)) {
+            const pipelineNode = renderPipeline(state.run.pipeline);
+            if (pipelineNode) wrap.appendChild(pipelineNode);
+        }
+
+        const transcript = node('div', 'cb-transcript');
+        transcript.dataset.cbRole = 'transcript';
+        transcript.setAttribute('role', 'log');
+        transcript.setAttribute('aria-live', 'polite');
+        transcript.tabIndex = -1;
+
+        if (!state.messages.length) {
+            transcript.appendChild(renderWelcome(state));
+        } else {
+            state.messages.forEach(message => transcript.appendChild(renderMessage(message)));
+        }
+        wrap.appendChild(transcript);
+        wrap.appendChild(renderComposer(state));
+        return wrap;
+    }
+
+    function renderChatHistoryFlyout(state) {
+        const flyout = node('div', 'cb-chat-history-popover');
+        flyout.dataset.cbRole = 'chat-history-popover';
+        flyout.setAttribute('role', 'dialog');
+        flyout.setAttribute('aria-label', 'Chat history');
+
+        const head = node('div', 'cb-chat-history-head');
+        const headTitle = node('div', 'cb-chat-history-title');
+        headTitle.appendChild(icon('fa-clock-rotate-left'));
+        headTitle.appendChild(node('strong', null, 'Chat History'));
+        head.appendChild(headTitle);
+
+        const headActions = node('div', 'cb-chat-history-actions');
+        const newChatBtn = node('button', 'cb-btn compact primary');
+        newChatBtn.type = 'button';
+        newChatBtn.dataset.cbAction = 'clear-chat';
+        newChatBtn.appendChild(icon('fa-plus'));
+        newChatBtn.appendChild(node('span', null, 'New Chat'));
+        headActions.appendChild(newChatBtn);
+
+        const closeBtn = node('button', 'cb-icon-btn cb-header-icon-btn');
+        closeBtn.type = 'button';
+        closeBtn.dataset.cbAction = 'toggle-chat-history';
+        closeBtn.title = 'Close history';
+        closeBtn.setAttribute('aria-label', 'Close history');
+        closeBtn.appendChild(icon('fa-xmark'));
+        headActions.appendChild(closeBtn);
+        head.appendChild(headActions);
+        flyout.appendChild(head);
+
+        const list = node('div', 'cb-chat-history-list');
+        const runs = state.runs || [];
+        if (!runs.length) {
+            const empty = node('div', 'cb-chat-history-empty');
+            empty.appendChild(icon('fa-clock-rotate-left'));
+            empty.appendChild(node('p', null, 'No chat history yet.'));
+            empty.appendChild(node('span', 'cb-muted', 'Finished runs and conversations will be saved here.'));
+            list.appendChild(empty);
+        } else {
+            runs.forEach(run => {
+                const isActive = run.id === state.activeRunId;
+                const item = node('div', `cb-chat-history-item${isActive ? ' active' : ''}`);
+                item.dataset.cbAction = 'open-chat-run';
+                item.dataset.runId = run.id;
+                item.setAttribute('role', 'button');
+                item.tabIndex = 0;
+
+                const itemIcon = node('div', 'cb-chat-history-item-icon');
+                const skill = skills.getSkill(run.skillId);
+                itemIcon.appendChild(icon(skill?.icon || 'fa-robot'));
+                item.appendChild(itemIcon);
+
+                const itemContent = node('div', 'cb-chat-history-item-content');
+                const titleLine = node('div', 'cb-chat-history-item-title');
+                const titleText = run.title || run.skillName || 'Untitled Chat';
+                titleLine.appendChild(node('strong', null, titleText));
+                if (isActive) {
+                    titleLine.appendChild(node('span', 'cb-badge cb-badge-primary', 'Active'));
+                }
+                itemContent.appendChild(titleLine);
+
+                if (run.idea) {
+                    itemContent.appendChild(node('p', 'cb-chat-history-item-idea', run.idea));
+                }
+
+                const meta = node('div', 'cb-chat-history-item-meta');
+                meta.appendChild(node('span', null, core.formatClock(run.createdAt)));
+                if (run.status) {
+                    meta.appendChild(node('span', `cb-run-status cb-run-${run.status}`, run.status));
+                }
+                if (run.writtenPaths && run.writtenPaths.length) {
+                    meta.appendChild(node('span', 'cb-muted', `${run.writtenPaths.length} doc${run.writtenPaths.length > 1 ? 's' : ''}`));
+                }
+                itemContent.appendChild(meta);
+                item.appendChild(itemContent);
+
+                const delBtn = node('button', 'cb-icon-btn cb-chat-history-delete-btn');
+                delBtn.type = 'button';
+                delBtn.dataset.cbAction = 'delete-history-run';
+                delBtn.dataset.runId = run.id;
+                delBtn.title = 'Delete from history';
+                delBtn.setAttribute('aria-label', 'Delete from history');
+                delBtn.appendChild(icon('fa-trash-can'));
+                item.appendChild(delBtn);
+
+                list.appendChild(item);
+            });
+        }
+        flyout.appendChild(list);
+
+        const foot = node('div', 'cb-chat-history-foot');
+        if (runs.length) {
+            const clearAllBtn = node('button', 'cb-btn compact danger');
+            clearAllBtn.type = 'button';
+            clearAllBtn.dataset.cbAction = 'clear-all-history';
+            clearAllBtn.appendChild(icon('fa-trash-can'));
+            clearAllBtn.appendChild(node('span', null, 'Clear All History'));
+            foot.appendChild(clearAllBtn);
+        }
+        const openRunsTabBtn = node('button', 'cb-btn compact');
+        openRunsTabBtn.type = 'button';
+        openRunsTabBtn.dataset.cbAction = 'open-runs-tab';
+        openRunsTabBtn.appendChild(icon('fa-arrow-up-right-from-square'));
+        openRunsTabBtn.appendChild(node('span', null, 'Open Runs Tab'));
+        foot.appendChild(openRunsTabBtn);
+
+        flyout.appendChild(foot);
+        return flyout;
+    }
+
+    function renderWelcome(state) {
+        const empty = node('div', 'cb-welcome');
+        empty.appendChild(icon('fa-compass-drafting'));
+        empty.appendChild(node('h3', null, 'One big planning chat'));
+        empty.appendChild(node('p', null, 'Describe the product you are building. Blueprint runs the Codalio skills as visible steps — clarifying questions, three independent lenses, then one synthesized document — and writes the results into the project file tree.'));
+
+        const picker = node('div', 'cb-welcome-skills');
+        skills.SKILLS.forEach(skill => {
+            const card = node('button', `cb-skill-card${state.selectedSkillId === skill.id ? ' selected' : ''}`);
+            card.type = 'button';
+            card.dataset.cbAction = 'pick-skill';
+            card.dataset.skillId = skill.id;
+            const head = node('div', 'cb-skill-card-head');
+            head.appendChild(icon(skill.icon));
+            head.appendChild(node('strong', null, skill.name));
+            card.appendChild(head);
+            card.appendChild(node('p', 'cb-skill-tagline', skill.tagline));
+            picker.appendChild(card);
+        });
+        empty.appendChild(picker);
+
+        const example = node('div', 'cb-welcome-example');
+        example.appendChild(node('span', null, 'Try:'));
+        const chip = node('button', 'cb-chip');
+        chip.type = 'button';
+        chip.dataset.cbAction = 'use-example';
+        chip.textContent = 'I want to build an app for neighbors to lend and borrow tools instead of everyone buying their own.';
+        example.appendChild(chip);
+        empty.appendChild(example);
+        return empty;
+    }
+
+    function renderComposer(state) {
+        const composer = node('div', 'cb-composer');
+
+        if (!state.busy && !state.pendingQuestion) {
+            const quickBar = node('div', 'cb-quick-bar');
+
+            // --- Group 1: Skills ---
+            const skillsGroup = node('div', 'cb-quick-group cb-quick-skills');
+            const quickLabel = node('span', 'cb-quick-label');
+            quickLabel.appendChild(icon('fa-bolt'));
+            quickLabel.appendChild(node('span', null, 'Skills:'));
+            skillsGroup.appendChild(quickLabel);
+
+            const quickSkills = [
+                { id: 'prd-builder', label: '/prd', title: 'PRD Builder' },
+                { id: 'mvp-checklist', label: '/mvp', title: 'MVP Scope' },
+                { id: 'gtm-plan', label: '/gtm', title: 'GTM Strategy' },
+                { id: 'arch-eval', label: '/arch', title: 'Architecture Evaluation' },
+                { id: 'doc-gen', label: '/docs', title: 'Doc Generation' },
+                { id: 'code-to-prd', label: '/code2prd', title: 'Code to PRD' }
+            ];
+            quickSkills.forEach(item => {
+                const chip = node('button', `cb-quick-chip${state.selectedSkillId === item.id ? ' active' : ''}`);
+                chip.type = 'button';
+                chip.dataset.cbAction = 'pick-skill';
+                chip.dataset.skillId = item.id;
+                chip.title = item.title;
+                chip.textContent = item.label;
+                skillsGroup.appendChild(chip);
+            });
+
+            const compactChip = node('button', `cb-quick-chip-compact${state.hasCompaction ? ' active' : ''}`);
+            compactChip.type = 'button';
+            compactChip.dataset.cbAction = 'compact-context';
+            compactChip.title = 'Compact Context (Anti-gravity Protocol)';
+            compactChip.textContent = '/compact';
+            skillsGroup.appendChild(compactChip);
+
+            quickBar.appendChild(skillsGroup);
+
+            // Divider
+            quickBar.appendChild(node('span', 'cb-quick-divider'));
+
+            // --- Group 2: Direct Folder Access ---
+            const folderGroup = node('div', 'cb-quick-group cb-quick-folders');
+            const folderLabel = node('span', 'cb-quick-label');
+            folderLabel.appendChild(icon('fa-folder'));
+            folderLabel.appendChild(node('span', null, 'Folder:'));
+            folderGroup.appendChild(folderLabel);
+
+            const folderSelect = node('select', 'cb-composer-select');
+            folderSelect.dataset.cbRole = 'composer-folder-select';
+            folderSelect.title = 'Active project folder — select to switch, create, or import';
+
+            const folders = Array.isArray(state.folders) ? state.folders : [];
+            folders.forEach(f => {
+                const opt = node('option');
+                opt.value = f.id;
+                const count = state.folderFileCounts && typeof state.folderFileCounts[f.id] === 'number'
+                    ? state.folderFileCounts[f.id]
+                    : (core && typeof core.folderFileCount === 'function' ? core.folderFileCount(f.id) : 0);
+                opt.textContent = `📁 ${f.name} (${count} file${count === 1 ? '' : 's'})`;
+                if (f.id === state.activeFolderId) {
+                    opt.selected = true;
+                    folderSelect.value = f.id;
+                }
+                folderSelect.appendChild(opt);
+            });
+
+            const sepOpt = node('option');
+            sepOpt.disabled = true;
+            sepOpt.textContent = '──────────';
+            folderSelect.appendChild(sepOpt);
+
+            const newFolderOpt = node('option');
+            newFolderOpt.value = '__new__';
+            newFolderOpt.textContent = '➕ New Folder…';
+            folderSelect.appendChild(newFolderOpt);
+
+            const importFolderOpt = node('option');
+            importFolderOpt.value = '__import__';
+            importFolderOpt.textContent = '📂 Import Folder from Disk…';
+            folderSelect.appendChild(importFolderOpt);
+
+            folderGroup.appendChild(folderSelect);
+
+            const importBtn = node('button', 'cb-quick-action-btn');
+            importBtn.type = 'button';
+            importBtn.dataset.cbAction = 'open-folder';
+            importBtn.title = 'Import a folder of source files from disk';
+            importBtn.appendChild(icon('fa-folder-open'));
+            importBtn.appendChild(node('span', null, 'Import'));
+            folderGroup.appendChild(importBtn);
+
+            quickBar.appendChild(folderGroup);
+
+            // Divider
+            quickBar.appendChild(node('span', 'cb-quick-divider'));
+
+            // --- Group 3: Project Files Selector ---
+            const filesGroup = node('div', 'cb-quick-group cb-quick-files');
+            const filesLabel = node('span', 'cb-quick-label');
+            filesLabel.appendChild(icon('fa-file-code'));
+            filesLabel.appendChild(node('span', null, 'Files:'));
+            filesGroup.appendChild(filesLabel);
+
+            const fileSelect = node('select', 'cb-composer-select');
+            fileSelect.dataset.cbRole = 'composer-file-select';
+            fileSelect.title = 'Attach a file from Project Files to prompt context';
+
+            const defaultFileOpt = node('option');
+            defaultFileOpt.value = '';
+            defaultFileOpt.disabled = true;
+            defaultFileOpt.selected = true;
+            defaultFileOpt.textContent = 'Attach file from project…';
+            fileSelect.appendChild(defaultFileOpt);
+
+            const allFiles = (core && typeof core.listFiles === 'function') ? core.listFiles() : (state.projectFiles || []);
+            const attachedFiles = Array.isArray(state.sourceFiles) ? state.sourceFiles : [];
+
+            if (!allFiles.length) {
+                const noFilesOpt = node('option');
+                noFilesOpt.value = '';
+                noFilesOpt.disabled = true;
+                noFilesOpt.textContent = '(No files in project yet)';
+                fileSelect.appendChild(noFilesOpt);
+            } else {
+                allFiles.forEach(filePath => {
+                    const opt = node('option');
+                    opt.value = filePath;
+                    const isAttached = attachedFiles.some(f => f.path === filePath);
+                    const rec = core && typeof core.readFile === 'function' ? core.readFile(filePath) : null;
+                    const sizeStr = rec && typeof rec.bytes === 'number' ? ` (${Math.round(rec.bytes / 1024)} KB)` : '';
+                    opt.textContent = `${isAttached ? '✓ ' : '📄 '}${filePath}${sizeStr}`;
+                    fileSelect.appendChild(opt);
+                });
+            }
+
+            const fileSepOpt = node('option');
+            fileSepOpt.disabled = true;
+            fileSepOpt.textContent = '──────────';
+            fileSelect.appendChild(fileSepOpt);
+
+            const uploadOpt = node('option');
+            uploadOpt.value = '__add__';
+            uploadOpt.textContent = '➕ Upload Source File from Disk…';
+            fileSelect.appendChild(uploadOpt);
+
+            filesGroup.appendChild(fileSelect);
+
+            const addFileBtn = node('button', 'cb-quick-action-btn');
+            addFileBtn.type = 'button';
+            addFileBtn.dataset.cbAction = 'add-source-file';
+            addFileBtn.title = 'Upload or paste a source file to attach to context';
+            addFileBtn.appendChild(icon('fa-file-circle-plus'));
+            addFileBtn.appendChild(node('span', null, 'Add File'));
+            filesGroup.appendChild(addFileBtn);
+
+            const browseBtn = node('button', 'cb-quick-action-btn');
+            browseBtn.type = 'button';
+            browseBtn.dataset.cbAction = 'go-files';
+            browseBtn.title = 'Jump to Project Files tab to browse and inspect documents';
+            browseBtn.appendChild(icon('fa-folder-tree'));
+            browseBtn.appendChild(node('span', null, 'Files Tab'));
+            filesGroup.appendChild(browseBtn);
+
+            quickBar.appendChild(filesGroup);
+
+            composer.appendChild(quickBar);
+        }
+
+        // --- Attached Files Bar (rendered whenever 1+ files are attached to prompt context) ---
+        if (Array.isArray(state.sourceFiles) && state.sourceFiles.length > 0) {
+            const attachedBar = node('div', 'cb-composer-attached');
+            const attachedLabel = node('span', 'cb-attached-label');
+            attachedLabel.appendChild(icon('fa-paperclip'));
+            attachedLabel.appendChild(node('span', null, `Attached (${state.sourceFiles.length}):`));
+            attachedBar.appendChild(attachedLabel);
+
+            const chipList = node('div', 'cb-attached-list');
+            state.sourceFiles.forEach(file => {
+                const chip = node('div', 'cb-attached-chip');
+                const len = file.content ? file.content.length : 0;
+                chip.title = `${file.path} (${Math.round(len / 1024)} KB)`;
+                chip.appendChild(icon('fa-file-lines'));
+                chip.appendChild(node('span', 'cb-attached-name', file.path));
+                chip.appendChild(node('span', 'cb-attached-size', ` (${Math.round(len / 1024)} KB)`));
+
+                const removeBtn = node('button', 'cb-attached-remove');
+                removeBtn.type = 'button';
+                removeBtn.title = `Detach ${file.path} from context`;
+                removeBtn.dataset.cbAction = 'detach-source-file';
+                removeBtn.dataset.path = file.path;
+                removeBtn.appendChild(icon('fa-xmark'));
+                chip.appendChild(removeBtn);
+
+                chipList.appendChild(chip);
+            });
+            attachedBar.appendChild(chipList);
+
+            const clearBtn = node('button', 'cb-attached-clear');
+            clearBtn.type = 'button';
+            clearBtn.dataset.cbAction = 'clear-attached-files';
+            clearBtn.title = 'Detach all files from prompt context';
+            clearBtn.textContent = 'Detach all';
+            attachedBar.appendChild(clearBtn);
+
+            composer.appendChild(attachedBar);
+        }
+
+        const isAwaitingAnswer = Boolean(state.pendingQuestion);
+        const isEffectivelyBusy = state.busy && !isAwaitingAnswer;
+
+        if (state.pendingQuestion) {
+            const bar = node('div', 'cb-composer-question');
+            bar.appendChild(icon('fa-circle-question'));
+            const textWrap = node('div', 'cb-composer-question-text');
+            textWrap.appendChild(node('strong', null, 'Clarifying question: '));
+            textWrap.appendChild(node('span', null, state.pendingQuestion.question));
+            bar.appendChild(textWrap);
+
+            if (Array.isArray(state.pendingQuestion.options) && state.pendingQuestion.options.length) {
+                const optGroup = node('div', 'cb-composer-question-options');
+                state.pendingQuestion.options.forEach(opt => {
+                    const optBtn = node('button', 'cb-chip cb-chip-primary');
+                    optBtn.type = 'button';
+                    optBtn.dataset.cbAction = 'answer-question';
+                    optBtn.dataset.answer = opt;
+                    optBtn.textContent = opt;
+                    optGroup.appendChild(optBtn);
+                });
+                bar.appendChild(optGroup);
+            }
+            composer.appendChild(bar);
+        }
+
+        const textarea = node('textarea', 'cb-composer-input');
+        textarea.dataset.cbRole = 'composer';
+        textarea.rows = 3;
+        textarea.value = state.draft || '';
+        textarea.placeholder = isAwaitingAnswer
+            ? 'Type your answer to the question above… Enter sends · Shift+Enter adds a line.'
+            : isEffectivelyBusy
+                ? 'A step is running — press Stop to interrupt safely.'
+                : 'Describe your product idea, or tell Blueprint what to revise. Enter sends · Shift+Enter adds a line.';
+        if (isEffectivelyBusy) textarea.disabled = true;
+        composer.appendChild(textarea);
+
+        const bar = node('div', 'cb-composer-bar');
+        const hint = node('span', 'cb-composer-hint');
+        hint.appendChild(icon(isAwaitingAnswer ? 'fa-pen-to-square' : isEffectivelyBusy ? 'fa-circle-notch fa-spin' : 'fa-circle-info'));
+        hint.appendChild(node('span', null, isAwaitingAnswer ? 'Agent paused · Awaiting your response to proceed with the plan.' : (state.hint || 'Runs on your active SimpleRAG model endpoint. Nothing is written to your workspace.')));
+        bar.appendChild(hint);
+
+        const right = node('div', 'cb-composer-right');
+        if (state.busy) {
+            right.appendChild(button('Stop', 'fa-stop', 'stop-run', { danger: true, title: 'Stop the current step safely' }));
+        }
+        const send = node('button', `cb-btn primary cb-send${isAwaitingAnswer ? ' cb-send-answer' : ''}`);
+        send.type = 'button';
+        send.dataset.cbAction = 'send';
+        send.appendChild(icon(isAwaitingAnswer ? 'fa-paper-plane' : isEffectivelyBusy ? 'fa-circle-notch fa-spin' : 'fa-paper-plane'));
+        send.appendChild(node('span', null, isAwaitingAnswer ? 'Send Answer' : isEffectivelyBusy ? 'Running…' : 'Send'));
+        if (isEffectivelyBusy) send.disabled = true;
+        right.appendChild(send);
+        bar.appendChild(right);
+        composer.appendChild(bar);
+        return composer;
+    }
+
+    function renderFilesPage(state) {
+        const record = state.openPath ? core.readFile(state.openPath) : null;
+        if (!record) {
+            const wrap = node('div', 'cb-viewer');
+            const empty = node('div', 'cb-viewer-empty');
+            empty.appendChild(icon('fa-folder-tree'));
+            empty.appendChild(node('h3', null, 'Project files'));
+            empty.appendChild(node('p', null, 'Pick a file in the list to read it. Blueprint writes each generated document here under docs/, and you can add your own source files for the code-reading skills.'));
+            const actions = node('div', 'cb-viewer-empty-actions');
+            actions.appendChild(button('Add source file', 'fa-file-circle-plus', 'add-source-file', { primary: true }));
+            actions.appendChild(button('New Markdown', 'fa-file-pen', 'new-file'));
+            empty.appendChild(actions);
+            wrap.appendChild(empty);
+            return wrap;
+        }
+        return renderViewer(state, record);
+    }
+
+    /** preview.js loads before ui.js; resolved lazily so order cannot break the page. */
+    const previewModule = () => window.__codalioBlueprintPreview;
+
+    /**
+     * Label and icon for the viewer mode toggle, phrased for the file being read.
+     *
+     * Offering "Markdown" on a .py file is misleading — rendering Python through
+     * the Markdown parser turns `#` comments into headings. For code the button
+     * says "Code" and for documents it says "Markdown", while the action stays the
+     * same either way.
+     */
+    function viewerToggleAffordance(state, path) {
+        const inSource = state.viewerMode === 'source';
+        const preview = previewModule();
+        // languageFor() returns { key, info }, and the display name lives on info.
+        const language = preview ? preview.languageFor(path) : { key: 'text', info: { label: 'Plain text' } };
+        const isDocument = language.key === 'markdown' || language.key === 'text';
+        const languageLabel = (language.info && language.info.label) || 'language';
+        return {
+            label: inSource ? 'Preview' : (isDocument ? 'Markdown' : 'Code'),
+            iconName: inSource ? 'fa-eye' : (isDocument ? 'fa-code' : 'fa-file-code'),
+            title: inSource
+                ? 'Render this document'
+                : (isDocument
+                    ? 'Show the raw Markdown'
+                    : `Show this file with line numbers and ${languageLabel} colouring`)
+        };
+    }
+
+    function renderViewer(state, record) {
+        const viewer = node('div', 'cb-viewer');
+
+        const bar = node('div', 'cb-viewer-bar');
+        const isImported = record.origin === 'imported';
+        const pathWrap = node('div', 'cb-viewer-path');
+        pathWrap.appendChild(icon(fileIconFor(record.path)));
+        pathWrap.appendChild(node('span', null, record.path));
+        if (isImported) {
+            const badge = node('span', 'cb-chip cb-chip-muted cb-viewer-badge');
+            badge.title = 'Project source file — Read-only to Blueprint';
+            badge.appendChild(icon('fa-lock'));
+            badge.appendChild(node('span', null, 'Read-Only Source'));
+            pathWrap.appendChild(badge);
+        } else {
+            const badge = node('span', 'cb-chip cb-chip-primary cb-viewer-badge');
+            badge.title = 'Created by Blueprint — Editable & rewritable';
+            badge.appendChild(icon('fa-pen-nib'));
+            badge.appendChild(node('span', null, 'Blueprint Document'));
+            pathWrap.appendChild(badge);
+        }
+        bar.appendChild(pathWrap);
+
+        const tools = node('div', 'cb-viewer-tools');
+        tools.appendChild(node('span', 'cb-viewer-meta', `${record.content.length.toLocaleString()} chars · ${record.content.split('\n').length} lines · ${core.formatClock(record.updatedAt)}`));
+        const toggle = viewerToggleAffordance(state, record.path);
+        tools.appendChild(button(toggle.label, toggle.iconName, 'viewer-toggle', {
+            compact: true,
+            title: toggle.title,
+            dataset: { path: record.path }
+        }));
+        tools.appendChild(button('Copy', 'fa-copy', 'copy-file', { compact: true, dataset: { path: record.path } }));
+        tools.appendChild(button('Download', 'fa-download', 'download-file', { compact: true, dataset: { path: record.path } }));
+        tools.appendChild(button('Rename', 'fa-pen', 'rename-file', { compact: true, dataset: { path: record.path } }));
+        tools.appendChild(button('Delete', 'fa-trash', 'delete-file', { compact: true, danger: true, dataset: { path: record.path } }));
+        bar.appendChild(tools);
+        viewer.appendChild(bar);
+
+        const body = node('div', 'cb-viewer-body');
+        const settings = core.readSettings();
+        // Reading width applies to both modes: rendered prose wants a comfortable
+        // measure, and the code view honours it so lines do not run to the edge.
+        body.classList.add(`cb-reading-${settings.readingWidth || 'wide'}`);
+
+        const preview = previewModule();
+        if (state.viewerMode === 'source') {
+            if (preview) {
+                // The Notepad++-style view: line-number gutter, syntax colouring,
+                // and an Ln / Col status bar. Layout idea from Notepad++; the code
+                // is this plug-in's own (see preview.js).
+                body.appendChild(preview.renderPreview(record, {
+                    highlight: settings.syntaxHighlighting !== false,
+                    wrap: settings.wrapLongLines !== false,
+                    gutter: settings.showLineNumbers !== false
+                }));
+            } else {
+                const pre = node('pre', 'cb-pre cb-viewer-source');
+                pre.appendChild(node('code', null, record.content));
+                body.appendChild(pre);
+            }
+        } else {
+            body.appendChild(core.renderMarkdown(record.content));
+        }
+        viewer.appendChild(body);
+        return viewer;
+    }
+
+    function renderHistoryPage(state) {
+        const wrap = node('div', 'cb-history');
+        const runs = state.runs || [];
+        if (!runs.length) {
+            const empty = node('div', 'cb-viewer-empty');
+            empty.appendChild(icon('fa-clock-rotate-left'));
+            empty.appendChild(node('h3', null, 'No runs yet'));
+            empty.appendChild(node('p', null, 'Every Blueprint run is stored here with its complete step trace, prompts, and written documents — kept only in this browser profile.'));
+            wrap.appendChild(empty);
+            return wrap;
+        }
+        const run = runs.find(item => item.id === state.activeRunId) || runs[0];
+        const header = node('header', 'cb-history-header');
+        const title = node('div');
+        title.appendChild(node('h2', null, run.title || run.skillName));
+        title.appendChild(node('p', null, `${run.skillName} · ${core.formatClock(run.createdAt)} · ${run.status}`));
+        header.appendChild(title);
+        const tools = node('div', 'cb-viewer-tools');
+        tools.appendChild(button('Reopen in agent', 'fa-robot', 'open-run', { compact: true, dataset: { runId: run.id } }));
+        tools.appendChild(button('Delete run', 'fa-trash', 'delete-run', { compact: true, danger: true, dataset: { runId: run.id } }));
+        header.appendChild(tools);
+        wrap.appendChild(header);
+
+        if (run.idea) {
+            const idea = node('div', 'cb-history-idea');
+            idea.appendChild(node('span', 'cb-written-label', 'Idea'));
+            idea.appendChild(node('p', null, run.idea));
+            wrap.appendChild(idea);
+        }
+
+        const timeline = node('div', 'cb-timeline cb-history-timeline');
+        (run.phases || []).forEach(step => timeline.appendChild(renderStep(step)));
+        if (!(run.phases || []).length) timeline.appendChild(node('p', 'cb-muted', 'This run recorded no steps.'));
+        wrap.appendChild(timeline);
+
+        if (run.writtenPaths && run.writtenPaths.length) {
+            const written = node('div', 'cb-written');
+            written.appendChild(node('span', 'cb-written-label', 'Documents written:'));
+            run.writtenPaths.forEach(path => {
+                const chip = node('button', 'cb-path-chip');
+                chip.type = 'button';
+                chip.dataset.cbAction = 'open-file';
+                chip.dataset.path = path;
+                chip.appendChild(icon('fa-file-lines'));
+                chip.appendChild(node('span', null, path));
+                written.appendChild(chip);
+            });
+            wrap.appendChild(written);
+        }
+        return wrap;
+    }
+
+    /**
+     * The thorough settings page: sections -> sub-pages -> cards -> groups ->
+     * rows, all driven by the schema in settings.js and rendered by
+     * settings-page.js. Kept as a ui.js export so existing callers and tests do
+     * not have to know the split.
+     */
+    function renderSettingsPage(state) {
+        const page = settingsPage();
+        if (page) return page.renderSettingsPage(state);
+        // settings-page.js is declared in the same install manifest as this file
+        // and the host rejects the extension if any asset hash fails, so this
+        // branch is unreachable in a working install. Say so plainly rather than
+        // rendering a broken half-page.
+        const broken = node('div', 'cb-viewer');
+        const empty = node('div', 'cb-viewer-empty');
+        empty.appendChild(icon('fa-triangle-exclamation'));
+        empty.appendChild(node('h3', null, 'Settings unavailable'));
+        empty.appendChild(node('p', null, 'The settings module did not load. Reinstall the plug-in with tools/blueprint.py install, then reload the page.'));
+        broken.appendChild(empty);
+        return broken;
+    }
+
+    // ------------------------------------------------------------------
+    // Tabbed workspace shell (the reading pane)
+    // ------------------------------------------------------------------
+
+    /**
+     * The whole Blueprint reading pane: tab strip + active panel.
+     *
+     * The Agent tab is pinned by default (Settings -> Workspace -> Tabs), so
+     * opening Project Files, Runs or Settings adds a tab BESIDE the chat
+     * instead of replacing it — the IDE behaviour the page is built around.
+     */
+    function renderWorkspace(state) {
+        const ws = state.workspace;
+        const shell = node('div', 'cb-workspace');
+
+        const wsModule = workspaceModule();
+        if (wsModule && ws) {
+            shell.appendChild(wsModule.renderTabStrip(ws, state));
+        }
+
+        const panel = node('div', 'cb-tabpanel');
+        panel.id = 'cb-tabpanel';
+        panel.dataset.cbRole = 'tabpanel';
+        panel.setAttribute('role', 'tabpanel');
+        panel.tabIndex = -1;
+        panel.appendChild(renderTabPanel(state));
+        shell.appendChild(panel);
+
+        return shell;
+    }
+
+    /** Map the active tab to its panel. */
+    function renderTabPanel(state) {
+        const ws = state.workspace;
+        const wsModule = workspaceModule();
+        if (!ws || !wsModule) return renderAgentPage(state);
+
+        const tab = wsModule.activeTab(ws);
+        if (tab.kind === 'file') {
+            const record = core.readFile(tab.path);
+            if (!record) return renderMissingFilePanel(state, tab);
+            const mode = wsModule.viewerModeFor(ws, tab.path, state.settings || core.readSettings());
+            return renderViewer(Object.assign({}, state, { viewerMode: mode, openPath: tab.path }), record);
+        }
+        if (tab.kind === 'section') {
+            if (tab.sectionId === 'cb-files') return renderFilesPage(state);
+            if (tab.sectionId === 'cb-history') return renderHistoryPage(state);
+            if (tab.sectionId === 'cb-settings') return renderSettingsPage(state);
+        }
+        return renderAgentPage(state);
+    }
+
+    /**
+     * A file tab whose document was deleted (e.g. closeTabOnDelete is off).
+     * Says so plainly and offers the way back.
+     */
+    function renderMissingFilePanel(state, tab) {
+        const wrap = node('div', 'cb-viewer');
+        const empty = node('div', 'cb-viewer-empty');
+        empty.appendChild(icon('fa-file-circle-xmark'));
+        empty.appendChild(node('h3', null, tab.title));
+        empty.appendChild(node('p', null, `\u201c${tab.path}\u201d is no longer in the project. It was deleted while this tab was open.`));
+        const actions = node('div', 'cb-viewer-empty-actions');
+        actions.appendChild(button('Close this tab', 'fa-xmark', 'close-tab', { dataset: { tabId: tab.id } }));
+        actions.appendChild(button('Back to Agent', 'fa-robot', 'activate-tab', { primary: true, dataset: { tabId: 'tab-agent' } }));
+        empty.appendChild(actions);
+        wrap.appendChild(empty);
+        return wrap;
+    }
+
+    // ------------------------------------------------------------------
+    // Modal + toast
+    // ------------------------------------------------------------------
+
+    function renderModal(state) {
+        const modal = state.modal;
+        const backdrop = node('div', 'cb-modal-backdrop');
+        backdrop.dataset.cbAction = 'close-modal';
+
+        const dialog = node('section', 'cb-modal');
+        dialog.setAttribute('role', 'dialog');
+        dialog.setAttribute('aria-modal', 'true');
+        dialog.dataset.cbAction = 'modal-body';
+
+        const header = node('header', 'cb-modal-header');
+        header.appendChild(icon(modal.icon || 'fa-file-circle-plus'));
+        header.appendChild(node('h2', null, modal.title));
+        header.appendChild(iconButton('fa-xmark', 'close-modal', 'Close'));
+        dialog.appendChild(header);
+
+        const body = node('div', 'cb-modal-body');
+        if (modal.description) body.appendChild(node('p', 'cb-modal-description', modal.description));
+
+        if (modal.kind === 'folder') {
+            // New folder / rename folder: a single name field. The confirm handler
+            // reads values.name, collected by data-cb-field below.
+            const nameLabel = node('label', 'cb-field');
+            nameLabel.appendChild(node('span', null, modal.nameLabel || 'Folder name'));
+            const nameInput = node('input', 'cb-input');
+            nameInput.type = 'text';
+            nameInput.dataset.cbField = 'name';
+            nameInput.value = modal.name || '';
+            nameInput.maxLength = MAX_FILE_NAME_LENGTH;
+            nameLabel.appendChild(nameInput);
+            body.appendChild(nameLabel);
+            body.appendChild(node('p', 'cb-modal-note', modal.note
+                || 'Folders live only in this browser profile, alongside the documents they hold. Nothing is uploaded.'));
+        } else if (modal.kind === 'file') {
+            const nameLabel = node('label', 'cb-field');
+            nameLabel.appendChild(node('span', null, modal.pathLabel || 'Project path'));
+            const nameInput = node('input', 'cb-input');
+            nameInput.type = 'text';
+            nameInput.dataset.cbField = 'path';
+            nameInput.value = modal.path || '';
+            nameInput.maxLength = MAX_FILE_NAME_LENGTH;
+            nameLabel.appendChild(nameInput);
+            body.appendChild(nameLabel);
+
+            if (modal.allowUpload) {
+                body.appendChild(button('Choose a file from disk…', 'fa-upload', 'pick-upload', { primary: true }));
+                const fileInput = document.createElement('input');
+                fileInput.type = 'file';
+                fileInput.dataset.cbField = 'file';
+                fileInput.style.display = 'none';
+                if (modal.accept) fileInput.accept = modal.accept;
+                body.appendChild(fileInput);
+                const limits = sourceLimits();
+                body.appendChild(node('p', 'cb-modal-note', modal.note || `Text files up to ${Math.round(limits.maxFileBytes / 1024)} KB. At most ${limits.maxFiles} attached files and ${Math.round(limits.maxTotalBytes / 1024)} KB total are sent to the model. Change these in Settings → Source files.`));
+            }
+
+            const contentLabel = node('label', 'cb-field');
+            contentLabel.appendChild(node('span', null, modal.contentLabel || 'Content'));
+            const contentInput = node('textarea', 'cb-input cb-modal-textarea');
+            contentInput.dataset.cbField = 'content';
+            contentInput.rows = modal.allowUpload ? 6 : 12;
+            contentInput.value = modal.content || '';
+            contentLabel.appendChild(contentInput);
+            body.appendChild(contentLabel);
+        } else if (modal.message) {
+            body.appendChild(node('p', null, modal.message));
+        }
+
+        dialog.appendChild(body);
+
+        const footer = node('footer', 'cb-modal-footer');
+        footer.appendChild(button(modal.cancelLabel || 'Cancel', '', 'close-modal'));
+        footer.appendChild(button(modal.confirmLabel || 'OK', modal.confirmIcon || '', 'confirm-modal', { primary: !modal.danger, danger: modal.danger }));
+        dialog.appendChild(footer);
+
+        backdrop.appendChild(dialog);
+        return backdrop;
+    }
+
+    function renderToast(state) {
+        const toast = node('div', `cb-toast cb-toast-${state.toast.tone || 'info'}`);
+        toast.setAttribute('role', 'status');
+        toast.appendChild(icon(state.toast.tone === 'error' ? 'fa-circle-exclamation' : state.toast.tone === 'success' ? 'fa-circle-check' : 'fa-circle-info'));
+        toast.appendChild(node('span', null, state.toast.text));
+        return toast;
+    }
+
+    window.__codalioBlueprintUi = Object.freeze({
+        MAX_SOURCE_FILE_BYTES,
+        MAX_SOURCE_FILES,
+        MAX_SOURCE_TOTAL_BYTES,
+        MAX_FILE_NAME_LENGTH,
+        SECTIONS,
+        folderRootKey,
+        node,
+        icon,
+        button,
+        iconButton,
+        fileIconFor,
+        buildTree,
+        renderNav,
+        renderRibbon,
+        renderList,
+        renderWorkspace,
+        renderTabPanel,
+        renderMissingFilePanel,
+        renderAgentPage,
+        renderChatHistoryFlyout,
+        renderFilesPage,
+        renderHistoryPage,
+        renderSettingsPage,
+        renderViewer,
+        sourceLimits,
+        renderStep,
+        renderMessage,
+        renderModal,
+        renderToast,
+        statusIcon
+    });
+}());

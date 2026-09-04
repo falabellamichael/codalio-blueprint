@@ -1,6 +1,24 @@
+This repository is a fork of https://github.com/codalio/codalio-blueprint and
+contains two bodies of work, both licensed under the MIT License reproduced below.
+
+  1. The upstream codalio-blueprint planning skills — the skill sources under
+     skills/, the sample output under examples/, and the vendor plugin manifests
+     (.claude-plugin/, .cursor-plugin/, .codex-plugin/, .antigravity-plugin/,
+     gemini-extension.json).
+     Copyright (c) 2026 Codalio
+
+  2. The SimpleRAG plug-in added by this fork — the Blueprint page, tabbed
+     workspace, agent runtime, file previewer, installer, stylesheet and tests,
+     all under src/, tests/ and tools/. src/skills.js is an original executable
+     port of the upstream skills and remains the copyright of Codalio in its
+     methodology, lens prompts, process flows, output contracts, document
+     templates and output paths.
+     Copyright (c) 2026 Michael Anthony Falabella
+
 MIT License
 
 Copyright (c) 2026 Codalio
+Copyright (c) 2026 Michael Anthony Falabella
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
