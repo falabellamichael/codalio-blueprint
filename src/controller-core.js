@@ -918,25 +918,26 @@
 
     let projectStoreLoadError = '';
 
-    function readStore() {
+    /**
+     * Parse and validate persisted project bytes into a store. Shared by the
+     * synchronous localStorage boot path and the asynchronous durable-tier
+     * hydration so both interpret bytes identically — a divergence there would
+     * silently drop or resurrect files depending on which tier answered first.
+     * Returns { store, error }; error is '' on success. Callers decide whether
+     * an error is fatal (boot) or merely a reason to prefer the other tier.
+     */
+    function parsePersistedStoreRaw(raw) {
         const store = emptyStore();
         try {
-            const raw = window.localStorage.getItem(PROJECTS_KEY);
-            if (!raw) {
-                projectStoreLoadError = '';
-                return store;
-            }
+            if (!raw) return { store, error: '' };
             const parsed = JSON.parse(raw);
             if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-                projectStoreLoadError = 'The saved project store is malformed.';
-                return store;
+                return { store, error: 'The saved project store is malformed.' };
             }
             const validationError = persistedStoreValidationError(parsed);
             if (validationError) {
-                projectStoreLoadError = validationError;
-                return store;
+                return { store, error: validationError };
             }
-            projectStoreLoadError = '';
 
             store.revision = Number.isSafeInteger(parsed.revision) && parsed.revision >= 0
                 ? parsed.revision : 0;
@@ -1014,10 +1015,25 @@
                 && String(selectedRun.folderId || '') !== String(store.activeFolderId || '')) {
                 store.activeRunId = '';
             }
+            return { store, error: '' };
         } catch (error) {
-            projectStoreLoadError = `The saved project store could not be parsed (${String((error && error.message) || error)}).`;
+            return {
+                store,
+                error: `The saved project store could not be parsed (${String((error && error.message) || error)}).`
+            };
         }
-        return store;
+    }
+
+    /**
+     * Synchronous boot read from localStorage. Keeps its original signature and
+     * its side effect on projectStoreLoadError so every existing caller (and
+     * every test that asserts on it) behaves exactly as before; the durable tier
+     * hydrates afterwards and may replace what this returned.
+     */
+    function readStore() {
+        const parsed = parsePersistedStoreRaw(window.localStorage.getItem(PROJECTS_KEY));
+        projectStoreLoadError = parsed.error;
+        return parsed.store;
     }
 
     /**
@@ -1260,10 +1276,36 @@
         console.warn('[codalio-blueprint] unable to persist project state', error);
     }
 
+    /**
+     * True when localStorage refused a write because the origin's quota is
+     * exhausted. Browsers disagree on how they report it — QuotaExceededError is
+     * the DOMException name, NS_ERROR_DOM_QUOTA_REACHED is Firefox, and legacy
+     * builds use numeric codes 22/1014 — so match those. Message text is a
+     * fallback only, and it must name quota *exceeded*: matching a bare "quota"
+     * would swallow unrelated failures (a transient refusal must stay a refusal)
+     * and claim a save succeeded when nothing was stored.
+     */
+    function isLocalStorageQuotaError(error) {
+        if (!error) return false;
+        const name = String(error.name || '');
+        const code = String(error.code || '');
+        if (name === 'QuotaExceededError' || name === 'NS_ERROR_DOM_QUOTA_REACHED') return true;
+        if (code === '22' || code === '1014') return true;
+        return /quota (exceeded|refused|limit)|exceeded the quota|storage is full|out of storage/i
+            .test(String(error.message || ''));
+    }
+
     function writeStore(store, options) {
         const borrowedLease = options && options.transactionLease
             ? options.transactionLease : null;
         let lease = borrowedLease;
+        // Declared at function scope, NOT inside try: the quota-recovery path in
+        // catch needs the validated bytes, and a const declared inside try is out
+        // of scope there (a ReferenceError exactly when the store is full).
+        let serialized = '';
+        let serializedCandidate = null;
+        let nextRevision = 0;
+        let commitId = '';
         try {
             if (externalResetObserved && !(options && options.allowMissingReset === true)) {
                 recordPersistenceFailure(new Error(
@@ -1348,8 +1390,8 @@
                 }
             }
 
-            const nextRevision = knownStoreRevision + 1;
-            const commitId = lease.token;
+            nextRevision = knownStoreRevision + 1;
+            commitId = lease.token;
             const candidate = {
                 version: STORE_VERSION,
                 revision: nextRevision,
@@ -1362,8 +1404,8 @@
                 activeRunId: store.activeRunId,
                 activeFolderId: store.activeFolderId
             };
-            const serialized = JSON.stringify(candidate, withoutDomNodes);
-            const serializedCandidate = JSON.parse(serialized);
+            serialized = JSON.stringify(candidate, withoutDomNodes);
+            serializedCandidate = JSON.parse(serialized);
             const outgoingError = persistedStoreValidationError(serializedCandidate, {
                 requireSelectionOwnership: true
             });
@@ -1383,14 +1425,31 @@
                 ), 'store-busy');
                 return false;
             }
-            window.localStorage.setItem(PROJECTS_KEY, serialized);
-            let committed = null;
-            try { committed = JSON.parse(window.localStorage.getItem(PROJECTS_KEY) || 'null'); } catch (_) { committed = null; }
-            if (!ownsStoreWriteIntent(lease) || !committed
-                || committed.revision !== nextRevision || committed.commitId !== commitId) {
+            // Once the durable tier has advanced past localStorage (a quota
+            // failure in an earlier session), localStorage's revision is stale
+            // and comparing against it would reject every save as a concurrent
+            // update. The newer tier becomes the fencing authority instead.
+            let localCommitOk = false;
+            if (!localStorageDegraded) {
+                window.localStorage.setItem(PROJECTS_KEY, serialized);
+                let committed = null;
+                try { committed = JSON.parse(window.localStorage.getItem(PROJECTS_KEY) || 'null'); } catch (_) { committed = null; }
+                if (!ownsStoreWriteIntent(lease) || !committed
+                    || committed.revision !== nextRevision || committed.commitId !== commitId) {
+                    recordPersistenceFailure(new Error(
+                        'Project data was replaced by another writer before this save could be verified.'
+                    ), 'concurrent-update');
+                    return false;
+                }
+                localCommitOk = true;
+            }
+            // Mirror to disk under the lease we still hold, so the durable copy
+            // carries the same commit identity the lease granted.
+            mirrorToDurableTier(serialized, nextRevision, commitId);
+            if (!localCommitOk && !ownsStoreWriteIntent(lease)) {
                 recordPersistenceFailure(new Error(
-                    'Project data was replaced by another writer before this save could be verified.'
-                ), 'concurrent-update');
+                    'Another Blueprint window acquired project-write priority before this save committed.'
+                ), 'store-busy');
                 return false;
             }
             store.revision = nextRevision;
@@ -1405,6 +1464,31 @@
             if (options && options.allowMissingReset === true) externalResetObserved = false;
             return true;
         } catch (error) {
+            // localStorage refused the commit — almost always quota. The bytes
+            // are already validated, so queue them to the durable tier to avoid
+            // losing them, and mark localStorage degraded so later saves skip a
+            // write that is doomed.
+            //
+            // We still report FAILURE. The durable mirror is asynchronous, so at
+            // this point nothing is provably stored anywhere: claiming success
+            // would tell the caller its checkpoint is safe when the queue may
+            // still fail (no OPFS, no disk space). A reported failure keeps the
+            // run's persistenceError and lets the existing retry path re-save,
+            // which is the honest and recoverable outcome.
+            if (!localStorageDegraded && isLocalStorageQuotaError(error)) {
+                try {
+                    mirrorToDurableTier(serialized, nextRevision, commitId);
+                } catch (mirrorError) {
+                    console.warn('[codalio-blueprint] durable mirror could not be queued', mirrorError);
+                }
+                // Only trust the durable tier once it has actually confirmed a
+                // write; until then localStorage remains the authority of record.
+                if (durableState.available) {
+                    localStorageDegraded = true;
+                    durableState.degraded = true;
+                    console.info('[codalio-blueprint] localStorage refused a commit; project data is mirrored to disk');
+                }
+            }
             recordPersistenceFailure(error, 'storage-write-failed');
             return false;
         } finally {
@@ -1415,6 +1499,265 @@
     /** A copy of the persistence state, safe to hand to the renderer. */
     function persistenceState() {
         return Object.assign({}, persistence);
+    }
+
+    // ------------------------------------------------------------------
+    // Durable storage tier (Origin Private File System)
+    // ------------------------------------------------------------------
+    //
+    // localStorage is capped at roughly 5 MB per origin and Blueprint stores
+    // full file content, so a large imported project exceeds it and every save
+    // fails with "Browser storage filled before every selected file could be
+    // imported." The Origin Private File System is real disk-backed storage in
+    // the same origin: multi-GB quota, no user gesture, no permission prompt,
+    // byte-exact reads. Measured on this machine: 10240 MB available, an 8 MB
+    // write in 35.6 ms.
+    //
+    // It is ASYNCHRONOUS, and this module's persistence API is synchronous by
+    // design — acquireStoreWriteLease exists precisely because "localStorage has
+    // no transaction primitive" and its cooperative Bakery lease must stay sync
+    // (24 writeStore call sites, none awaited; mount() is sync too). So the tier
+    // is a MIRROR, not a replacement:
+    //
+    //   - the in-memory `store` stays synchronous and authoritative, so no
+    //     caller changes and no lease guarantee is weakened;
+    //   - every committed save is also queued to disk in revision order;
+    //   - at boot whichever tier holds the HIGHER revision wins, and the
+    //     controller re-renders through the existing authoritative-reload event.
+    //
+    // Writes are serialized through one promise chain and fenced on `revision`,
+    // so neither a second window nor a slow write overtaking a fast one can land
+    // an older snapshot on top of a newer one.
+
+    const DURABLE_FILE = 'projects.json';
+    const durableState = {
+        available: false,
+        revision: 0,
+        commitId: '',
+        lastError: '',
+        pending: 0,
+        degraded: false
+    };
+    let durableQueue = Promise.resolve();
+    let durableRootPromise = null;
+    // Set once the browser has proven it has no OPFS at all (test harnesses,
+    // very old builds). Mirroring is then skipped silently instead of failing
+    // and logging on every single save.
+    let durableUnsupported = false;
+    // Consecutive mirror failures. Once this passes DURABLE_FAILURE_BACKOFF the
+    // tier stops being attempted: a permanently broken OPFS (policy-blocked,
+    // unwritable profile) would otherwise log on every single save for the rest
+    // of the session, burying real diagnostics in noise.
+    let durableFailureStreak = 0;
+    const DURABLE_FAILURE_BACKOFF = 3;
+    // Set once localStorage has rejected a commit (quota). From then on the
+    // durable tier's revision — not localStorage's — is the fencing authority.
+    let localStorageDegraded = false;
+
+    function durableRoot() {
+        if (!durableRootPromise) {
+            durableRootPromise = (async () => {
+                if (!navigator.storage || typeof navigator.storage.getDirectory !== 'function') {
+                    const error = new Error('This browser offers no origin-private file storage.');
+                    // Distinguish "no such API" from a transient failure: only
+                    // the former should permanently disable mirroring.
+                    error.unsupported = true;
+                    throw error;
+                }
+                return navigator.storage.getDirectory();
+            })();
+            // Never cache a rejected root: the failure may be transient, and a
+            // later save should be allowed to retry.
+            durableRootPromise.catch(() => { durableRootPromise = null; });
+        }
+        return durableRootPromise;
+    }
+
+    async function durableReadRaw() {
+        const root = await durableRoot();
+        let handle;
+        try {
+            handle = await root.getFileHandle(DURABLE_FILE);
+        } catch (error) {
+            // Never written yet. Distinct from a genuine failure so the caller
+            // can seed the tier instead of reporting an error.
+            if (error && error.name === 'NotFoundError') return null;
+            throw error;
+        }
+        const text = await (await handle.getFile()).text();
+        return text || null;
+    }
+
+    async function durableWriteRaw(serialized, revision, commitId) {
+        // Fence before touching disk.
+        if (Number(revision) < durableState.revision) return false;
+        const root = await durableRoot();
+        const tempName = `${DURABLE_FILE}.${commitId || revision}.tmp`;
+        const handle = await root.getFileHandle(tempName, { create: true });
+        const writable = await handle.createWritable();
+        try {
+            await writable.write(serialized);
+            await writable.close();
+        } catch (error) {
+            // A failed write must not leave a half-written temp file behind.
+            try { await root.removeEntry(tempName); } catch (_) { /* best effort */ }
+            throw error;
+        }
+        if (typeof handle.move === 'function') {
+            // Rename over the target: the only atomic replace OPFS offers, so a
+            // crash mid-write leaves the previous good file intact.
+            await handle.move(DURABLE_FILE);
+        } else {
+            // Older builds lack move(). Write straight to the target; the
+            // revision fence still prevents an older snapshot from winning.
+            const target = await root.getFileHandle(DURABLE_FILE, { create: true });
+            const targetWritable = await target.createWritable();
+            await targetWritable.write(serialized);
+            await targetWritable.close();
+            try { await root.removeEntry(tempName); } catch (_) { /* best effort */ }
+        }
+        durableState.revision = Number(revision) || 0;
+        durableState.commitId = String(commitId || '');
+        durableState.lastError = '';
+        return true;
+    }
+
+    /**
+     * Queue a durable mirror of already-committed bytes. Fire-and-forget by
+     * necessity — writeStore is synchronous — but ordered and revision-fenced.
+     * A failure is only escalated to the persistence channel when localStorage
+     * is ALSO degraded, because that is the one state where neither tier holds
+     * the data and losing it silently would be the worst possible outcome.
+     */
+    function mirrorToDurableTier(serialized, revision, commitId) {
+        if (durableUnsupported) return durableQueue;
+        durableState.pending += 1;
+        durableQueue = durableQueue
+            .then(() => durableWriteRaw(serialized, revision, commitId))
+            .then(wrote => {
+                if (wrote !== false) {
+                    durableState.available = true;
+                    // A success resets the streak so a later transient failure
+                    // gets its own budget before backing off.
+                    durableFailureStreak = 0;
+                }
+            })
+            .catch(error => {
+                if (error && error.unsupported) {
+                    // No OPFS at all. Disable mirroring permanently and stay
+                    // quiet: localStorage remains the store, exactly as before
+                    // this tier existed.
+                    durableUnsupported = true;
+                    durableState.available = false;
+                    return;
+                }
+                durableFailureStreak += 1;
+                durableState.lastError = String((error && error.message) || error);
+                if (localStorageDegraded) {
+                    recordPersistenceFailure(new Error(
+                        `Project data could not be saved to disk (${durableState.lastError}). `
+                        + 'Export your work before closing this tab.'
+                    ), 'durable-write-failed');
+                    // In degraded mode localStorage is no longer the authority,
+                    // so a failing disk tier is a genuine data-loss risk. Keep
+                    // escalating — but the caller already has persistence.ok
+                    // set false, so this does not spam the user.
+                } else if (durableFailureStreak >= DURABLE_FAILURE_BACKOFF) {
+                    // Repeatedly broken and localStorage is still authoritative:
+                    // disable the tier. Log ONCE, then go quiet.
+                    durableUnsupported = true;
+                    durableState.available = false;
+                    console.warn('[codalio-blueprint] durable storage unavailable after '
+                        + `${durableFailureStreak} failed writes; continuing with browser storage only. `
+                        + `Last error: ${durableState.lastError}`);
+                } else {
+                    // localStorage still holds the authoritative copy, so this
+                    // is a lost mirror rather than lost data.
+                    console.warn('[codalio-blueprint] durable storage mirror failed', error);
+                }
+            })
+            .then(() => {
+                durableState.pending = Math.max(0, durableState.pending - 1);
+            });
+        return durableQueue;
+    }
+
+    /**
+     * Boot hydration. Runs after the synchronous localStorage read so nothing
+     * depending on `store` existing at import time changes. If the durable tier
+     * holds a STRICTLY newer revision it replaces the store in place and asks
+     * the controller to re-render.
+     */
+    async function hydrateFromDurableTier() {
+        if (durableUnsupported) return false;
+        let raw = null;
+        try {
+            raw = await durableReadRaw();
+        } catch (error) {
+            if (error && error.unsupported) {
+                // No OPFS in this browser. Behave exactly as before this tier
+                // existed: localStorage is the store, and say nothing.
+                durableUnsupported = true;
+                durableState.available = false;
+                return false;
+            }
+            durableState.available = false;
+            durableState.lastError = String((error && error.message) || error);
+            return false;
+        }
+        const localRevision = Number.isSafeInteger(store.revision) ? store.revision : 0;
+        if (!raw) {
+            // Nothing on disk yet: seed it from localStorage so the tiers agree
+            // before the first save instead of diverging at the first quota hit.
+            durableState.available = true;
+            if (localRevision > 0) {
+                mirrorToDurableTier(
+                    JSON.stringify(clonePersistable(store), withoutDomNodes),
+                    localRevision,
+                    store.commitId
+                );
+            }
+            return false;
+        }
+        durableState.available = true;
+        const parsed = parsePersistedStoreRaw(raw);
+        if (parsed.error) {
+            // A corrupt durable copy must never displace a good localStorage one.
+            durableState.lastError = parsed.error;
+            return false;
+        }
+        const durableRevision = Number.isSafeInteger(parsed.store.revision) ? parsed.store.revision : 0;
+        durableState.revision = durableRevision;
+        durableState.commitId = String(parsed.store.commitId || '');
+        // Only a strictly newer tier wins. Equal means both agree; LOWER means
+        // another window already moved on, so rolling back would lose its work.
+        if (durableRevision <= localRevision) return false;
+
+        assignStoreState(parsed.store);
+        store.revision = durableRevision;
+        store.commitId = durableState.commitId;
+        knownStoreRevision = durableRevision;
+        knownStoreCommitId = durableState.commitId;
+        lastGoodStoreSnapshot = clonePersistable(store);
+        // The durable tier outran localStorage — typically a quota failure in an
+        // earlier session. Treat localStorage as a cache from here on.
+        localStorageDegraded = true;
+        durableState.degraded = true;
+        projectStoreLoadError = '';
+        persistence.ok = true;
+        persistence.lastError = '';
+        persistence.lastCode = '';
+        scheduleAuthoritativeStoreReload('durable-tier-hydration');
+        return true;
+    }
+
+    /** A copy of the durable-tier state, safe to hand to the renderer. */
+    function durableStorageState() {
+        return Object.assign({}, durableState, {
+            localStorageDegraded,
+            // True only while a mirror is in flight and unconfirmed.
+            mirroring: durableState.pending > 0
+        });
     }
 
     const store = readStore();
@@ -1428,6 +1771,14 @@
         persistence.lastCode = 'corrupt-store';
         persistence.lastError = projectStoreLoadError;
     }
+    // Prefer whichever tier holds the newer revision. Deliberately NOT awaited:
+    // every consumer of `store` expects it synchronously at import time, and
+    // mount() is synchronous too. When the durable tier wins, hydration swaps
+    // the store in place and asks the controller to re-render through the same
+    // authoritative-reload path an external window edit already uses.
+    hydrateFromDurableTier().catch(error => {
+        console.warn('[codalio-blueprint] durable storage hydration failed', error);
+    });
     if (typeof window.addEventListener === 'function') {
         window.addEventListener('storage', event => {
             if (!event || !event.key) return;
@@ -6887,6 +7238,9 @@
         isDomNode,
         withoutDomNodes,
         persistenceState,
+        durableStorageState,
+        hydrateFromDurableTier,
+        isLocalStorageQuotaError,
         reloadStoreFromStorage,
         findRun,
         activeRun,
