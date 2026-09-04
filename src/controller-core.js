@@ -816,6 +816,13 @@
             skippedTotal: 0,
             notEnumerated: 0,
             truncatedByBudget: false,
+            // Set when localStorage refused a chunk. Distinct from
+            // truncatedByBudget: that is a configured limit the user can raise in
+            // Settings, this is a hard browser limit they cannot.
+            storageFull: false,
+            // How many imported files are safely on disk. Equals imported.length
+            // unless storage filled, in which case the tail was rolled back.
+            persisted: 0,
             error: ''
         };
 
@@ -853,8 +860,47 @@
         // permits it.
         const perFileLimit = Math.max(1, Number(cfg.maxFileKb) || 256) * 1024;
         const totalLimit = Math.max(1, Number(cfg.maxTotalKb) || 4096) * 1024;
+        // Math.max(1, Infinity) is Infinity, so an unlimited count budget flows
+        // through here unchanged and the `>= maxFiles` test simply never fires.
         const maxFiles = Math.max(1, Number(cfg.maxFiles) || 400);
         let totalBytes = 0;
+
+        // ---- chunked persistence -------------------------------------------
+        // The previous shape wrote the whole store ONCE at the end. For a large
+        // import that is a single synchronous JSON.stringify + setItem of
+        // everything -- the freeze -- and at ~32 MB it throws
+        // QuotaExceededError, which writeStore() catches and turns into `false`,
+        // discarding every file that was read.
+        //
+        // Persisting every CHUNK_FILES files bounds each synchronous block, so the
+        // page stays responsive, and a quota failure costs one chunk.
+        const CHUNK_FILES = 40;
+        let sincePersist = 0;
+
+        /**
+         * Persist the store. On refusal, recover from the last good state.
+         *
+         * Returns false once storage is full, so the caller stops reading files it
+         * can no longer store.
+         */
+        const persistChunk = () => {
+            sincePersist = 0;
+            if (writeStore(store)) {
+                result.persisted = result.imported.length;
+                return true;
+            }
+            // localStorage refused the write but still holds the LAST GOOD state,
+            // so re-reading it is authoritative. This cannot clobber an earlier
+            // persisted copy of a path this chunk reused.
+            const good = readStore();
+            store.files = good.files;
+            // Keep only the imports that genuinely survived, then recount, so
+            // `persisted` never includes rolled-back files.
+            result.imported = result.imported.filter(item => good.files[item.path]);
+            result.persisted = result.imported.length;
+            result.storageFull = true;
+            return false;
+        };
 
         let sinceYield = 0;
         for (let index = 0; index < list.length; index += 1) {
@@ -925,14 +971,25 @@
             });
             totalBytes += size;
             result.imported.push({ path: storedPath, bytes: size });
+
+            sincePersist += 1;
+            if (sincePersist >= CHUNK_FILES && !persistChunk()) {
+                // persistChunk already truncated `imported` to what survived.
+                result.notEnumerated = list.length - index - 1;
+                break;
+            }
         }
 
-        // One persist for the whole import instead of one per file.
-        // writeFile() also moves openPath to whatever it last wrote; putting the
-        // user's previously open document back means importing a folder does not
-        // silently switch the viewer to some arbitrary file from it.
+        // writeFile() moves openPath to whatever it last wrote; putting the user's
+        // previously open document back means importing a folder does not silently
+        // switch the viewer to some arbitrary file from it.
         store.openPath = openPathBeforeImport;
-        writeStore(store);
+
+        // Flush the trailing partial chunk. openPath changed even if there is
+        // nothing new to write, so the store is persisted either way.
+        if (!persistChunk()) {
+            writeStore(store);
+        }
         return result;
     }
 

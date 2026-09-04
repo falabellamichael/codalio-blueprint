@@ -120,7 +120,17 @@
      * source-attachment budgets: those describe what fits in a model window, and
      * capping a whole imported project at 50 files would make the feature useless.
      */
-    const IMPORT_MAX_FILES = 1000;
+    // There is deliberately NO file-count cap. The 1000-file ceiling was
+    // arbitrary, and it masked the real limit: writeStore() targets localStorage,
+    // which browsers cap at roughly 5 MB per origin, while IMPORT_MAX_TOTAL_KB
+    // allowed 32 MB. The count always bound first, so the quota problem was
+    // invisible until it threw.
+    //
+    // The import now stops on a REAL limit and reports which one it hit:
+    //   * the byte budget below (what the user can raise in Settings), or
+    //   * the storage quota (a hard browser limit, reported as "storage full").
+    // Unlimited by default; Infinity keeps importFolder()'s arithmetic simple.
+    const IMPORT_MAX_FILES = Infinity;
     const IMPORT_MAX_TOTAL_KB = 32768;
 
     const runtime = {
@@ -1758,9 +1768,12 @@
         try {
             // Importing a project is deliberately more generous than attaching
             // sources to a prompt — the model-context budget (maxSourceFiles,
-            // maxSourceTotalKb) is about what fits in a window, not about what a
-            // project may contain. But the per-file limit is shared, because a file
-            // too big to attach is too big to be worth storing either.
+            // bounded 1..150, is about what fits in a context window, not about
+            // what a project may contain). Those stay separate: lifting the import
+            // cap must not mean stuffing 100k files into a prompt.
+            //
+            // The per-file limit IS shared, because a file too big to attach is too
+            // big to be worth storing either.
             result = await core.importFolder(files, pickedName, {
                 maxFileKb: Math.max(1024, Number(settings.maxSourceFileKb) || 512),
                 maxFiles: IMPORT_MAX_FILES,
