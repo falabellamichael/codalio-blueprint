@@ -466,7 +466,10 @@ assert.notEqual(core.store.openPath, 'docs/prd/open-me.md',
         fakeFile('big/huge.txt', 'x'.repeat(3000))
     ], 'big', { maxFileKb: 2 });
     assert.equal(result.imported.length, 1, 'the per-file limit was not enforced');
-    assert.match(result.skipped[0].reason, /exceeds the 2 KB per-file limit/,
+    // The reason is deliberately stable text with no per-file byte size in it: skip
+    // entries are now COUNTED BY REASON past the first 50, and a reason containing
+    // each file's own size would make every entry its own group, defeating the cap.
+    assert.match(result.skipped[0].reason, /over the 2 KB per-file limit/,
         'the per-file rejection did not name the limit');
 
     // File-count budget.
@@ -475,7 +478,13 @@ assert.notEqual(core.store.openPath, 'docs/prd/open-me.md',
     result = await core.importFolder(many, 'many', { maxFiles: 5, maxTotalKb: 4096 });
     assert.equal(result.imported.length, 5, 'the file-count limit was not enforced');
     assert.equal(result.truncatedByBudget, true, 'hitting the count limit did not flag truncation');
-    assert.match(result.skipped.map(s => s.reason).join(' | '), /file limit of 5 reached/);
+    // The count budget is a HARD STOP: it breaks instead of pushing a skip entry per
+    // remaining file, and reports the remainder as a count. Pushing one entry per
+    // file was what made a 100k-file directory allocate ~100k objects.
+    assert.equal(result.notEnumerated, 7,
+        `expected the 7 unexamined files to be counted, got ${result.notEnumerated}`);
+    assert.equal(result.skipped.length, 0,
+        'a hard-stop budget should not materialise per-file skip entries');
 
     // Total-size budget. The per-file limit must not be the binding constraint
     // here, or this asserts nothing about the total.
@@ -487,7 +496,7 @@ assert.notEqual(core.store.openPath, 'docs/prd/open-me.md',
     ], 'tot', { maxFileKb: 64, maxFiles: 100, maxTotalKb: 2 });
     assert.equal(result.imported.length, 2, 'the total-size limit was not enforced');
     assert.equal(result.truncatedByBudget, true);
-    assert.match(result.skipped.map(s => s.reason).join(' | '), /import budget of 2 KB reached/);
+    assert.equal(result.notEnumerated, 1, 'the file past the total budget was not counted');
 
     // Binary content is rejected even when the extension is allowed.
     reset();

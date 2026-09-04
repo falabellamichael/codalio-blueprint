@@ -540,7 +540,11 @@
         };
         touchFolder(folder);
         store.openPath = cleanPath;
-        writeStore(store);
+        // Bulk callers (a folder import) pass persist:false and write the store
+        // once at the end. Persisting here would JSON.stringify the ENTIRE store
+        // per file, which is O(n^2): importing 255 files serialised the whole
+        // project 255 times while it grew, and that was the import freeze.
+        if (!meta || meta.persist !== false) writeStore(store);
         return store.files[cleanPath];
     }
 
@@ -706,6 +710,31 @@
         return listFiles(folderId).length;
     }
 
+    /**
+     * File count for every folder, in ONE pass over store.files.
+     *
+     * The sidebar needs a count per folder on every render. Calling
+     * folderFileCount() per folder made each render O(folders x n log n), because
+     * listFiles() scans AND sorts the whole project each time — and the sort is
+     * wasted work when only the length is wanted. This is O(n) with no sort.
+     *
+     * Folders with no files are included with a count of 0, so an empty project
+     * folder still renders its badge.
+     */
+    function folderFileCounts() {
+        const counts = {};
+        Object.keys(store.folders).forEach(id => { counts[id] = 0; });
+        Object.keys(store.files).forEach(path => {
+            const record = store.files[path];
+            if (!record || typeof record.content !== 'string') return;
+            const id = typeof record.folder === 'string' && counts[record.folder] !== undefined
+                ? record.folder
+                : '';
+            if (id) counts[id] += 1;
+        });
+        return counts;
+    }
+
     // ------------------------------------------------------------------
     // "Open folder" import
     // ------------------------------------------------------------------
@@ -770,13 +799,41 @@
         }, options || {});
 
         const list = Array.prototype.slice.call(files || []);
-        const result = { folder: null, imported: [], skipped: [], truncatedByBudget: false, error: '' };
+        // `notEnumerated` counts files past the point where a budget was hit. They
+        // are deliberately NOT pushed into `skipped`: doing that built an array of
+        // one entry per remaining file, so a directory with hundreds of thousands
+        // of files allocated ~100k objects after the budget closed at file 255.
+        const result = {
+            folder: null,
+            imported: [],
+            skipped: [],
+            // Count per reason for skips past MAX_SKIP_ENTRIES. A directory with
+            // hundreds of thousands of files spends nearly all of them inside
+            // node_modules / .git / .venv, and pushing one object + one string per
+            // file allocated ~100k entries before the loop reached anything
+            // importable. Capping keeps the report useful and the cost O(1).
+            skippedByReason: {},
+            skippedTotal: 0,
+            notEnumerated: 0,
+            truncatedByBudget: false,
+            error: ''
+        };
+
+        const MAX_SKIP_ENTRIES = 50;
+        const noteSkip = (path, reason) => {
+            result.skippedTotal += 1;
+            result.skippedByReason[reason] = (result.skippedByReason[reason] || 0) + 1;
+            if (result.skipped.length < MAX_SKIP_ENTRIES) {
+                result.skipped.push({ path, reason });
+            }
+        };
 
         if (!list.length) {
             result.error = 'No files were selected.';
             return result;
         }
 
+        const openPathBeforeImport = store.openPath;
         const created = createFolder(folderName || suggestedFolderName(list), 'imported');
         if (created.error) {
             result.error = created.error;
@@ -799,68 +856,82 @@
         const maxFiles = Math.max(1, Number(cfg.maxFiles) || 400);
         let totalBytes = 0;
 
+        let sinceYield = 0;
         for (let index = 0; index < list.length; index += 1) {
+            // Walking a huge FileList is one long synchronous block, so the page
+            // cannot paint the busy state the caller just set and the tab looks
+            // hung. Yield every 40 files: enough to stay fast on a small import,
+            // often enough that a 100k-file directory still repaints.
+            sinceYield += 1;
+            if (sinceYield >= 40) {
+                sinceYield = 0;
+                if (typeof cfg.onProgress === 'function') {
+                    cfg.onProgress(index, list.length, result.imported.length);
+                }
+                await new Promise(resolve => setTimeout(resolve, 0));
+            }
+
             const file = list[index];
             const relativePath = relativePathOf(file);
             if (!relativePath) continue;
 
             if (isSkippedPath(relativePath)) {
-                result.skipped.push({ path: relativePath, reason: 'ignored directory' });
+                noteSkip(relativePath, 'ignored directory');
                 continue;
             }
             const ext = extensionOf(relativePath);
             if (ext && IMPORTABLE_EXTENSIONS.indexOf(ext) < 0) {
-                result.skipped.push({ path: relativePath, reason: `unsupported type .${ext}` });
+                noteSkip(relativePath, `unsupported type .${ext}`);
                 continue;
             }
             if (result.imported.length >= maxFiles) {
                 result.truncatedByBudget = true;
-                result.skipped.push({ path: relativePath, reason: `file limit of ${maxFiles} reached` });
-                continue;
+                result.notEnumerated = list.length - index;
+                break;
             }
             const size = Number(file.size) || 0;
             if (size > perFileLimit) {
-                result.skipped.push({
-                    path: relativePath,
-                    reason: `${formatBytes(size)} exceeds the ${cfg.maxFileKb} KB per-file limit`
-                });
+                noteSkip(relativePath, `over the ${cfg.maxFileKb} KB per-file limit`);
                 continue;
             }
             if (totalBytes + size > totalLimit) {
                 result.truncatedByBudget = true;
-                result.skipped.push({
-                    path: relativePath,
-                    reason: `import budget of ${cfg.maxTotalKb} KB reached`
-                });
-                continue;
+                result.notEnumerated = list.length - index;
+                break;
             }
 
             let content = '';
             try {
                 content = await readAsText(file);
             } catch (error) {
-                result.skipped.push({
-                    path: relativePath,
-                    reason: `could not be read (${String((error && error.message) || error)})`
-                });
+                noteSkip(relativePath, 'could not be read');
                 continue;
             }
 
             // A NUL byte means binary; storing it would produce garbage in the
             // previewer and waste quota.
             if (cfg.skipBinary && content.indexOf('\u0000') >= 0) {
-                result.skipped.push({ path: relativePath, reason: 'binary file' });
+                noteSkip(relativePath, 'binary file');
                 continue;
             }
 
             // Store under a path that keeps the picked folder's internal structure
             // but drops its leading directory name, so paths stay short and stable.
             const storedPath = stripLeadingDirectory(relativePath);
-            writeFile(storedPath, content, { folder: result.folder.id, origin: 'imported' });
+            writeFile(storedPath, content, {
+                folder: result.folder.id,
+                origin: 'imported',
+                persist: false
+            });
             totalBytes += size;
             result.imported.push({ path: storedPath, bytes: size });
         }
 
+        // One persist for the whole import instead of one per file.
+        // writeFile() also moves openPath to whatever it last wrote; putting the
+        // user's previously open document back means importing a folder does not
+        // silently switch the viewer to some arbitrary file from it.
+        store.openPath = openPathBeforeImport;
         writeStore(store);
         return result;
     }
@@ -1840,6 +1911,7 @@
         renameFolder,
         deleteFolder,
         folderFileCount,
+        folderFileCounts,
         importFolder,
         IMPORTABLE_EXTENSIONS,
         IMPORT_SKIP_DIRS,

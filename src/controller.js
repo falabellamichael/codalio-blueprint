@@ -115,6 +115,14 @@
     const wsModule = () => window.__codalioBlueprintWorkspace;
     const schemaModule = () => window.__codalioBlueprintSettings;
 
+    /**
+     * Budgets for "Open folder". These are intentionally NOT the Settings
+     * source-attachment budgets: those describe what fits in a model window, and
+     * capping a whole imported project at 50 files would make the feature useless.
+     */
+    const IMPORT_MAX_FILES = 1000;
+    const IMPORT_MAX_TOTAL_KB = 32768;
+
     const runtime = {
         context: null,
         mounted: false,
@@ -356,6 +364,11 @@
         return {
             folder: runtime.folder,
             busy: runtime.busy,
+            // Neither was in the snapshot, so the UI could not see that an import
+            // was running at all — the busy state was set and rendered, then drawn
+            // from a snapshot that did not carry it.
+            busyImport: runtime.busyImport,
+            importProgress: runtime.importProgress,
             draft: runtime.draft,
             hint: runtime.hint,
             settings,
@@ -383,10 +396,10 @@
             folderCount: folders.length,
             activeFolderId: activeFolder ? activeFolder.id : core.DEFAULT_FOLDER_ID,
             activeFolderName: activeFolder ? activeFolder.name : 'Blueprint project',
-            folderFileCounts: folders.reduce((acc, item) => {
-                acc[item.id] = core.folderFileCount(item.id);
-                return acc;
-            }, {}),
+            // One pass for every folder's count. The per-folder reduce called
+            // core.folderFileCount(), which is a full listFiles() scan plus a
+            // localeCompare sort — O(folders x n log n) on every single render.
+            folderFileCounts: core.folderFileCounts(),
             projectName: activeFolder ? activeFolder.name : runtime.projectName,
             projectFiles: core.listFiles(),
             sourceFiles: runtime.sourceFiles,
@@ -1738,14 +1751,23 @@
 
         setToast(`Importing ${files.length.toLocaleString()} file(s) from ${pickedName}…`, 'info');
         runtime.busyImport = true;
+        runtime.importProgress = null;
         renderPage();
 
         let result;
         try {
+            // Importing a project is deliberately more generous than attaching
+            // sources to a prompt — the model-context budget (maxSourceFiles,
+            // maxSourceTotalKb) is about what fits in a window, not about what a
+            // project may contain. But the per-file limit is shared, because a file
+            // too big to attach is too big to be worth storing either.
             result = await core.importFolder(files, pickedName, {
                 maxFileKb: Math.max(1024, Number(settings.maxSourceFileKb) || 512),
-                maxFiles: 1000,
-                maxTotalKb: 32768
+                maxFiles: IMPORT_MAX_FILES,
+                maxTotalKb: IMPORT_MAX_TOTAL_KB,
+                onProgress: (done, total, imported) => {
+                    runtime.importProgress = { done, total, imported };
+                }
             });
         } catch (error) {
             runtime.busyImport = false;
@@ -1754,6 +1776,7 @@
             return;
         }
         runtime.busyImport = false;
+        runtime.importProgress = null;
 
         if (result.error) {
             setToast(result.error, 'error');
@@ -1764,13 +1787,27 @@
         runtime.projectName = result.folder.name;
         result.imported.forEach(item => noteFileWritten(item.path));
 
-        const skipped = result.skipped.length;
+        // skippedTotal is authoritative: result.skipped holds at most 50 detailed
+        // entries, and a directory with hundreds of thousands of files skips nearly
+        // all of them inside node_modules / .git / .venv.
+        const skipped = result.skippedTotal || 0;
         const parts = [`${result.imported.length.toLocaleString()} file(s) imported into "${result.folder.name}".`];
-        if (skipped) parts.push(`${skipped.toLocaleString()} skipped.`);
-        if (result.truncatedByBudget) {
-            parts.push('The import hit its size limit — raise it in Settings -> Source files.');
+        if (skipped) {
+            const reasons = Object.keys(result.skippedByReason || {})
+                .sort((a, b) => result.skippedByReason[b] - result.skippedByReason[a])
+                .slice(0, 3)
+                .map(reason => `${result.skippedByReason[reason].toLocaleString()} ${reason}`);
+            parts.push(`${skipped.toLocaleString()} skipped`
+                + (reasons.length ? ` (${reasons.join(', ')})` : '') + '.');
         }
-        setToast(parts.join(' '), skipped ? 'info' : 'success', skipped ? 9000 : 4200);
+        if (result.notEnumerated) {
+            parts.push(`${result.notEnumerated.toLocaleString()} more file(s) were not examined `
+                + 'because a limit was reached.');
+        }
+        if (result.truncatedByBudget) {
+            parts.push('Raise the limits in Settings -> Source files to import more.');
+        }
+        setToast(parts.join(' '), skipped ? 'info' : 'success', skipped ? 12000 : 4200);
 
         renderHostSurfaces();
         renderPage();
