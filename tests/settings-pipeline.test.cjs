@@ -193,13 +193,8 @@ const schema = sandbox.window.__codalioBlueprintSettings;
 const agent = sandbox.window.__codalioBlueprintAgent;
 
 function resetStores() {
-    localStorageStub.clear();
-    core.store.files = {};
-    core.store.runs = [];
-    core.store.openPath = '';
-    core.store.activeRunId = '';
-    core.store.projectName = '';
-    core.writeStore();
+    const cleared = core.clearAllData(core.DEFAULT_SETTINGS);
+    assert.equal(cleared.ok, true, `test fixture reset failed: ${cleared.error || 'unknown error'}`);
     requests.length = 0;
 }
 
@@ -487,6 +482,13 @@ const tightSettings = Object.assign({}, core.DEFAULT_SETTINGS, {
 });
 const oneKb = 'a'.repeat(1024);          // exactly 1 KB
 const tooBig = 'b'.repeat(2048);          // 2 KB, over the per-file cap
+core.writeFile('big.js', tooBig, { origin: 'imported' });
+core.writeFile('a.js', 'a'.repeat(900), { origin: 'imported' });
+core.writeFile('b.js', 'b'.repeat(900), { origin: 'imported' });
+core.writeFile('c.js', 'c'.repeat(900), { origin: 'imported' });
+core.writeFile('big1.js', tooBig, { origin: 'imported' });
+core.writeFile('ok.js', oneKb.slice(0, 400), { origin: 'imported' });
+core.writeFile('big2.js', tooBig, { origin: 'imported' });
 
 // Per-file cap rejects an oversized file.
 let selected = agent.sourceFilesForModel({ sourceFiles: [{ path: 'big.js', content: tooBig }] }, tightSettings);

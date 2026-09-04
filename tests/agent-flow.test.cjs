@@ -443,6 +443,13 @@ sandbox.window.RagChatStreaming = {
 // ---------------------------------------------------------------------------
 
 async function main() {
+    const clearProjectFiles = () => {
+        core.store.files = {};
+        core.store.openPath = '';
+        core.store.openFolderId = '';
+        assert.equal(core.writeStore(), true, 'test fixture could not persist an empty file graph');
+    };
+
     // ---- 1. Sequential multi-lens PRD run, questions off ----------------
     core.writeSettings(Object.assign({}, core.DEFAULT_SETTINGS, {
         concurrency: 'sequential',
@@ -517,8 +524,7 @@ async function main() {
 
     // ---- 2. Parallel run reuses the same contract -----------------------
     requests.length = 0;
-    core.store.files = {};
-    core.writeStore();
+    clearProjectFiles();
     core.writeSettings(Object.assign({}, core.DEFAULT_SETTINGS, { concurrency: 'parallel', askClarifyingQuestions: false }));
 
     const parallelRun = core.createRun(skill, 'A shared workshop booking tool for maker spaces.');
@@ -536,8 +542,7 @@ async function main() {
 
     // ---- 3. Clarifying questions become visible, blocking steps ---------
     requests.length = 0;
-    core.store.files = {};
-    core.writeStore();
+    clearProjectFiles();
     core.writeSettings(Object.assign({}, core.DEFAULT_SETTINGS, { concurrency: 'sequential', askClarifyingQuestions: true }));
 
     const questionRun = core.createRun(skill, 'A budgeting app for freelancers.');
@@ -578,17 +583,16 @@ async function main() {
     // run proceeds through all three lenses + synthesis.
     resolveFirstAnswer('Freelance designers with irregular income');
     await questionPromise;
-    assert.equal(askedQuestions.length, 3, `prd-builder should ask its 3 clarifying questions, saw ${askedQuestions.length}`);
+    assert.equal(askedQuestions.length, 6, `prd-builder should ask its 6 clarifying questions (2 per section), saw ${askedQuestions.length}`);
     askedQuestions.forEach(step => assert.equal(step.status, 'done', 'a question step was not marked answered'));
     askedQuestions.forEach(step => assert.ok(step.answered, 'a question step recorded no answer'));
     assert.equal(requests.length, 4, 'after answering, the run should complete its 3 lenses + synthesis');
-    assert.equal(questionRun.phases.filter(step => step.kind === 'question').length, 3);
+    assert.equal(questionRun.phases.filter(step => step.kind === 'question').length, 6);
     core.writeSettings(Object.assign({}, core.DEFAULT_SETTINGS, { concurrency: 'sequential', askClarifyingQuestions: false }));
 
     // ---- 3b. Stopping during a question aborts the run -----------------
     requests.length = 0;
-    core.store.files = {};
-    core.writeStore();
+    clearProjectFiles();
     core.writeSettings(Object.assign({}, core.DEFAULT_SETTINGS, { concurrency: 'sequential', askClarifyingQuestions: true }));
     const stopQuestionRun = core.createRun(skill, 'A tool whose question is never answered.');
     let stopQuestionError = null;
@@ -619,8 +623,7 @@ async function main() {
     // the run proceeded as if the user had said nothing. Answers must MERGE, and
     // a fresh answer to the SAME question id must still win over a stale one.
     requests.length = 0;
-    core.store.files = {};
-    core.writeStore();
+    clearProjectFiles();
     let seenPrompt = '';
     const mergeRun = core.createRun(skill, 'A tool for tracking garden tools.');
     await agent.runSkill(mergeRun, skill, {
@@ -641,8 +644,7 @@ async function main() {
     // With questions ON, a freshly gathered answer to the same id must WIN over
     // a stale pre-supplied one — the user just typed the newer value.
     requests.length = 0;
-    core.store.files = {};
-    core.writeStore();
+    clearProjectFiles();
     core.writeSettings(Object.assign({}, core.DEFAULT_SETTINGS, {
         concurrency: 'sequential', askClarifyingQuestions: true
     }));
@@ -666,8 +668,7 @@ async function main() {
 
     // ---- 4. Stop/cancel aborts the run ---------------------------------
     requests.length = 0;
-    core.store.files = {};
-    core.writeStore();
+    clearProjectFiles();
     streamMode = 'abort-mid-stream';
     const abortController = new AbortController();
     const stopRun = core.createRun(skill, 'A tool that will be stopped mid-flight.');
@@ -689,8 +690,7 @@ async function main() {
 
     // ---- 5. No endpoint selected surfaces a clear error -----------------
     requests.length = 0;
-    core.store.files = {};
-    core.writeStore();
+    clearProjectFiles();
     streamMode = 'no-endpoint';
     const noEndpointRun = core.createRun(skill, 'A tool with no model configured.');
     let noEndpointError = null;
@@ -709,8 +709,7 @@ async function main() {
 
     // ---- 6. HTTP failure surfaces the backend detail --------------------
     requests.length = 0;
-    core.store.files = {};
-    core.writeStore();
+    clearProjectFiles();
     streamMode = 'http-500';
     const httpRun = core.createRun(skill, 'A tool whose endpoint 500s.');
     let httpError = null;
@@ -729,8 +728,7 @@ async function main() {
 
     // ---- 7. Code-reading skills refuse to run without source -----------
     requests.length = 0;
-    core.store.files = {};
-    core.writeStore();
+    clearProjectFiles();
     const archSkill = skills.getSkill('arch-evaluation');
     const archRun = core.createRun(archSkill, 'Evaluate this codebase against a 10x scale target.');
     let archError = null;
@@ -750,8 +748,7 @@ async function main() {
     assert.ok(archRun.phases.some(step => /Waiting for source/.test(step.label)), 'no waiting-for-source step was shown');
 
     // ---- 8. With source attached, the prompt carries the real code ------
-    core.store.files = {};
-    core.writeStore();
+    clearProjectFiles();
     core.writeFile('src/router.py', 'def handle(request):\n    return db.query(request.id)\n', { skill: 'source' });
     const archRun2 = core.createRun(archSkill, 'Evaluate this codebase against a 10x scale target.');
     const sourceFiles = agent.sourceFilesForModel({
@@ -779,8 +776,7 @@ async function main() {
 
     // ---- 9. doc-generation refuses to improvise a PRD -------------------
     requests.length = 0;
-    core.store.files = {};
-    core.writeStore();
+    clearProjectFiles();
     const docSkill = skills.getSkill('doc-generation');
     const docRun = core.createRun(docSkill, 'Generate docs.');
     let docError = null;
@@ -799,8 +795,7 @@ async function main() {
     assert.equal(requests.length, 0, 'doc-generation called the model without a PRD');
 
     // ---- 10. doc-generation writes each selected doc to its own folder --
-    core.store.files = {};
-    core.writeStore();
+    clearProjectFiles();
     core.writeFile(
         'docs/prd/2026-09-03-toolshare-prd.md',
         '# ToolShare — Product Requirements Document\n\n## 3. User Stories\n- list a tool\n',
@@ -836,8 +831,7 @@ async function main() {
     // answering "one subsystem" actually narrows it (it used to be prose only),
     // and that a project with no verbatim picks still runs instead of being
     // refused as "no source".
-    core.store.files = {};
-    core.writeStore();
+    clearProjectFiles();
     core.writeSettings(Object.assign({}, core.DEFAULT_SETTINGS, {
         concurrency: 'sequential',
         askClarifyingQuestions: false,
@@ -876,10 +870,10 @@ async function main() {
     assert.ok(requests.length >= 3, `digest mode ran ${requests.length} turns, expected >= 3`);
     const digestPrompt = requests[0].message;
 
-    // The structural map is in the prompt, labelled as a whole-project map.
+    // The structural map is in the prompt and truthfully labelled as bounded.
     assert.match(digestPrompt, /Codebase map/, 'the digest map never reached the model prompt');
-    assert.match(digestPrompt, /digest of every file in the project/,
-        'the prompt did not tell the model the map covers the whole project');
+    assert.match(digestPrompt, /budgeted map of the active project root/,
+        'the prompt did not disclose the active-root and budget boundaries');
 
     // Every first-party file is MAPPED, including the ones never attached
     // verbatim — this is the whole point of the feature.
@@ -906,10 +900,10 @@ async function main() {
     assert.ok(digestPrompt.indexOf('docs/prd/older.md') < 0,
         'a generated Blueprint document was mapped as project source');
 
-    // The run trace says what happened, in whole-codebase terms.
+    // The run trace says exactly which active project was mapped.
     const digestStep = digestRun.phases.find(step => /Mapped \d+ project files/.test(step.label));
     assert.ok(digestStep, 'no digest step was added to the run trace');
-    assert.match(digestStep.text, /Whole-codebase digest/, 'the trace did not explain the digest');
+    assert.match(digestStep.text, /Active-project digest/, 'the trace did not explain the digest');
     assert.match(digestStep.text, /token budget/, 'the trace did not report the budget used');
     assert.ok(Number(digestStep.summary.match(/([\d,]+) tokens/)[1].replace(/,/g, '')) <= 4000,
         'the digest exceeded the configured budget');
@@ -954,29 +948,33 @@ async function main() {
     assert.match(narrowStep.text, /Scope: \d+ file\(s\) matched/,
         'the run trace did not report that the scope answer narrowed the digest');
 
-    // A scope answer that matches nothing must fall back to the whole project
-    // and SAY SO, rather than producing an empty digest that looks like a
-    // complete map of an empty codebase.
+    // A scope answer that matches nothing must fail closed. Broadening "billing"
+    // to the whole project would violate both correctness and the source boundary.
     requests.length = 0;
     const missRun = core.createRun(archSkill, 'Evaluate the billing subsystem.');
-    await agent.runSkill(missRun, archSkill, {
-        idea: 'Evaluate the billing subsystem.',
-        answers: [{ id: 'scope', question: 'Which subsystem?', answer: 'only the billing module' }],
-        requirementsText: 'Must support 10x current load.',
-        signal: new AbortController().signal
-    }, { onRender() {}, onStep() {}, onStream() {} });
-    assert.ok(requests[0].message.indexOf('comfy/worker.py') >= 0,
-        'a non-matching scope answer produced an empty digest instead of the whole project');
-    const missStep = missRun.phases.find(step => /Mapped \d+ project files/.test(step.label));
-    assert.match(missStep.text, /no project path matched it/,
-        'the trace did not disclose that the scope filter matched nothing');
+    let missError = null;
+    try {
+        await agent.runSkill(missRun, archSkill, {
+            idea: 'Evaluate the billing subsystem.',
+            answers: [{ id: 'scope', question: 'Which subsystem?', answer: 'only the billing module' }],
+            requirementsText: 'Must support 10x current load.',
+            signal: new AbortController().signal
+        }, { onRender() {}, onStep() {}, onStream() {} });
+    } catch (error) {
+        missError = error;
+    }
+    assert.equal(missError && missError.code, 'scope-not-found',
+        'a non-matching scope did not fail closed');
+    assert.equal(requests.length, 0, 'a non-matching scope still sent project source to the model');
+    assert.equal(missRun.status, 'blocked', 'a non-matching scope was not persisted as blocked');
+    const missStep = missRun.phases.find(step => step.label === 'Requested subsystem was not found');
+    assert.ok(missStep, 'the run trace did not explain that the scope matched nothing');
 
     // ---- 13. A structure-only project still runs -------------------------
     //
     // A project of only stylesheets and documents yields no verbatim picks.
     // Refusing it as "no source" would hide the map that does describe it.
-    core.store.files = {};
-    core.writeStore();
+    clearProjectFiles();
     core.writeFile('theme.css', makeLine(80, '.selector'), { skill: 'source', origin: 'imported' });
     core.writeFile('README.md', '# Project\n\n## Overview\n\nA thing.\n', { skill: 'source', origin: 'imported' });
     requests.length = 0;
@@ -1002,8 +1000,7 @@ async function main() {
     //
     // The default must remain the old behaviour, so upgrading cannot silently
     // change what an existing user's runs send.
-    core.store.files = {};
-    core.writeStore();
+    clearProjectFiles();
     core.writeSettings(Object.assign({}, core.DEFAULT_SETTINGS, {
         concurrency: 'sequential',
         askClarifyingQuestions: false

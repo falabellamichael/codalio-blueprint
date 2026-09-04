@@ -20,9 +20,9 @@ itself.
    there's exactly one, confirm it's the right one. If there are several, ask
    which. If there's none, tell the user this skill needs an existing PRD
    (e.g. from `prd-builder`) and stop — don't improvise one.
-2. **Ask which doc(s) to generate.** Offer the three types as a multi-select-
-   style question: backlog, API contract sketch, onboarding doc. Default to
-   generating all three only if the user says "everything" or equivalent.
+2. **Clarifying questions.** Ask 2 clarifying questions for the document scope:
+   which doc(s) to generate (backlog, API contract sketch, onboarding doc), and
+   who the primary audience is (engineering team, executive stakeholders, or onboarding hires).
 3. **Generate each requested doc** using the matching template in
    `references/doc-templates.md`. Pull directly from the PRD's user stories,
    entities, and MVP scope — don't invent scope the PRD doesn't support.

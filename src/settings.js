@@ -162,7 +162,8 @@
                     icon: 'fa-microchip',
                     summary: settings => `temp ${settings.temperature.toFixed(2)}`
                         + ` · lens ${tokens(settings.lensMaxOutputTokens)}`
-                        + ` · doc ${tokens(settings.documentMaxOutputTokens)}`,
+                        + ` · doc ${tokens(settings.documentMaxOutputTokens)}`
+                        + ` · ${settings.modelMaxRetries} retr${settings.modelMaxRetries === 1 ? 'y' : 'ies'}`,
                     groups: [
                         {
                             id: 'sampling',
@@ -260,6 +261,46 @@
                                     label: 'Confirm before stopping',
                                     type: 'toggle',
                                     help: 'Ask before cancelling a running step. Stop sends a real cancel to the backend turn, so an accidental click loses the work in progress.'
+                                },
+                                {
+                                    key: 'modelMaxRetries',
+                                    label: 'Transient retries',
+                                    type: 'number',
+                                    min: 0,
+                                    max: 5,
+                                    step: 1,
+                                    unit: 'retries',
+                                    help: 'Additional attempts after a temporary network, 429, or server failure. Blueprint retries only before any answer text appears, so two generations are never mixed.'
+                                },
+                                {
+                                    key: 'modelRequestTimeoutSeconds',
+                                    label: 'Turn deadline',
+                                    type: 'number',
+                                    min: 30,
+                                    max: 3600,
+                                    step: 30,
+                                    unit: 'seconds',
+                                    help: 'Hard deadline for one model attempt, including local prompt evaluation and generation. Timed-out turns are cancelled at the backend before a safe retry.'
+                                },
+                                {
+                                    key: 'modelIdleTimeoutSeconds',
+                                    label: 'Stream idle deadline',
+                                    type: 'number',
+                                    min: 15,
+                                    max: 900,
+                                    step: 15,
+                                    unit: 'seconds',
+                                    help: 'Stops a response that has gone completely silent after the stream opens. Content and visible reasoning both reset this timer.'
+                                },
+                                {
+                                    key: 'modelRetryBaseDelayMs',
+                                    label: 'Retry backoff',
+                                    type: 'number',
+                                    min: 100,
+                                    max: 10000,
+                                    step: 100,
+                                    unit: 'ms',
+                                    help: 'Initial delay before retrying a temporary failure. Later retries back off exponentially and honor bounded Retry-After responses.'
                                 }
                             ]
                         }
@@ -660,7 +701,7 @@
                             id: 'mode',
                             label: 'What the code-reading skills see',
                             icon: 'fa-layer-group',
-                            note: 'A whole codebase cannot be attached verbatim — a real 6 MB project is roughly 1.6 million tokens, far past any context window. Digest mode solves that by sending STRUCTURE for every file (imports, classes, function signatures, HTTP routes, host-extension registrations, command tables) plus the full text of the highest-value files. That covers 100% of your own source within a budget that actually fits, so answering "whole codebase" means something.',
+                            note: 'A whole codebase cannot be attached verbatim. Digest mode builds a bounded structural map (imports, classes, function signatures, HTTP routes, host-extension registrations, command tables), discloses exclusions or omissions, and spends the remaining budget on full implementation text or a clearly marked excerpt. An explicit subsystem stays inside that scope and fails closed when no path matches.',
                             fields: [
                                 {
                                     key: 'sourceContextMode',
@@ -677,10 +718,10 @@
                                             value: 'digest',
                                             label: 'Whole codebase',
                                             icon: 'fa-sitemap',
-                                            hint: 'Digest every file in the active project folder, plus full text of the highest-value code files. Vendored and minified bundles are excluded.'
+                                            hint: 'Map the active project within one combined budget, then add full code or a disclosed excerpt. Exclusions and omissions are reported.'
                                         }
                                     ],
-                                    help: 'Applies to the code-reading skills (Architecture Evaluation, Code to PRD). Digest mode reads the whole project instead of only the attached files.'
+                                    help: 'Applies to the code-reading skills (Architecture Evaluation, Code to PRD). A "whole codebase" answer selects digest mode for that run even when this default remains bounded source.'
                                 }
                             ]
                         },
@@ -698,7 +739,7 @@
                                     max: 65536,
                                     step: 1024,
                                     unit: 'tokens',
-                                    help: 'Total source tokens the digest may occupy. About 62% goes to structure (all files) and the rest to full file text. ~16,000 balances coverage against a ~2.7 minute prompt evaluation.'
+                                    help: 'Approximate source-envelope budget. About 62% goes to structure and the rest to full text or one disclosed implementation excerpt; prompt wrappers still consume additional context.'
                                 },
                                 {
                                     key: 'digestMinFullTextLines',
@@ -757,8 +798,10 @@
                             actions: [
                                 { key: 'export-project', label: 'Export project', icon: 'fa-file-zipper', tone: 'default', help: 'Downloads every document in the project as a single .zip-free Markdown bundle.' },
                                 { key: 'export-settings', label: 'Export settings', icon: 'fa-file-arrow-down', tone: 'default', help: 'Downloads these settings as JSON you can keep or share.' },
+                                { key: 'export-recovery', label: 'Export recovery snapshot', icon: 'fa-life-ring', tone: 'default', help: 'Downloads the exact raw Blueprint storage keys, including malformed data, before you repair or reset anything.' },
                                 { key: 'import-settings', label: 'Import settings', icon: 'fa-file-arrow-up', tone: 'default', help: 'Restores settings from a JSON file. Unknown keys are ignored; values are clamped to their documented bounds.' },
                                 { key: 'reset-settings', label: 'Reset settings', icon: 'fa-rotate-left', tone: 'warn', help: 'Returns every setting on this page to its documented default.' },
+                                { key: 'reset-workspace', label: 'Reset tab layout', icon: 'fa-window-restore', tone: 'warn', help: 'Removes only Blueprint\'s saved tabs and recreates the Agent tab. Projects, runs and settings remain untouched.' },
                                 { key: 'clear-runs', label: 'Clear run history', icon: 'fa-clock-rotate-left', tone: 'warn', help: 'Deletes every stored run and its step trace. Documents already written stay in the project.' },
                                 { key: 'clear-files', label: 'Clear project files', icon: 'fa-folder-minus', tone: 'danger', help: 'Deletes every document and attached source file from the project. Run history is kept.' },
                                 { key: 'clear-all', label: 'Erase all Blueprint data', icon: 'fa-trash-can', tone: 'danger', help: 'Removes projects, runs, settings and the removal marker — the plug-in starts as if freshly installed.' }

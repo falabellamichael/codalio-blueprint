@@ -160,7 +160,13 @@ async function run() {
     // 3. Prompt Injection
     const originalPrompt = 'Write a technical specification for the vector indexer module.';
     const injected = agent.injectCompactionIntoPrompt(originalPrompt, compaction);
-    assert.ok(injected.startsWith('# Resuming from a compaction'), 'Injected prompt starts with compaction header');
+    assert.ok(injected.startsWith('## Prior compacted context (UNTRUSTED HISTORY'),
+        'Injected prompt starts with the compaction trust boundary');
+    assert.ok(injected.includes('# Resuming from a compaction'),
+        'Injected prompt retains the Anti-gravity compaction header inside the boundary');
+    assert.ok(injected.includes('<BLUEPRINT_UNTRUSTED_COMPACTION>')
+        && injected.includes('</BLUEPRINT_UNTRUSTED_COMPACTION>'),
+    'Injected prompt fences compacted history as untrusted data');
     assert.ok(injected.includes('Write a technical specification for the vector indexer module.'), 'Injected prompt preserves current turn prompt');
     assert.ok(injected.includes('---'), 'Compaction separated from prompt with divider');
     console.log('✓ agent.injectCompactionIntoPrompt injects compaction block cleanly');

@@ -233,41 +233,46 @@
         return root;
     }
 
-    function renderTreeBranch(branch, state, depth) {
+    function renderTreeBranch(branch, state, depth, folderId) {
         const fragment = document.createDocumentFragment();
         const indent = Number(state.treeIndentPx) || 13;
         [...branch.folders.values()]
             .sort((a, b) => a.name.localeCompare(b.name))
             .forEach(folder => {
-                const isOpen = state.expanded.has(folder.path);
+                const qualifiedPath = folderPathKey(folderId, folder.path);
+                const isOpen = state.expanded.has(qualifiedPath)
+                    || state.expanded.has(folder.path); // legacy state, migrated by controller
                 const row = node('div', 'cb-tree-row cb-tree-folder');
                 row.style.paddingLeft = `${8 + depth * indent}px`;
                 row.dataset.cbAction = 'toggle-folder';
                 row.dataset.path = folder.path;
+                row.dataset.folderId = folderId;
                 row.setAttribute('role', 'treeitem');
                 row.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
                 row.tabIndex = 0;
                 row.appendChild(icon(isOpen ? 'fa-folder-open' : 'fa-folder'));
                 row.appendChild(node('span', 'cb-tree-name', folder.name));
                 fragment.appendChild(row);
-                if (isOpen) fragment.appendChild(renderTreeBranch(folder, state, depth + 1));
+                if (isOpen) fragment.appendChild(renderTreeBranch(folder, state, depth + 1, folderId));
             });
         branch.files
             .slice()
             .sort((a, b) => a.name.localeCompare(b.name))
             .forEach(file => {
-                const row = node('div', `cb-tree-row cb-tree-file${state.openPath === file.path ? ' selected' : ''}`);
+                const selected = state.openPath === file.path && state.openFolderId === folderId;
+                const row = node('div', `cb-tree-row cb-tree-file${selected ? ' selected' : ''}`);
                 row.style.paddingLeft = `${11 + depth * indent}px`;
                 row.dataset.cbAction = 'open-file';
                 row.dataset.path = file.path;
+                row.dataset.folderId = folderId;
                 row.setAttribute('role', 'treeitem');
-                row.setAttribute('aria-selected', state.openPath === file.path ? 'true' : 'false');
+                row.setAttribute('aria-selected', selected ? 'true' : 'false');
                 row.tabIndex = 0;
                 row.title = file.path;
                 row.appendChild(icon(fileIconFor(file.name)));
                 row.appendChild(node('span', 'cb-tree-name', file.name));
                 if (state.showFileMeta !== false) {
-                    const record = core.readFile(file.path);
+                    const record = core.readFile(file.path, folderId);
                     if (record) {
                         row.appendChild(node('span', 'cb-tree-meta', `${(record.content.length / 1024).toFixed(1)} KB`));
                     }
@@ -286,6 +291,11 @@
      */
     function folderRootKey(folderId) {
         return `folder:${folderId}`;
+    }
+
+    /** Root-qualified directory identity for the multi-root explorer. */
+    function folderPathKey(folderId, path) {
+        return `path:${encodeURIComponent(String(folderId || ''))}:${encodeURIComponent(String(path || ''))}`;
     }
 
     /**
@@ -351,12 +361,17 @@
             row.tabIndex = 0;
             row.title = `${folder.name} — ${fileCount} file(s)`
                 + (isActive ? ' · new files are created here' : ' · click to expand or collapse')
-                + (folder.origin === 'imported' ? ' · imported from disk' : '');
+                + (folder.origin === 'imported' ? ' · imported from disk' : '')
+                + (folder.importState === 'incomplete'
+                    ? ` · incomplete import${folder.importError ? `: ${folder.importError}` : ''}` : '');
 
             row.appendChild(icon(isOpen ? 'fa-folder-open' : 'fa-folder'));
             const nameWrap = node('span', 'cb-tree-name');
             nameWrap.appendChild(node('span', null, folder.name));
             if (isActive) nameWrap.appendChild(node('span', 'cb-root-badge', 'target'));
+            if (folder.importState === 'incomplete') {
+                nameWrap.appendChild(node('span', 'cb-root-badge cb-root-badge-warn', 'incomplete'));
+            }
             row.appendChild(nameWrap);
             row.appendChild(node('span', 'cb-tree-meta', String(fileCount)));
 
@@ -389,7 +404,7 @@
             }
             // Nested one level under the root, so the hierarchy reads
             // project folder -> directory -> file.
-            tree.appendChild(renderTreeBranch(buildTree(paths), state, 1));
+            tree.appendChild(renderTreeBranch(buildTree(paths), state, 1, folder.id));
         });
 
         // A store with no folders at all cannot happen (the default folder is
@@ -413,7 +428,10 @@
                 item.appendChild(icon('fa-paperclip'));
                 item.appendChild(node('span', null, file.path));
                 item.appendChild(node('em', null, `${Math.round(file.content.length / 1024)} KB`));
-                item.appendChild(iconButton('fa-xmark', 'remove-source-file', `Detach ${file.path}`, { path: file.path }));
+                item.appendChild(iconButton('fa-xmark', 'detach-source-file', `Detach ${file.path}`, {
+                    path: file.path,
+                    folderId: file.folderId || file.folder || state.activeFolderId || ''
+                }));
                 list.appendChild(item);
             });
             attached.appendChild(list);
@@ -457,8 +475,8 @@
 
     function statusIcon(status) {
         if (status === 'done') return 'fa-circle-check';
-        if (status === 'error') return 'fa-circle-exclamation';
-        if (status === 'stopped') return 'fa-circle-stop';
+        if (status === 'error' || status === 'blocked' || status === 'gaps') return 'fa-circle-exclamation';
+        if (status === 'stopped' || status === 'interrupted') return 'fa-circle-stop';
         if (status === 'running') return 'fa-circle-notch fa-spin';
         return 'fa-circle-dot';
     }
@@ -495,6 +513,10 @@
         running: 'fa-circle-notch fa-spin',
         done: 'fa-circle-check',
         error: 'fa-circle-exclamation',
+        blocked: 'fa-circle-exclamation',
+        gaps: 'fa-circle-exclamation',
+        stopped: 'fa-circle-stop',
+        interrupted: 'fa-circle-stop',
         skipped: 'fa-circle-minus'
     };
 
@@ -566,8 +588,12 @@
         }
 
         if (step.kind === 'question') {
+            if (step.section) {
+                const secBadge = node('div', 'cb-step-section-badge', step.section);
+                body.appendChild(secBadge);
+            }
             body.appendChild(node('p', 'cb-step-question', step.question || ''));
-            if (step.options && step.options.length) {
+            if (isRunning && !step.answered && step.options && step.options.length) {
                 const options = node('div', 'cb-step-options');
                 step.options.forEach(option => {
                     const chip = node('button', 'cb-chip cb-chip-primary');
@@ -585,6 +611,7 @@
                 const inlineInput = node('input', 'cb-input cb-step-inline-input');
                 inlineInput.type = 'text';
                 inlineInput.placeholder = 'Type your answer here…';
+                inlineInput.value = step.answerDraft || '';
                 inlineInput.dataset.cbRole = 'inline-answer-input';
                 inlineInput.dataset.stepId = step.id;
                 inlineBox.appendChild(inlineInput);
@@ -667,6 +694,19 @@
                 actionRow.appendChild(filesTabBtn);
 
                 body.appendChild(actionRow);
+            }
+            if (step.canRepair && step.runId && step.reviewPath) {
+                const repairRow = node('div', 'cb-step-source-actions');
+                const repairBtn = node('button', 'cb-btn primary cb-step-action-btn');
+                repairBtn.type = 'button';
+                repairBtn.dataset.cbAction = 'auto-repair-gaps';
+                repairBtn.dataset.runId = step.runId;
+                repairBtn.dataset.path = step.reviewPath;
+                repairBtn.dataset.folderId = step.reviewFolderId || '';
+                repairBtn.appendChild(icon('fa-wand-magic-sparkles'));
+                repairBtn.appendChild(node('span', null, 'Repair Gaps'));
+                repairRow.appendChild(repairBtn);
+                body.appendChild(repairRow);
             }
         }
 
@@ -761,7 +801,11 @@
             written.appendChild(writtenHeader);
 
             const grid = node('div', 'cb-written-grid');
-            message.paths.forEach(path => {
+            const writtenFiles = Array.isArray(message.writtenFiles) && message.writtenFiles.length
+                ? message.writtenFiles
+                : message.paths.map(path => ({ path, folderId: message.folderId || '' }));
+            writtenFiles.forEach(file => {
+                const path = file.path;
                 const card = node('div', 'cb-artifact-card');
                 const fileHead = node('div', 'cb-artifact-head');
                 fileHead.appendChild(icon(fileIconFor(path)));
@@ -772,6 +816,7 @@
                 chip.type = 'button';
                 chip.dataset.cbAction = 'open-file';
                 chip.dataset.path = path;
+                chip.dataset.folderId = file.folderId || message.folderId || '';
                 chip.appendChild(icon('fa-file-arrow-down'));
                 chip.appendChild(node('span', null, path));
                 card.appendChild(chip);
@@ -785,8 +830,13 @@
         const actions = node('div', 'cb-msg-actions');
         if (message.role === 'assistant') {
             if (message.text) actions.appendChild(button('Copy', 'fa-copy', 'copy-message', { compact: true, dataset: { messageId: message.id } }));
-            if (message.canRetry && !message.busy) {
-                actions.appendChild(button('Retry', 'fa-rotate-right', 'retry-message', { compact: true, dataset: { messageId: message.id } }));
+            if ((message.canRetry || message.retryStarting) && !message.busy) {
+                const retry = button(message.retryStarting ? 'Checking…' : 'Retry', 'fa-rotate-right', 'retry-message', {
+                    compact: true,
+                    dataset: { messageId: message.id }
+                });
+                retry.disabled = Boolean(message.retryStarting);
+                actions.appendChild(retry);
             }
             actions.appendChild(button('Revise', 'fa-pen', 'revise-message', { compact: true, dataset: { messageId: message.id } }));
         }
@@ -807,7 +857,15 @@
             const isRunning = item.status === 'running';
             const isDone = item.status === 'done';
             const stepItem = node('div', `cb-pipeline-step cb-pipeline-${item.status || 'pending'}${isRunning ? ' active' : ''}`);
-            const iconName = isDone ? 'fa-circle-check' : isRunning ? 'fa-circle-notch fa-spin' : 'fa-circle-dot';
+            const iconName = isDone
+                ? 'fa-circle-check'
+                : isRunning
+                    ? 'fa-circle-notch fa-spin'
+                    : (item.status === 'error' || item.status === 'blocked' || item.status === 'gaps')
+                        ? 'fa-circle-exclamation'
+                        : (item.status === 'stopped' || item.status === 'interrupted')
+                            ? 'fa-circle-stop'
+                            : item.status === 'skipped' ? 'fa-circle-minus' : 'fa-circle-dot';
             stepItem.appendChild(icon(iconName));
             stepItem.appendChild(node('span', 'cb-pipeline-label', item.label));
             bar.appendChild(stepItem);
@@ -1039,7 +1097,7 @@
     function renderComposer(state) {
         const composer = node('div', 'cb-composer');
 
-        if (!state.busy && !state.pendingQuestion) {
+        if (!state.busy && !state.busyImport && !state.cancellationCheckBusy && !state.pendingQuestion) {
             const quickBar = node('div', 'cb-quick-bar');
 
             // --- Group 1: Skills ---
@@ -1053,8 +1111,8 @@
                 { id: 'prd-builder', label: '/prd', title: 'PRD Builder' },
                 { id: 'mvp-checklist', label: '/mvp', title: 'MVP Scope' },
                 { id: 'gtm-plan', label: '/gtm', title: 'GTM Strategy' },
-                { id: 'arch-eval', label: '/arch', title: 'Architecture Evaluation' },
-                { id: 'doc-gen', label: '/docs', title: 'Doc Generation' },
+                { id: 'arch-evaluation', label: '/arch', title: 'Architecture Evaluation' },
+                { id: 'doc-generation', label: '/docs', title: 'Doc Generation' },
                 { id: 'code-to-prd', label: '/code2prd', title: 'Code to PRD' }
             ];
             quickSkills.forEach(item => {
@@ -1153,7 +1211,8 @@
             defaultFileOpt.textContent = 'Attach file from project…';
             fileSelect.appendChild(defaultFileOpt);
 
-            const allFiles = (core && typeof core.listFiles === 'function') ? core.listFiles() : (state.projectFiles || []);
+            const allFiles = (core && typeof core.listFiles === 'function')
+                ? core.listFiles(state.activeFolderId) : (state.projectFiles || []);
             const attachedFiles = Array.isArray(state.sourceFiles) ? state.sourceFiles : [];
 
             if (!allFiles.length) {
@@ -1167,7 +1226,8 @@
                     const opt = node('option');
                     opt.value = filePath;
                     const isAttached = attachedFiles.some(f => f.path === filePath);
-                    const rec = core && typeof core.readFile === 'function' ? core.readFile(filePath) : null;
+                    const rec = core && typeof core.readFile === 'function'
+                        ? core.readFile(filePath, state.activeFolderId) : null;
                     const sizeStr = rec && typeof rec.bytes === 'number' ? ` (${Math.round(rec.bytes / 1024)} KB)` : '';
                     opt.textContent = `${isAttached ? '✓ ' : '📄 '}${filePath}${sizeStr}`;
                     fileSelect.appendChild(opt);
@@ -1229,6 +1289,7 @@
                 removeBtn.title = `Detach ${file.path} from context`;
                 removeBtn.dataset.cbAction = 'detach-source-file';
                 removeBtn.dataset.path = file.path;
+                removeBtn.dataset.folderId = file.folderId || file.folder || state.activeFolderId || '';
                 removeBtn.appendChild(icon('fa-xmark'));
                 chip.appendChild(removeBtn);
 
@@ -1247,13 +1308,24 @@
         }
 
         const isAwaitingAnswer = Boolean(state.pendingQuestion);
-        const isEffectivelyBusy = state.busy && !isAwaitingAnswer;
+        const isSubmittingAnswer = Boolean(state.pendingQuestion && state.pendingQuestion.submitting);
+        const isEffectivelyBusy = Boolean(
+            (state.busy && !isAwaitingAnswer)
+            || isSubmittingAnswer
+            || state.busyImport
+            || state.cancellationCheckBusy
+            || state.recoveryPersistenceBlocked
+        );
 
         if (state.pendingQuestion) {
             const bar = node('div', 'cb-composer-question');
             bar.appendChild(icon('fa-circle-question'));
             const textWrap = node('div', 'cb-composer-question-text');
             textWrap.appendChild(node('strong', null, 'Clarifying question: '));
+            if (state.pendingQuestion.section) {
+                const secTag = node('span', 'cb-composer-question-section', `[${state.pendingQuestion.section}] `);
+                textWrap.appendChild(secTag);
+            }
             textWrap.appendChild(node('span', null, state.pendingQuestion.question));
             bar.appendChild(textWrap);
 
@@ -1263,8 +1335,10 @@
                     const optBtn = node('button', 'cb-chip cb-chip-primary');
                     optBtn.type = 'button';
                     optBtn.dataset.cbAction = 'answer-question';
+                    optBtn.dataset.stepId = state.pendingQuestion.stepId || '';
                     optBtn.dataset.answer = opt;
                     optBtn.textContent = opt;
+                    if (isSubmittingAnswer) optBtn.disabled = true;
                     optGroup.appendChild(optBtn);
                 });
                 bar.appendChild(optGroup);
@@ -1275,8 +1349,13 @@
         const textarea = node('textarea', 'cb-composer-input');
         textarea.dataset.cbRole = 'composer';
         textarea.rows = 3;
+        if (Number.isFinite(Number(state.maxUserRequestChars))) {
+            textarea.maxLength = Number(state.maxUserRequestChars);
+        }
         textarea.value = state.draft || '';
-        textarea.placeholder = isAwaitingAnswer
+        textarea.placeholder = isSubmittingAnswer
+            ? 'Saving your answer…'
+            : isAwaitingAnswer
             ? 'Type your answer to the question above… Enter sends · Shift+Enter adds a line.'
             : isEffectivelyBusy
                 ? 'A step is running — press Stop to interrupt safely.'
@@ -1287,18 +1366,23 @@
         const bar = node('div', 'cb-composer-bar');
         const hint = node('span', 'cb-composer-hint');
         hint.appendChild(icon(isAwaitingAnswer ? 'fa-pen-to-square' : isEffectivelyBusy ? 'fa-circle-notch fa-spin' : 'fa-circle-info'));
-        hint.appendChild(node('span', null, isAwaitingAnswer ? 'Agent paused · Awaiting your response to proceed with the plan.' : (state.hint || 'Runs on your active SimpleRAG model endpoint. Nothing is written to your workspace.')));
+        hint.appendChild(node('span', null, isSubmittingAnswer
+            ? 'Saving your answer before the agent continues…'
+            : isAwaitingAnswer ? 'Agent paused · Awaiting your response to proceed with the plan.' : (state.hint || 'Runs on your active SimpleRAG model endpoint. Nothing is written to your workspace.')));
         bar.appendChild(hint);
 
         const right = node('div', 'cb-composer-right');
-        if (state.busy) {
-            right.appendChild(button('Stop', 'fa-stop', 'stop-run', { danger: true, title: 'Stop the current step safely' }));
+        if (state.busy || state.busyImport) {
+            right.appendChild(button(state.busyImport ? 'Cancel import' : 'Stop', 'fa-stop', 'stop-run', {
+                danger: true,
+                title: state.busyImport ? 'Cancel the import and remove partial files' : 'Stop the current step safely'
+            }));
         }
         const send = node('button', `cb-btn primary cb-send${isAwaitingAnswer ? ' cb-send-answer' : ''}`);
         send.type = 'button';
         send.dataset.cbAction = 'send';
         send.appendChild(icon(isAwaitingAnswer ? 'fa-paper-plane' : isEffectivelyBusy ? 'fa-circle-notch fa-spin' : 'fa-paper-plane'));
-        send.appendChild(node('span', null, isAwaitingAnswer ? 'Send Answer' : isEffectivelyBusy ? 'Running…' : 'Send'));
+        send.appendChild(node('span', null, isSubmittingAnswer ? 'Saving…' : isAwaitingAnswer ? 'Send Answer' : isEffectivelyBusy ? 'Running…' : 'Send'));
         if (isEffectivelyBusy) send.disabled = true;
         right.appendChild(send);
         bar.appendChild(right);
@@ -1307,7 +1391,7 @@
     }
 
     function renderFilesPage(state) {
-        const record = state.openPath ? core.readFile(state.openPath) : null;
+        const record = state.openPath ? core.readFile(state.openPath, state.openFolderId) : null;
         if (!record) {
             const wrap = node('div', 'cb-viewer');
             const empty = node('div', 'cb-viewer-empty');
@@ -1382,12 +1466,12 @@
         tools.appendChild(button(toggle.label, toggle.iconName, 'viewer-toggle', {
             compact: true,
             title: toggle.title,
-            dataset: { path: record.path }
+            dataset: { path: record.path, folderId: record.folder || '' }
         }));
-        tools.appendChild(button('Copy', 'fa-copy', 'copy-file', { compact: true, dataset: { path: record.path } }));
-        tools.appendChild(button('Download', 'fa-download', 'download-file', { compact: true, dataset: { path: record.path } }));
-        tools.appendChild(button('Rename', 'fa-pen', 'rename-file', { compact: true, dataset: { path: record.path } }));
-        tools.appendChild(button('Delete', 'fa-trash', 'delete-file', { compact: true, danger: true, dataset: { path: record.path } }));
+        tools.appendChild(button('Copy', 'fa-copy', 'copy-file', { compact: true, dataset: { path: record.path, folderId: record.folder || '' } }));
+        tools.appendChild(button('Download', 'fa-download', 'download-file', { compact: true, dataset: { path: record.path, folderId: record.folder || '' } }));
+        tools.appendChild(button('Rename', 'fa-pen', 'rename-file', { compact: true, dataset: { path: record.path, folderId: record.folder || '' } }));
+        tools.appendChild(button('Delete', 'fa-trash', 'delete-file', { compact: true, danger: true, dataset: { path: record.path, folderId: record.folder || '' } }));
         bar.appendChild(tools);
         viewer.appendChild(bar);
 
@@ -1458,11 +1542,16 @@
         if (run.writtenPaths && run.writtenPaths.length) {
             const written = node('div', 'cb-written');
             written.appendChild(node('span', 'cb-written-label', 'Documents written:'));
-            run.writtenPaths.forEach(path => {
+            const writtenFiles = Array.isArray(run.writtenFiles) && run.writtenFiles.length
+                ? run.writtenFiles
+                : run.writtenPaths.map(path => ({ path, folderId: run.folderId || '' }));
+            writtenFiles.forEach(file => {
+                const path = file.path;
                 const chip = node('button', 'cb-path-chip');
                 chip.type = 'button';
                 chip.dataset.cbAction = 'open-file';
                 chip.dataset.path = path;
+                chip.dataset.folderId = file.folderId || run.folderId || '';
                 chip.appendChild(icon('fa-file-lines'));
                 chip.appendChild(node('span', null, path));
                 written.appendChild(chip);
@@ -1533,10 +1622,14 @@
 
         const tab = wsModule.activeTab(ws);
         if (tab.kind === 'file') {
-            const record = core.readFile(tab.path);
+            const record = core.readFile(tab.path, tab.folderId);
             if (!record) return renderMissingFilePanel(state, tab);
-            const mode = wsModule.viewerModeFor(ws, tab.path, state.settings || core.readSettings());
-            return renderViewer(Object.assign({}, state, { viewerMode: mode, openPath: tab.path }), record);
+            const mode = wsModule.viewerModeFor(ws, tab.path, state.settings || core.readSettings(), tab.folderId);
+            return renderViewer(Object.assign({}, state, {
+                viewerMode: mode,
+                openPath: tab.path,
+                openFolderId: tab.folderId
+            }), record);
         }
         if (tab.kind === 'section') {
             if (tab.sectionId === 'cb-files') return renderFilesPage(state);
@@ -1662,6 +1755,7 @@
         MAX_FILE_NAME_LENGTH,
         SECTIONS,
         folderRootKey,
+        folderPathKey,
         node,
         icon,
         button,

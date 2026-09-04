@@ -135,8 +135,8 @@
 
 .cb-run-running { color: var(--cb-info); }
 .cb-run-done { color: var(--cb-ok); }
-.cb-run-error { color: var(--cb-danger); }
-.cb-run-stopped { color: var(--cb-warn); }
+.cb-run-error, .cb-run-blocked, .cb-run-gaps { color: var(--cb-danger); }
+.cb-run-stopped, .cb-run-interrupted { color: var(--cb-warn); }
 
 .cb-agent {
     position: relative;
@@ -634,7 +634,8 @@
     background: rgba(var(--cb-accent-rgb), 0.07);
 }
 
-.cb-step-error { border-color: color-mix(in srgb, var(--cb-danger) 55%, var(--cb-border)); }
+.cb-step-error, .cb-step-blocked { border-color: color-mix(in srgb, var(--cb-danger) 55%, var(--cb-border)); }
+.cb-step-stopped, .cb-step-interrupted { border-color: color-mix(in srgb, var(--cb-warn) 55%, var(--cb-border)); }
 .cb-step-done { border-color: color-mix(in srgb, var(--cb-ok) 26%, var(--cb-border)); }
 .cb-step-skipped { opacity: 0.62; }
 
@@ -658,7 +659,10 @@
 .cb-step-head > i:first-child { flex: 0 0 auto; width: 16px; text-align: center; font-size: 13px; }
 .cb-step-running .cb-step-head > i:first-child { color: var(--cb-info); }
 .cb-step-done .cb-step-head > i:first-child { color: var(--cb-ok); }
-.cb-step-error .cb-step-head > i:first-child { color: var(--cb-danger); }
+.cb-step-error .cb-step-head > i:first-child,
+.cb-step-blocked .cb-step-head > i:first-child { color: var(--cb-danger); }
+.cb-step-stopped .cb-step-head > i:first-child,
+.cb-step-interrupted .cb-step-head > i:first-child { color: var(--cb-warn); }
 .cb-step-skipped .cb-step-head > i:first-child { color: var(--cb-text-3); }
 .cb-step-pending .cb-step-head > i:first-child { color: var(--cb-text-3); }
 
@@ -778,6 +782,20 @@
     font-size: 13px;
     line-height: 1.55;
     color: var(--cb-text);
+}
+
+.cb-step-section-badge {
+    margin-bottom: 4px;
+    color: var(--cb-accent);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+.cb-composer-question-section {
+    color: var(--cb-accent);
+    font-weight: 600;
 }
 
 .cb-step-options {
@@ -4072,6 +4090,12 @@
     letter-spacing: 0.04em;
     text-transform: uppercase;
     line-height: 15px;
+}
+
+.cb-root-badge-warn {
+    color: #ffd08a;
+    border-color: rgba(255, 176, 72, .45);
+    background: rgba(160, 88, 0, .22);
 }
 
 .cb-tree-none {

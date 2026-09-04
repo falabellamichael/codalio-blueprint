@@ -21,10 +21,10 @@ against, not just a one-paragraph angle.
    their project first), read it and reuse its target user, positioning, and
    any GTM-lite section rather than re-asking. Otherwise ask for the product
    and target user directly, one open question.
-2. **Clarifying questions.** Ask one at a time. Cover: budget/team size for
-   GTM execution, whether this is paid or free/freemium, any existing
-   audience or channel already in hand (an email list, a community, a prior
-   product), and target launch timeframe.
+2. **Clarifying questions.** Ask one at a time, organized as 2 questions per section (2x per section):
+   - **Positioning & Audience:** existing audience or channels in hand and ideal early adopter profile with their acute pain trigger.
+   - **Channels & Pricing:** budget and team size for GTM execution, plus business model and anchor pricing hypothesis.
+   - **Launch Sequence:** target launch timeframe and milestone/conversion gates to advance phases.
 3. **Positioning.** One sentence: "[Product] helps [target market] [achieve
    outcome] by [mechanism]." Confirm it's specific enough to guide channel
    choice — a positioning statement that could describe five other products

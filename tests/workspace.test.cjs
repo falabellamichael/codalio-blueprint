@@ -263,7 +263,12 @@ function resetProject() {
     core.store.files = {};
     core.store.runs = [];
     core.store.openPath = '';
+    core.store.openFolderId = '';
     core.store.activeRunId = '';
+    Object.keys(core.store.folders).forEach(id => {
+        if (id !== core.DEFAULT_FOLDER_ID) delete core.store.folders[id];
+    });
+    core.store.activeFolderId = core.DEFAULT_FOLDER_ID;
     core.writeStore();
     core.clearWorkspace();
     core.writeSettings(Object.assign({}, core.DEFAULT_SETTINGS));
@@ -335,6 +340,40 @@ assert.equal(ws.tabs(work).length, 5, 're-opening a document duplicated its tab'
 
 ws.openFile(work, 'docs/mvp/2026-09-03-toolshare-mvp.md', core.readSettings());
 assert.equal(ws.tabs(work).length, 6, 'a second document did not get its own tab');
+
+// Two project roots may contain the same relative path. They must remain two
+// independently readable, restorable tabs with independent viewer preferences.
+resetProject();
+work = ws.createWorkspace(core.readSettings());
+const rootA = core.createFolder('Root A').folder;
+core.writeFile('src/index.js', 'export const root = "A";\n', { folder: rootA.id, origin: 'imported' });
+const rootB = core.createFolder('Root B').folder;
+core.writeFile('src/index.js', 'export const root = "B";\n', { folder: rootB.id, origin: 'imported' });
+ws.openFile(work, 'src/index.js', core.readSettings(), true, rootA.id);
+ws.openFile(work, 'src/index.js', core.readSettings(), true, rootB.id);
+const duplicateTabs = ws.tabs(work).filter(tab => tab.kind === 'file' && tab.path === 'src/index.js');
+assert.equal(duplicateTabs.length, 2, 'same-path files from two roots collapsed into one tab');
+assert.notEqual(duplicateTabs[0].id, duplicateTabs[1].id, 'file tab ids ignored the owning root');
+assert.ok(ws.fileTab(work, 'src/index.js', rootA.id));
+assert.ok(ws.fileTab(work, 'src/index.js', rootB.id));
+ws.setViewerMode(work, 'src/index.js', 'preview', rootA.id);
+ws.setViewerMode(work, 'src/index.js', 'source', rootB.id);
+assert.equal(ws.viewerModeFor(work, 'src/index.js', core.readSettings(), rootA.id), 'preview');
+assert.equal(ws.viewerModeFor(work, 'src/index.js', core.readSettings(), rootB.id), 'source');
+core.saveWorkspace(work);
+const duplicateRestored = ws.normalizeWorkspace(core.readWorkspaceRaw(), core.readSettings());
+assert.ok(ws.fileTab(duplicateRestored, 'src/index.js', rootA.id), 'root A tab did not restore');
+    assert.ok(ws.fileTab(duplicateRestored, 'src/index.js', rootB.id), 'root B tab did not restore');
+    ws.openFile(duplicateRestored, '/src/index.js', core.readSettings(), true, rootB.id);
+    assert.equal(ws.tabs(duplicateRestored).filter(tab => tab.kind === 'file'
+        && tab.folderId === rootB.id && tab.path === 'src/index.js').length, 1,
+    'a leading-slash alias created a duplicate tab for the same owned file');
+    assert.equal(ws.activeTab(duplicateRestored).path, 'src/index.js',
+        'an alias path was retained instead of the canonical file identity');
+core.deleteFile('src/index.js', rootA.id);
+ws.onFileDeleted(duplicateRestored, 'src/index.js', core.readSettings(), rootA.id);
+assert.ok(!ws.fileTab(duplicateRestored, 'src/index.js', rootA.id), 'deleting root A left its tab open');
+assert.ok(ws.fileTab(duplicateRestored, 'src/index.js', rootB.id), 'deleting root A closed root B\'s tab');
 
 // ---------------------------------------------------------------------------
 // 4. The tab cap evicts least-recently-used FILES, never the Agent
@@ -431,6 +470,8 @@ work = ws.createWorkspace(core.readSettings());
 // the BACKGROUND: the run is still streaming steps into the Agent tab, and
 // stealing focus mid-run hides the trace the user is watching.
 const agentActiveBefore = ws.activeTab(work).id;
+assert.ok(core.writeFile('docs/prd/written.md', '# Written\n', {}),
+    'written-file fixture could not be persisted');
 ws.onFileWritten(work, 'docs/prd/written.md', core.readSettings());
 assert.ok(ws.fileTab(work, 'docs/prd/written.md'), 'a written document did not open a tab');
 assert.equal(ws.activeTab(work).id, agentActiveBefore,
@@ -448,6 +489,8 @@ assert.equal(ws.activeTab(work).path, 'docs/prd/written.md', 'an explicit openFi
 ws.activateAgent(work);
 
 // Writing a second document also stays in the background.
+assert.ok(core.writeFile('docs/prd/second.md', '# Second\n', {}),
+    'second written-file fixture could not be persisted');
 ws.onFileWritten(work, 'docs/prd/second.md', core.readSettings());
 assert.ok(ws.fileTab(work, 'docs/prd/second.md'), 'a second written document did not open a tab');
 assert.equal(ws.activeTab(work).id, ws.AGENT_TAB_ID, 'the second write stole focus too');
@@ -528,9 +571,9 @@ work = ws.createWorkspace(core.readSettings());
 ws.openSection(work, 'cb-files', core.readSettings());
 ws.openSection(work, 'cb-settings', core.readSettings());
 ws.setSettingsLocation(work, 'workspace', 'editor');
-ws.setViewerMode(work, 'docs/prd/x.md', 'source');
 ws.setDivider(work, 380);
 core.writeFile('docs/prd/x.md', '# X\n', {});
+ws.setViewerMode(work, 'docs/prd/x.md', 'source', core.DEFAULT_FOLDER_ID);
 ws.openFile(work, 'docs/prd/x.md', core.readSettings());
 ws.openSection(work, 'cb-agent', core.readSettings());   // back to the chat
 
@@ -547,7 +590,7 @@ assert.equal(restored.activeTabId, work.activeTabId, 'the active tab changed acr
 assert.equal(restored.settingsSection, 'workspace');
 assert.equal(restored.settingsPage, 'editor');
 assert.equal(restored.dividerPx, 380, 'the divider width was not restored');
-assert.equal(restored.viewerModeByPath['docs/prd/x.md'], 'source');
+assert.equal(restored.viewerModeByPath[ws.viewerKey('docs/prd/x.md', core.DEFAULT_FOLDER_ID)], 'source');
 
 // A persisted file tab whose document is gone must not come back.
 core.deleteFile('docs/prd/x.md');
@@ -642,7 +685,8 @@ closable.forEach(button => {
 });
 
 // A document tab shows its file name and a document icon.
-const fileButton = tabButtons.find(button => button.dataset.tabId === 'tab-file:docs/prd/strip.md');
+const stripTab = ws.fileTab(work, 'docs/prd/strip.md');
+const fileButton = tabButtons.find(button => button.dataset.tabId === stripTab.id);
 assert.match(textOf(fileButton), /strip\.md/, 'the document tab does not show its file name');
 assert.ok(findAll(fileButton, byClass('fa-file-lines')).length, 'the document tab has no file icon');
 
@@ -780,7 +824,7 @@ sidebarExpectations.forEach(([sectionId, expectedClass]) => {
 
 // A file tab whose document was deleted renders an explanatory state, not a crash.
 core.deleteFile('docs/prd/shell.md');
-ws.activateTab(work, 'tab-file:docs/prd/shell.md');
+ws.activateTab(work, ws.fileTab(work, 'docs/prd/shell.md').id);
 const missingShell = ui.renderWorkspace(workspaceState());
 const missingPanel = findAll(missingShell, node => node.dataset && node.dataset.cbRole === 'tabpanel')[0];
 assert.equal(findAll(missingPanel, byClass('cb-viewer-empty')).length, 1, 'a deleted document tab rendered nothing useful');
@@ -943,7 +987,7 @@ assert.equal(work.dividerPx, 0, 'zero means "use the setting" and must stay zero
 ws.setDivider(work, 'not a number');
 assert.equal(work.dividerPx, 0, 'a non-numeric divider was not rejected');
 
-console.log('workspace.test.cjs: 12 workspace groups passed');
+console.log('workspace.test.cjs: 13 workspace groups passed');
 console.log(`  tabs verified  : agent pinned, 3 sections, per-document editors`);
 console.log(`  cap behaviour  : LRU file eviction at maxOpenTabs`);
 console.log(`  shortcuts      : ${ws.SHORTCUTS.length} documented and exercised`);

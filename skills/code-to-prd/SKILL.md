@@ -21,37 +21,40 @@ as an assumption or open question, never guessed silently.
    real code: entry points, routes/API surface, data model/schema, UI flows
    if present, README and any existing docs. Don't infer from naming alone —
    confirm behavior against the actual implementation.
-2. **Infer the target user and problem.** From what the code lets a user do
+2. **Clarifying questions.** Ask one at a time, organized as 2 questions per section (2x per section):
+   - **Audience & Intent:** who this reconstructed PRD is for (new team members, an acquirer, or a compliance/audit reader) and which specific workflows or capabilities to emphasize.
+   - **Codebase Scope:** whether to cover the whole codebase or one subsystem, and any known deprecated paths, experimental features, or unfinished stubs that should be flagged.
+3. **Infer the target user and problem.** From what the code lets a user do
    and how it's structured (auth model, roles, domain language in the code),
    infer who this is built for and what problem it solves. Mark this
-   inferred, not confirmed — it belongs in step 6's assumptions unless the
+   inferred, not confirmed — it belongs in step 7's assumptions unless the
    user confirms it.
-3. **Infer user stories.** Derive 5-10 "As a [user], I want [capability] so
+4. **Infer user stories.** Derive 5-10 "As a [user], I want [capability] so
    that [benefit]" stories from what the code actually implements — each
    should map to a real feature/route/flow found in step 1, not a guess
    about what the product "should" do.
-4. **Infer current scope.** What's actually built and working today reads as
+5. **Infer current scope.** What's actually built and working today reads as
    the current MVP scope. Note anything that looks unfinished, feature-
    flagged off, or stubbed — that's a signal, not necessarily "in scope."
-5. **Architecture overview.** Core entities and their relationships as they
+6. **Architecture overview.** Core entities and their relationships as they
    actually exist in the code/schema — this section can be higher-confidence
    than the others since it's read directly from the implementation.
-6. **Flag gaps explicitly.** Anything about intent, target user, or "why"
+7. **Flag gaps explicitly.** Anything about intent, target user, or "why"
    that the code can't answer goes in Open Questions, not into a confident-
    sounding sentence. Never present an inference as a confirmed fact.
-7. **Write the doc** to `docs/prd/YYYY-MM-DD-<project-slug>-prd.md` in the
+8. **Write the doc** to `docs/prd/YYYY-MM-DD-<project-slug>-prd.md` in the
    user's project, using the same output template as `prd-builder` (see
    `../prd-builder/references/lens-prompts.md` §Output Template) so
    reconstructed and freshly-written PRDs look the same — but prefix the
    summary with a note that this was reconstructed from code on `<date>`,
    not authored from a described idea.
-8. **Self-review.** Check every user story traces to real code found in step
+9. **Self-review.** Check every user story traces to real code found in step
    1, and every inference not directly confirmed by code is either in Open
    Questions or clearly marked as an assumption.
-9. **User review gate.** Point the user to the file, ask them to confirm or
-   correct the inferences before treating it as final — this doc is a
-   starting point for a conversation, not a finished spec. Wait for their
-   response.
+10. **User review gate.** Point the user to the file, ask them to confirm or
+    correct the inferences before treating it as final — this doc is a
+    starting point for a conversation, not a finished spec. Wait for their
+    response.
 
 ## Output Template
 

@@ -222,6 +222,7 @@ const ribbonButtons = [];
 const navFolders = [];
 
 const hostState = { app: 'blueprint', folder: 'all', plugins: { installed: [] } };
+const windowListeners = Object.create(null);
 
 const hostElementsMap = {
     listPane,
@@ -319,9 +320,20 @@ const windowStub = {
     queueMicrotask: fn => queueMicrotask(fn),
     MutationObserver: class { observe() {} disconnect() {} },
     CustomEvent: class { constructor(type, init) { this.type = type; this.detail = (init || {}).detail; } },
-    addEventListener() {},
-    removeEventListener() {},
-    dispatchEvent() { return true; },
+    addEventListener(type, listener) {
+        if (typeof listener !== 'function') return;
+        if (!windowListeners[type]) windowListeners[type] = [];
+        if (!windowListeners[type].includes(listener)) windowListeners[type].push(listener);
+    },
+    removeEventListener(type, listener) {
+        if (!windowListeners[type]) return;
+        windowListeners[type] = windowListeners[type].filter(item => item !== listener);
+    },
+    dispatchEvent(event) {
+        const type = event && event.type;
+        (windowListeners[type] || []).slice().forEach(listener => listener.call(windowStub, event));
+        return true;
+    },
     URL: { createObjectURL: () => 'blob:test', revokeObjectURL: () => {} },
     Blob: class Blob { constructor(parts) { this.parts = parts; } },
     FileReader: class { readAsText() {} },
@@ -680,8 +692,10 @@ function tick(ms) {
 
     // A written document opened its own editor tab BESIDE the Agent.
     const fileTabs = queryAll('[data-cb-action="activate-tab"]').filter(t => t.id.startsWith('cb-tabbtn'));
+    const persistedWorkspace = ws.normalizeWorkspace(core.readWorkspaceRaw(), core.readSettings());
+    const writtenTab = ws.fileTab(persistedWorkspace, written[0], prdRecord.folder);
     assert.ok(
-        queryAll('[data-cb-action="activate-tab"]').some(t => t.dataset.tabId === `tab-file:${written[0]}`),
+        writtenTab && queryAll('[data-cb-action="activate-tab"]').some(t => t.dataset.tabId === writtenTab.id),
         'the written document did not open its own tab'
     );
     void fileTabs;
@@ -689,6 +703,60 @@ function tick(ms) {
     // The run was persisted.
     assert.equal(core.store.runs.length, 1, 'the run was not saved');
     assert.equal(core.store.runs[0].status, 'done');
+
+    // A revision first checkpoints its active step and transcript, then claims
+    // the single-backend execution lease. Force another window to win that lease
+    // in the narrow gap and prove startup rolls back every durable/UI artifact
+    // without dispatching a request.
+    const revisionRun = core.store.runs[0];
+    const revisionMessagesBefore = JSON.stringify(revisionRun.messages || []);
+    const revisionPhaseCountBefore = (revisionRun.phases || []).length;
+    const revisionRequestCount = requests.length;
+    const globalOwnerId = '__codalio-blueprint-model-operation__';
+    const globalOwnerKey = `${core.RUN_OWNER_PREFIX}${encodeURIComponent(globalOwnerId)}`;
+    const originalStorageSet = localStorageStub.setItem;
+    let injectedForeignGlobalOwner = false;
+    localStorageStub.setItem = (key, value) => {
+        originalStorageSet(key, value);
+        if (!injectedForeignGlobalOwner && String(key) === core.PROJECTS_KEY) {
+            injectedForeignGlobalOwner = true;
+            originalStorageSet(globalOwnerKey, JSON.stringify({
+                runId: globalOwnerId,
+                ownerId: 'foreign-revision-window',
+                leaseId: 'foreign-revision-lease',
+                leaseExpiresAt: Date.now() + 30000
+            }));
+        }
+    };
+    windowStub.prompt = () => 'Tighten the acceptance criteria without changing scope.';
+    const reviseButton = query('[data-cb-action="revise-message"]');
+    assert.ok(reviseButton, 'the completed document offered no revision action');
+    click(reviseButton);
+    for (let i = 0; i < 100 && !injectedForeignGlobalOwner; i += 1) await tick(10);
+    for (let i = 0; i < 100 && publicApi.isBusy(); i += 1) await tick(10);
+    await tick(30);
+    localStorageStub.setItem = originalStorageSet;
+    localStorageStub.removeItem(globalOwnerKey);
+    windowStub.prompt = () => null;
+
+    assert.equal(injectedForeignGlobalOwner, true,
+        'the forced revision lease race never reached its durable startup checkpoint');
+    assert.equal(requests.length, revisionRequestCount,
+        'a revision request escaped after the global execution lease was lost');
+    assert.equal(revisionRun.status, 'done',
+        'revision lease failure left the existing run marked running');
+    assert.equal(revisionRun.phases.length, revisionPhaseCountBefore,
+        'revision lease failure left a phantom active phase');
+    assert.equal(JSON.stringify(revisionRun.messages || []), revisionMessagesBefore,
+        'revision lease failure left a phantom user or busy assistant message');
+    const durableRevisionRun = JSON.parse(localStorageStub.getItem(core.PROJECTS_KEY)).runs
+        .find(item => item.id === revisionRun.id);
+    assert.equal(durableRevisionRun.status, 'done',
+        'revision rollback did not restore the durable terminal status');
+    assert.equal(durableRevisionRun.phases.length, revisionPhaseCountBefore,
+        'revision rollback did not remove the durable phantom phase');
+    assert.equal(JSON.stringify(durableRevisionRun.messages || []), revisionMessagesBefore,
+        'revision rollback did not restore the durable transcript');
 
     // =======================================================================
     // 6. Opening a document from the tree shows it in its own tab
@@ -715,7 +783,7 @@ function tick(ms) {
     assert.match(textOf(query('.cb-preview-status')), /Ln 1, Col 1/, 'the previewer status bar is missing');
     assert.equal(ws.viewerModeFor(
         core.readWorkspaceRaw() && ws.normalizeWorkspace(core.readWorkspaceRaw(), core.readSettings()),
-        written[0], core.readSettings()
+        written[0], core.readSettings(), prdRecord.folder
     ), 'source', 'the per-document viewer mode was not persisted');
 
     // =======================================================================
@@ -897,6 +965,205 @@ function tick(ms) {
 
     // Wait for it to settle before the next section.
     for (let i = 0; i < 150 && query('[data-cb-role="composer"]') && query('[data-cb-role="composer"]').disabled; i += 1) await tick(25);
+
+    // Six visible messages crosses the default deterministic compaction
+    // threshold. It must run only after the final settlement token is removed,
+    // persist atomically, and never spend an extra model request.
+    const requestsBeforeAutoCompaction = requests.length;
+    for (let i = 0; i < 80 && !(core.store.runs[0] && core.store.runs[0].compaction); i += 1) {
+        await tick(10);
+    }
+    assert.ok(core.store.runs[0].compaction,
+        'threshold-crossing run never executed automatic compaction after settlement');
+    assert.equal(requests.length, requestsBeforeAutoCompaction,
+        'deterministic automatic compaction unexpectedly dispatched a model turn');
+    assert.equal((core.store.runs[0].messages || [])[0].role, 'compaction',
+        'automatic compaction was not persisted with its shortened transcript');
+
+    // Re-evaluating controller.js is how the development host hot-reloads an
+    // extension. The prior delegated handlers must be retired, or one click is
+    // observed by two independent controller closures.
+    const delegatedEvents = ['click', 'input', 'change', 'keydown'];
+    delegatedEvents.forEach(type => assert.equal((documentStub._listeners[type] || []).length, 1,
+        `${type} unexpectedly had duplicate handlers before hot reload`));
+    runFile(path.join(SRC, 'controller.js'), 'controller hot reload');
+    delegatedEvents.forEach(type => assert.equal((documentStub._listeners[type] || []).length, 1,
+        `${type} handler leaked across controller re-evaluation`));
+    await host.callPageHook('blueprint', 'mount');
+    await host.callPageHook('blueprint', 'activate');
+    hostRenderAll();
+    await tick();
+
+    // Workspace and project selection are separate durable keys. The sender
+    // writes W then P, so another window can observe the workspace event first.
+    // Reproduce that exact ordering and prove the receiver converges instead of
+    // permanently blocking its composer after the first CAS conflict.
+    const pairedRoot = core.createFolder('Paired event root').folder;
+    assert.ok(pairedRoot, 'could not create the cross-window pairing fixture root');
+    const pairedPath = 'docs/paired-event.md';
+    assert.ok(core.writeFile(pairedPath, '# Paired event\n\nAuthoritative external tab.', {
+        folder: pairedRoot.id
+    }), 'could not create the cross-window pairing fixture file');
+    assert.equal(core.restoreSelection({
+        activeFolderId: core.DEFAULT_FOLDER_ID,
+        openPath: '',
+        openFolderId: '',
+        activeRunId: ''
+    }), true, 'could not establish the stale receiver selection');
+
+    const pairedProject = JSON.parse(localStorageStub.getItem(core.PROJECTS_KEY));
+    pairedProject.revision += 1;
+    pairedProject.commitId = 'external-paired-project';
+    pairedProject.activeFolderId = pairedRoot.id;
+    pairedProject.openPath = pairedPath;
+    pairedProject.openFolderId = pairedRoot.id;
+    pairedProject.activeRunId = '';
+
+    const pairedWorkspace = JSON.parse(JSON.stringify(core.readWorkspaceRaw()));
+    const pairedTabId = ws.fileTabId(pairedPath, pairedRoot.id);
+    pairedWorkspace.tabs = pairedWorkspace.tabs.filter(tab => tab.id !== pairedTabId);
+    pairedWorkspace.tabs.push({
+        id: pairedTabId,
+        kind: 'file',
+        title: 'paired-event.md',
+        icon: 'fa-file-lines',
+        sectionId: '',
+        path: pairedPath,
+        folderId: pairedRoot.id,
+        pinned: false,
+        openedAt: Date.now(),
+        lastActiveAt: Date.now()
+    });
+    pairedWorkspace.activeTabId = pairedTabId;
+    pairedWorkspace.revision += 1;
+    pairedWorkspace.commitId = 'external-paired-workspace';
+
+    localStorageStub.setItem(core.WORKSPACE_KEY, JSON.stringify(pairedWorkspace));
+    localStorageStub.setItem(core.PROJECTS_KEY, JSON.stringify(pairedProject));
+    windowStub.dispatchEvent(new windowStub.CustomEvent('codalio-blueprint-workspace-change', {
+        detail: { reason: 'external-workspace-update' }
+    }));
+    windowStub.dispatchEvent(new windowStub.CustomEvent('codalio-blueprint-store-change', {
+        detail: { reason: 'external-update' }
+    }));
+    for (let i = 0; i < 30 && core.store.openPath !== pairedPath; i += 1) await tick(10);
+
+    assert.equal(core.store.activeFolderId, pairedRoot.id,
+        'W-before-P delivery did not adopt the authoritative project root');
+    assert.equal(core.store.openPath, pairedPath,
+        'W-before-P delivery did not adopt the authoritative file selection');
+    assert.equal(core.store.openFolderId, pairedRoot.id,
+        'W-before-P delivery lost the file owner');
+    assert.equal(ws.activeTab(core.readWorkspaceRaw()).id, pairedTabId,
+        'W-before-P delivery discarded the authoritative active tab');
+    documentStub.dispatch('keydown', { key: '1', ctrlKey: true, target: documentStub.body });
+    await tick(20);
+    assert.equal(query('[data-cb-role="composer"]').disabled, false,
+        'W-before-P delivery left new agent work blocked until reload');
+
+    // Thirty continued turns must remain linear on disk. The live UI still
+    // presents one conversation, while each run stores only its own assistant
+    // card and follows an explicit parent chain.
+    assert.equal(core.writeSettings(Object.assign({}, core.readSettings(), {
+        contextCompression: false,
+        askClarifyingQuestions: false,
+        concurrency: 'parallel',
+        autoOpenWrittenDocument: false
+    })), true, 'could not disable compaction for the transcript-growth fixture');
+    const growthPrefix = 'Linear transcript turn ';
+    const growthPrompts = [];
+    const durableMessageTotals = [];
+    for (let index = 1; index <= 30; index += 1) {
+        const promptText = `${growthPrefix}${index}.`;
+        growthPrompts.push(promptText);
+        const growthComposer = query('[data-cb-role="composer"]');
+        growthComposer.value = promptText;
+        documentStub.dispatch('input', { target: growthComposer });
+        clickAction('send');
+        for (let spin = 0; spin < 200; spin += 1) {
+            await tick(5);
+            const newest = core.store.runs[0];
+            const liveComposer = query('[data-cb-role="composer"]');
+            if (newest && newest.idea === promptText && newest.status !== 'running'
+                && liveComposer && !liveComposer.disabled) break;
+        }
+        const durableGrowthRuns = core.store.runs
+            .filter(run => String(run.idea || '').startsWith(growthPrefix));
+        assert.equal(durableGrowthRuns.length, index,
+            `turn ${index} did not reach a durable terminal run`);
+        durableMessageTotals.push(durableGrowthRuns.reduce(
+            (total, run) => total + (Array.isArray(run.messages) ? run.messages.length : 0), 0));
+    }
+
+    const growthRuns = core.store.runs
+        .filter(run => String(run.idea || '').startsWith(growthPrefix));
+    assert.equal(growthRuns.length, 30);
+    assert.ok(growthRuns.every(run => run.transcriptMode === 'run-local-v1'),
+        'a new run persisted another cumulative transcript mode');
+    assert.ok(growthRuns.every(run => (run.messages || []).length <= 2
+        && (run.messages || []).every(message => String(message.runId || '') === run.id)),
+    'a run persisted cards owned by an earlier turn');
+    assert.ok(growthRuns.every(run => (run.messages || []).every(message => !Object.prototype.hasOwnProperty.call(message, 'idea'))),
+        'assistant cards duplicated their canonical run idea');
+    assert.ok(durableMessageTotals.every((total, index) => total <= (index + 1) * 2),
+        'durable transcript-card growth became superlinear');
+
+    // Hot reload rebuilds the exact chain: no duplicate legacy snapshot cards,
+    // and no missing first/last turn.
+    runFile(path.join(SRC, 'controller.js'), 'controller transcript hot reload');
+    await host.callPageHook('blueprint', 'mount');
+    await host.callPageHook('blueprint', 'activate');
+    hostRenderAll();
+    await tick(20);
+    const rebuiltUserCards = queryAll('.cb-msg-user');
+    assert.equal(rebuiltUserCards.filter(card => textOf(card).includes(growthPrompts[0])).length, 1,
+        'the first local transcript turn was missing or duplicated after reload');
+    assert.equal(rebuiltUserCards.filter(card => textOf(card).includes(growthPrompts[29])).length, 1,
+        'the last local transcript turn was missing or duplicated after reload');
+
+    // Reject pathological composer payloads before claiming a run or clearing
+    // the draft; the user can move the material into Project Files instead.
+    const oversizedComposer = query('[data-cb-role="composer"]');
+    const oversizedRequest = 'x'.repeat(32769);
+    const requestsBeforeOversize = requests.length;
+    oversizedComposer.value = oversizedRequest;
+    documentStub.dispatch('input', { target: oversizedComposer });
+    clickAction('send');
+    await tick(20);
+    assert.equal(requests.length, requestsBeforeOversize,
+        'an oversized composer payload reached the model');
+    assert.equal(query('[data-cb-role="composer"]').value, oversizedRequest,
+        'an oversized rejected payload was cleared or silently truncated');
+
+    // Clear chat is a conversation boundary even inside the same project root.
+    const clearComposer = query('[data-cb-role="composer"]');
+    clearComposer.value = '/clear';
+    documentStub.dispatch('input', { target: clearComposer });
+    clickAction('send');
+    await tick(20);
+    const postClearPrompt = 'Fresh conversation after explicit clear.';
+    const postClearComposer = query('[data-cb-role="composer"]');
+    postClearComposer.value = postClearPrompt;
+    documentStub.dispatch('input', { target: postClearComposer });
+    clickAction('send');
+    for (let spin = 0; spin < 200; spin += 1) {
+        await tick(5);
+        const newest = core.store.runs[0];
+        const liveComposer = query('[data-cb-role="composer"]');
+        if (newest && newest.idea === postClearPrompt && newest.status !== 'running'
+            && liveComposer && !liveComposer.disabled) break;
+    }
+    assert.equal(core.store.runs[0].contextRunId, '',
+        'a post-clear run reattached the prior same-root conversation');
+    runFile(path.join(SRC, 'controller.js'), 'controller clear-boundary hot reload');
+    await host.callPageHook('blueprint', 'mount');
+    await host.callPageHook('blueprint', 'activate');
+    hostRenderAll();
+    await tick(20);
+    assert.match(allText(), /Fresh conversation after explicit clear/,
+        'the post-clear turn did not survive reload');
+    assert.ok(!allText().includes(growthPrompts[29]),
+        'reload resurrected a pre-clear turn from the same project root');
 
     // =======================================================================
     // 11. Leaving the page releases the divider (no leak into other apps)

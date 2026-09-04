@@ -20,10 +20,12 @@ optional.
 1. **Gather the idea.** If the user hasn't already described what they're
    building, ask them in one open question. Don't proceed on a one-line idea —
    move to clarifying questions next.
-2. **Clarifying questions.** Ask one question at a time, prefer multiple choice
-   when there's a natural short list of options. Cover: who's the user, what
-   problem, why now, any hard constraints (timeline, platform, must-integrate-with).
-   Stop once you can write a real first sentence of an elevator pitch.
+2. **Clarifying questions.** Ask one question at a time, organized as 2 questions
+   per analytical section (2x per section):
+   - **Product & Scope:** who the user is (role, context, workarounds) and what core problem/workflows are needed.
+   - **Architecture & Data:** core entities and state to manage, plus hard technical constraints (timeline, platform, integrations).
+   - **Go-to-Market:** early adopter profile and distribution channels with checkable success milestones.
+   Stop once you have clear answers for each lens.
 3. **Run the three lenses** (see below).
 4. **Synthesize.** Merge the three lens outputs into the PRD template. Resolve
    overlaps (e.g. both product and GTM lenses may name a "target user" —

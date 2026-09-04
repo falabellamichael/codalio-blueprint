@@ -21,10 +21,10 @@ scope decision, not just sketch one.
    their project first), read it and reuse its target user, problem, and user
    stories rather than re-asking. Otherwise ask for the idea and target user
    directly, one open question.
-2. **Clarifying questions.** Ask one at a time. Cover: timeline/deadline
-   pressure, team size, what "launch" means for this project (paying
-   customers? internal pilot? public beta?), and any hard constraint that
-   caps scope (budget, a must-hit date, a single-person team).
+2. **Clarifying questions.** Ask one at a time, organized as 2 questions per section (2x per section):
+   - **Context & Team:** team size/roles available and deadline or launch date pressures.
+   - **Scope & Cuts:** core value action that must work for v1 and hard constraints capping scope (budget, must-hit date, single person).
+   - **Launch & Done-Criteria:** what "launch" means (paying customers, pilot, public beta) and 3-5 concrete checkable done-criteria.
 3. **List every candidate feature.** Pull from the PRD's user stories if one
    exists, or elicit them directly. Don't filter yet — get the full
    candidate list first so cuts are visible decisions, not silent omissions.

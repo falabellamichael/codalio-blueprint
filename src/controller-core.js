@@ -31,6 +31,10 @@
     const SETTINGS_KEY = keyFor('settings');
     const REMOVED_KEY = keyFor('removed');
     const WORKSPACE_KEY = keyFor('workspace');
+    const PROJECTS_WRITE_LOCK_PREFIX = `${PLUGIN_ID}.projects-write-lock.`;
+    const PENDING_CANCEL_PREFIX = `${PLUGIN_ID}.pending-cancel.`;
+    const RUN_OWNER_PREFIX = `${PLUGIN_ID}.run-owner.`;
+    const MODEL_OPERATION_OWNER_ID = '__codalio-blueprint-model-operation__';
 
     // ------------------------------------------------------------------
     // Text helpers
@@ -48,6 +52,19 @@
     function clampText(value, max) {
         const text = String(value === null || value === undefined ? '' : value);
         return text.length > max ? text.slice(0, max) : text;
+    }
+
+    /**
+     * Whether a provider fragment contains something a person can actually see.
+     * String.trim() deliberately ignores several format controls (zero-width
+     * space/joiners, BOM, NUL, bidi controls). Treating those as progress lets a
+     * broken endpoint keep the idle timer alive forever and can turn an invisible
+     * terminal response into a successful document.
+     */
+    function hasMeaningfulText(value) {
+        return String(value === null || value === undefined ? '' : value)
+            .replace(/[\p{Z}\p{Cc}\p{Cf}\p{Default_Ignorable_Code_Point}]/gu, '')
+            .length > 0;
     }
 
     function slugify(value) {
@@ -114,6 +131,13 @@
         documentMaxOutputTokens: 8192,
         maxPromptChars: 2400,
         confirmStop: false,
+        // Reliability guardrails. A "retry" is an additional attempt and is
+        // only used before the model has emitted any text, so Blueprint never
+        // silently splices two generations together.
+        modelMaxRetries: 2,
+        modelRequestTimeoutSeconds: 1200,
+        modelIdleTimeoutSeconds: 300,
+        modelRetryBaseDelayMs: 750,
 
         // Agent -> Step detail
         streamLive: true,
@@ -175,14 +199,40 @@
         showStorageUsage: true
     };
 
+    let settingsLoadError = '';
+    const SETTINGS_RAW_SYMBOL = Symbol('codalioBlueprintSettingsRaw');
+
+    function bindSettingsSnapshot(settings, raw) {
+        if (!settings || typeof settings !== 'object') return settings;
+        try {
+            Object.defineProperty(settings, SETTINGS_RAW_SYMBOL, {
+                value: raw,
+                configurable: true,
+                enumerable: false,
+                writable: true
+            });
+        } catch (_) { /* plain settings objects are normally extensible */ }
+        return settings;
+    }
+
     function readSettingsRaw() {
         try {
             const raw = window.localStorage.getItem(SETTINGS_KEY);
-            if (!raw) return {};
+            if (!raw) {
+                settingsLoadError = '';
+                return bindSettingsSnapshot({}, null);
+            }
             const parsed = JSON.parse(raw);
-            return (parsed && typeof parsed === 'object') ? parsed : {};
-        } catch (_) {
-            return {};   // corrupt settings fall back to defaults
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                settingsLoadError = 'The saved settings are malformed.';
+                return bindSettingsSnapshot({}, raw);
+            }
+            settingsLoadError = '';
+            return bindSettingsSnapshot(parsed, raw);
+        } catch (error) {
+            settingsLoadError = `The saved settings could not be parsed (${String((error && error.message) || error)}).`;
+            return bindSettingsSnapshot({}, undefined);
+            // use defaults without overwriting the original bytes
         }
     }
 
@@ -193,14 +243,15 @@
      * core applies the same limits itself.
      */
     function readSettings() {
+        const raw = readSettingsRaw();
+        const rawSnapshot = raw && raw[SETTINGS_RAW_SYMBOL];
         const schema = window.__codalioBlueprintSettings;
         if (schema && typeof schema.normalizeSettings === 'function') {
             try {
-                return schema.normalizeSettings(readSettingsRaw());
+                return bindSettingsSnapshot(schema.normalizeSettings(raw), rawSnapshot);
             } catch (_) { /* fall through to the built-in bounds */ }
         }
 
-        const raw = readSettingsRaw();
         const settings = { ...DEFAULT_SETTINGS };
         Object.keys(DEFAULT_SETTINGS).forEach(key => {
             if (raw[key] !== undefined) settings[key] = raw[key];
@@ -211,6 +262,10 @@
         settings.lensMaxOutputTokens = boundedInt(settings.lensMaxOutputTokens, 512, 32768, DEFAULT_SETTINGS.lensMaxOutputTokens);
         settings.documentMaxOutputTokens = boundedInt(settings.documentMaxOutputTokens, 512, 32768, DEFAULT_SETTINGS.documentMaxOutputTokens);
         settings.maxPromptChars = boundedInt(settings.maxPromptChars, 200, 8000, DEFAULT_SETTINGS.maxPromptChars);
+        settings.modelMaxRetries = boundedInt(settings.modelMaxRetries, 0, 5, DEFAULT_SETTINGS.modelMaxRetries);
+        settings.modelRequestTimeoutSeconds = boundedInt(settings.modelRequestTimeoutSeconds, 30, 3600, DEFAULT_SETTINGS.modelRequestTimeoutSeconds);
+        settings.modelIdleTimeoutSeconds = boundedInt(settings.modelIdleTimeoutSeconds, 15, 900, DEFAULT_SETTINGS.modelIdleTimeoutSeconds);
+        settings.modelRetryBaseDelayMs = boundedInt(settings.modelRetryBaseDelayMs, 100, 10000, DEFAULT_SETTINGS.modelRetryBaseDelayMs);
         settings.maxOpenTabs = boundedInt(settings.maxOpenTabs, 2, 24, DEFAULT_SETTINGS.maxOpenTabs);
         settings.listPaneWidth = boundedInt(settings.listPaneWidth, 220, 520, DEFAULT_SETTINGS.listPaneWidth);
         settings.treeIndentPx = boundedInt(settings.treeIndentPx, 8, 28, DEFAULT_SETTINGS.treeIndentPx);
@@ -249,7 +304,7 @@
             ? settings.extraGuidance.slice(0, 1200)
             : '';
 
-        return settings;
+        return bindSettingsSnapshot(settings, rawSnapshot);
     }
 
     function boundedInt(value, min, max, fallback) {
@@ -264,49 +319,118 @@
         return Math.min(max, Math.max(min, parsed));
     }
 
-    function writeSettings(settings) {
+    function writeSettings(settings, options) {
+        const opts = options && typeof options === 'object' ? options : {};
+        const borrowedLease = opts.transactionLease || null;
+        let lease = borrowedLease;
         try {
-            window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
-        } catch (_) { /* storage full or unavailable */ }
+            if (!lease) lease = acquireStoreWriteLease();
+            if (!lease.ok || !ownsStoreWriteIntent(lease) || hasPriorStoreWriter(lease)) return false;
+            const rawBefore = window.localStorage.getItem(SETTINGS_KEY);
+            const expectedRaw = opts.expectedRaw !== undefined
+                ? opts.expectedRaw
+                : (settings && Object.prototype.hasOwnProperty.call(settings, SETTINGS_RAW_SYMBOL)
+                    ? settings[SETTINGS_RAW_SYMBOL] : undefined);
+            if (expectedRaw !== undefined && rawBefore !== expectedRaw) {
+                settingsLoadError = 'Settings changed in another Blueprint window. Reload before saving this change.';
+                return false;
+            }
+            if (!(opts.allowCorruptReset === true)) {
+                // A caller may save before the settings page has read the key.
+                // Inspect it here too, so a routine toggle cannot silently
+                // replace malformed data that the user may need to export.
+                readSettingsRaw();
+                if (settingsLoadError) {
+                    console.warn('[codalio-blueprint] refusing to overwrite corrupt settings', settingsLoadError);
+                    return false;
+                }
+            }
+            const serialized = JSON.stringify(settings);
+            if (!ownsStoreWriteIntent(lease) || hasPriorStoreWriter(lease)
+                || window.localStorage.getItem(SETTINGS_KEY) !== rawBefore) return false;
+            window.localStorage.setItem(SETTINGS_KEY, serialized);
+            if (!ownsStoreWriteIntent(lease)
+                || window.localStorage.getItem(SETTINGS_KEY) !== serialized) return false;
+            bindSettingsSnapshot(settings, serialized);
+            settingsLoadError = '';
+            return true;
+        } catch (error) {
+            console.warn('[codalio-blueprint] unable to persist settings', error);
+            return false;
+        } finally {
+            if (!borrowedLease && lease && lease.ok) releaseStoreWriteLease(lease);
+        }
     }
 
     // ------------------------------------------------------------------
     // Persistence: projects, runs, and the virtual filesystem
     // ------------------------------------------------------------------
 
+    /** Current persisted project-store schema. v3 permits duplicate paths across roots. */
+    const STORE_VERSION = 3;
+
     /** Id of the folder that always exists and owns anything unfiled. */
     const DEFAULT_FOLDER_ID = 'folder-default';
 
+    const hasOwn = (value, key) => Boolean(value)
+        && Object.prototype.hasOwnProperty.call(value, key);
+
+    /**
+     * Folder and file dictionaries are populated from persisted JSON. Keeping
+     * them prototype-free means ids such as "toString" can never masquerade as
+     * records through Object.prototype, even before schema validation runs.
+     */
+    function safeRecordMap(source) {
+        const result = Object.create(null);
+        if (!source || typeof source !== 'object' || Array.isArray(source)) return result;
+        Object.keys(source).forEach(key => { result[key] = source[key]; });
+        return result;
+    }
+
+    function hasRecord(map, key) {
+        return typeof key === 'string' && Boolean(key) && hasOwn(map, key);
+    }
+
     function emptyFolder(id, name, origin) {
         const now = new Date().toISOString();
+        const normalizedOrigin = String(origin || 'created');
         return {
             id: String(id),
             name: String(name),
-            origin: String(origin || 'created'),
+            origin: normalizedOrigin,
             createdAt: now,
-            updatedAt: now
+            updatedAt: now,
+            importState: normalizedOrigin === 'imported' ? 'importing' : 'complete',
+            importedCount: 0,
+            importError: ''
         };
     }
 
     function emptyStore() {
-        const folders = {};
+        const folders = safeRecordMap();
         folders[DEFAULT_FOLDER_ID] = emptyFolder(DEFAULT_FOLDER_ID, 'Blueprint project', 'default');
         return {
-            version: 2,
+            version: STORE_VERSION,
+            // Monotonic compare-and-swap token. Separate app windows can share
+            // localStorage; refusing a stale write is safer than silently
+            // replacing a newer project's files or run checkpoints.
+            revision: 0,
+            commitId: '',
             folders,
-            files: {},
+            files: safeRecordMap(),
             runs: [],
             openPath: '',
+            openFolderId: '',
             activeRunId: '',
             activeFolderId: DEFAULT_FOLDER_ID
         };
     }
 
     /**
-     * Bring a v1 store (flat files, no folders) forward to v2. Existing documents
-     * and runs land in the default folder, so upgrading cannot lose work. Runs are
-     * not folder-scoped: a run describes work on an idea, and its documents carry
-     * their own folder.
+     * Bring older stores forward without rewriting their file bodies. v1 files
+     * had no folder and land in the default root; v2 already had folders but used
+     * paths as storage keys. v3 keeps those legacy keys and allocates a qualified
+     * key only when two roots contain the same relative path.
      */
     function migrateStore(parsed, store) {
         const incomingFolders = parsed.folders && typeof parsed.folders === 'object' ? parsed.folders : null;
@@ -314,26 +438,509 @@
             Object.keys(incomingFolders).forEach(id => {
                 const folder = incomingFolders[id];
                 if (!folder || typeof folder !== 'object') return;
-                store.folders[id] = Object.assign(emptyFolder(id, folder.name || id, folder.origin), {
-                    createdAt: typeof folder.createdAt === 'string' ? folder.createdAt : store.folders[id].createdAt,
-                    updatedAt: typeof folder.updatedAt === 'string' ? folder.updatedAt : store.folders[id].updatedAt
+                const base = emptyFolder(id, folder.name || id, folder.origin);
+                store.folders[id] = Object.assign(base, {
+                    createdAt: typeof folder.createdAt === 'string' ? folder.createdAt : base.createdAt,
+                    updatedAt: typeof folder.updatedAt === 'string' ? folder.updatedAt : base.updatedAt,
+                    // A persisted "importing" marker belongs to an operation that
+                    // did not reach its final commit (crash/reload). Never present
+                    // that partial root as a completed import on the next load.
+                    importState: folder.importState === 'importing'
+                        ? 'incomplete'
+                        : (folder.importState === 'incomplete' ? 'incomplete' : 'complete'),
+                    importedCount: Math.max(0, Number(folder.importedCount) || 0),
+                    importError: folder.importState === 'importing'
+                        ? 'The prior folder import was interrupted before completion.'
+                        : String(folder.importError || '')
                 });
             });
         }
         // The default folder must always exist, even if a hand-edited store dropped it.
-        if (!store.folders[DEFAULT_FOLDER_ID]) {
+        if (!hasRecord(store.folders, DEFAULT_FOLDER_ID)) {
             store.folders[DEFAULT_FOLDER_ID] = emptyFolder(DEFAULT_FOLDER_ID, 'Blueprint project', 'default');
         }
         return store;
     }
 
+    function normalizePersistedRun(rawRun, targetStore, fallbackFolderId, schemaVersion, runFolderById) {
+        if (!rawRun || typeof rawRun !== 'object') return null;
+        const run = Object.assign({}, rawRun);
+        const records = Object.keys(targetStore.files)
+            .map(key => targetStore.files[key])
+            .filter(record => record && typeof record === 'object');
+        const writtenPaths = Array.isArray(run.writtenPaths)
+            ? run.writtenPaths.map(path => cleanFilePath(String(path))).filter(Boolean)
+            : (Array.isArray(run.writtenFiles)
+                ? run.writtenFiles.map(item => cleanFilePath(String((item && item.path) || ''))).filter(Boolean)
+                : []);
+
+        let folderId = typeof run.folderId === 'string' && run.folderId ? run.folderId : '';
+        if (!folderId && Number(schemaVersion || 1) < 3) {
+            const candidates = new Set();
+            records.forEach(record => {
+                if (run.id && record.runId === run.id && record.folder) candidates.add(record.folder);
+            });
+            writtenPaths.forEach(path => {
+                const matches = records.filter(record => record.path === path);
+                if (matches.length === 1 && matches[0].folder) candidates.add(matches[0].folder);
+            });
+            folderId = candidates.size === 1 ? [...candidates][0] : fallbackFolderId;
+        }
+        run.folderId = folderId || DEFAULT_FOLDER_ID;
+        run.rootMissing = !targetStore.folders[run.folderId];
+
+        const priorRefs = Array.isArray(run.writtenFiles)
+            ? run.writtenFiles.map(item => item && typeof item === 'object'
+                ? Object.assign({}, item, { path: cleanFilePath(String(item.path || '')) })
+                : item)
+            : [];
+        const legacyCrossRootFiles = [];
+        run.writtenFiles = writtenPaths.map(path => {
+            const prior = priorRefs.find(item => item && item.path === path);
+            const matches = records.filter(record => record.path === path);
+            const inRunRoot = matches.find(record => record.folder === run.folderId);
+            const resolvedOwner = String((inRunRoot && inRunRoot.folder)
+                || (prior && prior.folderId)
+                || (matches.length === 1 && matches[0].folder)
+                || run.folderId);
+            if (Number(schemaVersion || 1) < 3 && resolvedOwner !== run.folderId) {
+                legacyCrossRootFiles.push({ path, folderId: resolvedOwner });
+                return null;
+            }
+            return { path, folderId: run.folderId };
+        }).filter(Boolean);
+        run.writtenPaths = run.writtenFiles.map(ref => ref.path);
+        if (legacyCrossRootFiles.length) {
+            // Preserve the old ambiguous evidence as audit metadata without
+            // advertising it as a mutable v3 artifact handle.
+            run.legacyCrossRootFiles = legacyCrossRootFiles.slice(0, 100);
+        }
+        if (Array.isArray(run.reviews)) {
+            run.reviews = run.reviews.map(review => {
+                if (Number(schemaVersion || 1) < 3 && review && review.folderId
+                    && String(review.folderId) !== run.folderId) return null;
+                const path = cleanFilePath(String((review && review.path) || ''));
+                if (!path) return null;
+                return Object.assign({}, review, { path, folderId: run.folderId });
+            }).filter(Boolean);
+        }
+        if (Array.isArray(run.phases)) {
+            run.phases.forEach(step => {
+                if (step && step.reviewPath) {
+                    step.reviewPath = cleanFilePath(String(step.reviewPath));
+                    step.reviewFolderId = run.folderId;
+                }
+            });
+        }
+        for (const field of ['messages', 'transcript']) {
+            if (!Array.isArray(run[field])) continue;
+            run[field] = run[field].filter(message => message && typeof message === 'object')
+                .map(message => {
+                    const copy = Object.assign({}, message);
+                    const referencedFolderId = runFolderById && copy.runId
+                        ? String(runFolderById.get(String(copy.runId)) || '') : '';
+                    const explicitFolderId = typeof copy.folderId === 'string'
+                        && targetStore.folders[copy.folderId] ? copy.folderId : '';
+                    // A run transcript intentionally carries earlier assistant
+                    // cards. Their artifacts still belong to the earlier run's
+                    // root; coercing every card to the enclosing/new run corrupts
+                    // links and makes a normal A -> B conversation fail v3.
+                    const messageFolderId = referencedFolderId
+                        || explicitFolderId
+                        || run.folderId;
+                    if (Array.isArray(copy.paths)) {
+                        copy.paths = copy.paths.map(path => cleanFilePath(String(path || ''))).filter(Boolean);
+                    }
+                    if (Array.isArray(copy.writtenFiles)) {
+                        copy.writtenFiles = copy.writtenFiles.map(ref => {
+                            const path = cleanFilePath(String((ref && ref.path) || ''));
+                            const refFolderId = ref && typeof ref.folderId === 'string'
+                                && targetStore.folders[ref.folderId]
+                                ? ref.folderId : messageFolderId;
+                            return path ? { path, folderId: refFolderId } : null;
+                        }).filter(Boolean);
+                    }
+                    if (copy.targetPath !== undefined) {
+                        const targetPath = cleanFilePath(String(copy.targetPath || ''));
+                        if (targetPath) {
+                            copy.targetPath = targetPath;
+                            copy.targetFolderId = typeof copy.targetFolderId === 'string'
+                                && targetStore.folders[copy.targetFolderId]
+                                ? copy.targetFolderId : messageFolderId;
+                        } else {
+                            delete copy.targetPath;
+                            delete copy.targetFolderId;
+                        }
+                    }
+                    if (copy.folderId !== undefined || copy.paths || copy.writtenFiles) {
+                        copy.folderId = messageFolderId;
+                    }
+                    return copy;
+                });
+        }
+        return run;
+    }
+
+    function persistedStoreValidationError(parsed, options) {
+        const validationOptions = options && typeof options === 'object' ? options : {};
+        const isRecord = value => Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+        const dangerousKeys = new Set(['__proto__', 'prototype', 'constructor']);
+        const reservedIdentifierKeys = new Set([
+            ...Object.getOwnPropertyNames(Object.prototype),
+            '__proto__',
+            'prototype'
+        ]);
+        const stack = [parsed];
+        let inspectedNodes = 0;
+        while (stack.length) {
+            const node = stack.pop();
+            if (!node || typeof node !== 'object') continue;
+            inspectedNodes += 1;
+            if (inspectedNodes > 50000) return 'The saved project store is too structurally complex to validate safely.';
+            for (const key of Object.keys(node)) {
+                if (dangerousKeys.has(key)) {
+                    return `The saved project store contains unsafe object key "${key}".`;
+                }
+                const child = node[key];
+                if (child && typeof child === 'object') stack.push(child);
+            }
+        }
+        if (parsed.version !== undefined) {
+            if (!Number.isSafeInteger(parsed.version) || parsed.version < 1) {
+                return 'The saved project store has an invalid schema version.';
+            }
+            if (parsed.version > STORE_VERSION) {
+                return `The saved project store uses newer unsupported schema version ${parsed.version}.`;
+            }
+        }
+        const schemaVersion = Number.isSafeInteger(parsed.version) && parsed.version > 0
+            ? parsed.version : 1;
+        if (parsed.revision !== undefined
+            && (!Number.isSafeInteger(parsed.revision) || parsed.revision < 0)) {
+            return 'The saved project store has an invalid revision.';
+        }
+        if (parsed.commitId !== undefined && typeof parsed.commitId !== 'string') {
+            return 'The saved project store has an invalid commit identity.';
+        }
+        const folders = parsed.folders;
+        if (folders !== undefined && !isRecord(folders)) return 'The saved project folder map is malformed.';
+        const folderIds = new Set([DEFAULT_FOLDER_ID]);
+        if (folders) {
+            for (const id of Object.keys(folders)) {
+                if (!id || reservedIdentifierKeys.has(id)) {
+                    return `The saved project contains unsafe project-root id "${id}".`;
+                }
+                const folder = folders[id];
+                if (!isRecord(folder)) return `The saved project folder "${id}" is malformed.`;
+                if (folder.id !== undefined && typeof folder.id !== 'string') {
+                    return `The saved project folder "${id}" has an invalid id.`;
+                }
+                if (folder.name !== undefined && typeof folder.name !== 'string') {
+                    return `The saved project folder "${id}" has an invalid name.`;
+                }
+                folderIds.add(id);
+            }
+        }
+
+        for (const field of ['activeFolderId', 'openFolderId']) {
+            if (parsed[field] !== undefined && typeof parsed[field] !== 'string') {
+                return `The saved project has an invalid ${field}.`;
+            }
+            if (parsed[field] && !folderIds.has(parsed[field])) {
+                return `The saved project ${field} references a missing project root.`;
+            }
+        }
+        for (const field of ['openPath', 'activeRunId']) {
+            if (parsed[field] !== undefined && typeof parsed[field] !== 'string') {
+                return `The saved project has an invalid ${field}.`;
+            }
+        }
+
+        if (parsed.files !== undefined && !isRecord(parsed.files)) {
+            return 'The saved project file map is malformed.';
+        }
+        const fileIdentities = new Set();
+        const fileRunReferences = [];
+        if (parsed.files) {
+            for (const key of Object.keys(parsed.files)) {
+                const record = parsed.files[key];
+                if (!isRecord(record)) return `The saved project file record "${key}" is malformed.`;
+                if (typeof record.content !== 'string') {
+                    return `The saved project file record "${key}" has invalid content.`;
+                }
+                if (record.path !== undefined && typeof record.path !== 'string') {
+                    return `The saved project file record "${key}" has an invalid path.`;
+                }
+                const rawPath = record.path !== undefined ? record.path : key;
+                const canonicalPath = cleanFilePath(rawPath);
+                if (!canonicalPath) return `The saved project file record "${key}" has an empty or unsafe path.`;
+                if (schemaVersion >= 2 && canonicalPath !== rawPath) {
+                    return `The saved project file record "${key}" has a non-canonical path.`;
+                }
+                if (schemaVersion >= 2 && typeof record.folder !== 'string') {
+                    return `The saved project file record "${key}" has lost its project-root owner.`;
+                }
+                if (record.folder !== undefined) {
+                    if (typeof record.folder !== 'string' || !folderIds.has(record.folder)) {
+                        return `The saved project file record "${key}" references a missing project root.`;
+                    }
+                }
+                if (record.runId !== undefined && typeof record.runId !== 'string') {
+                    return `The saved project file record "${key}" has an invalid run owner.`;
+                }
+                if (record.runId) {
+                    fileRunReferences.push({
+                        key,
+                        runId: record.runId,
+                        folderId: String(record.folder || DEFAULT_FOLDER_ID)
+                    });
+                }
+                const identity = `${String(record.folder || DEFAULT_FOLDER_ID)}\u0000${canonicalPath}`;
+                if (fileIdentities.has(identity)) {
+                    return `The saved project contains duplicate file identity "${canonicalPath}" in one project root.`;
+                }
+                fileIdentities.add(identity);
+            }
+        }
+        if (schemaVersion >= 3) {
+            const openPath = String(parsed.openPath || '');
+            const openFolderId = String(parsed.openFolderId || '');
+            if (Boolean(openPath) !== Boolean(openFolderId)) {
+                return 'The saved project open file has lost part of its owner-qualified identity.';
+            }
+            if (openPath) {
+                const canonicalOpenPath = cleanFilePath(openPath);
+                if (canonicalOpenPath !== openPath
+                    || !fileIdentities.has(`${openFolderId}\u0000${canonicalOpenPath}`)) {
+                    return 'The saved project open file references a missing file identity.';
+                }
+            }
+        }
+
+        if (parsed.runs !== undefined && !Array.isArray(parsed.runs)) {
+            return 'The saved project run history is malformed.';
+        }
+        const persistedRuns = Array.isArray(parsed.runs) ? parsed.runs : [];
+        const runFolderById = new Map(persistedRuns
+            .filter(run => isRecord(run) && typeof run.id === 'string' && run.id
+                && typeof run.folderId === 'string' && run.folderId)
+            .map(run => [run.id, run.folderId]));
+        for (const reference of fileRunReferences) {
+            const runFolderId = runFolderById.get(reference.runId);
+            // Files may outlive a run removed by the 60-entry retention cap.
+            // When the referenced run is still present, however, its root is an
+            // immutable integrity boundary.
+            if (runFolderId && runFolderId !== reference.folderId) {
+                return `The saved project file record "${reference.key}" belongs to a run in another project root.`;
+            }
+        }
+        const runIds = new Set();
+        for (const run of persistedRuns) {
+            if (!isRecord(run) || typeof run.id !== 'string' || !run.id) {
+                return 'A saved project run record is malformed.';
+            }
+            if (runIds.has(run.id)) return `The saved project contains duplicate run id "${run.id}".`;
+            runIds.add(run.id);
+            if (run.folderId !== undefined && typeof run.folderId !== 'string') {
+                return `The saved run "${run.id}" has an invalid project-root owner.`;
+            }
+            if (schemaVersion >= 3 && (!run.folderId || typeof run.folderId !== 'string')) {
+                return `The saved run "${run.id}" has lost its project-root owner.`;
+            }
+            for (const field of ['phases', 'messages', 'answers', 'reviews', 'writtenPaths', 'pipeline', 'transcript']) {
+                if (run[field] !== undefined && !Array.isArray(run[field])) {
+                    return `The saved run "${run.id}" has malformed ${field}.`;
+                }
+            }
+            if (run.selectedOptions !== undefined && run.selectedOptions !== null
+                && !Array.isArray(run.selectedOptions)) {
+                return `The saved run "${run.id}" has malformed selectedOptions.`;
+            }
+            if (run.transcriptMode !== undefined && run.transcriptMode !== 'run-local-v1') {
+                return `The saved run "${run.id}" has an unknown transcript storage mode.`;
+            }
+            if (run.contextRunId !== undefined && typeof run.contextRunId !== 'string') {
+                return `The saved run "${run.id}" has an invalid transcript parent.`;
+            }
+            for (const field of ['messages', 'transcript']) {
+                for (const message of (Array.isArray(run[field]) ? run[field] : [])) {
+                    if (!isRecord(message)) return `The saved run "${run.id}" has a malformed ${field} item.`;
+                    const referencedFolderId = typeof message.runId === 'string'
+                        ? String(runFolderById.get(message.runId) || '') : '';
+                    for (const ownerField of ['folderId', 'targetFolderId']) {
+                        if (message[ownerField] !== undefined
+                            && typeof message[ownerField] !== 'string') {
+                            return `The saved run "${run.id}" has invalid ${field} ${ownerField}.`;
+                        }
+                        if (schemaVersion >= 3 && message[ownerField]
+                            && !folderIds.has(message[ownerField])
+                            && message[ownerField] !== referencedFolderId) {
+                            return `The saved run "${run.id}" has a ${field} reference to a missing project root.`;
+                        }
+                    }
+                    const messageFolderId = String(message.folderId
+                        || referencedFolderId
+                        || run.folderId);
+                    if (schemaVersion >= 3 && referencedFolderId
+                        && messageFolderId !== referencedFolderId) {
+                        return `The saved run "${run.id}" has a ${field} card whose run and root owners disagree.`;
+                    }
+                    if (schemaVersion >= 3 && message.runId === run.id
+                        && messageFolderId !== run.folderId) {
+                        return `The saved run "${run.id}" has a cross-root ${field} reference.`;
+                    }
+                    if (schemaVersion >= 3 && message.targetPath
+                        && message.targetFolderId !== messageFolderId) {
+                        return `The saved run "${run.id}" has a ${field} target outside its owning project root.`;
+                    }
+                    if (message.targetPath !== undefined && (typeof message.targetPath !== 'string'
+                        || !cleanFilePath(message.targetPath)
+                        || (schemaVersion >= 3 && cleanFilePath(message.targetPath) !== message.targetPath))) {
+                        return `The saved run "${run.id}" has an invalid ${field} target path.`;
+                    }
+                    if (message.paths !== undefined && (!Array.isArray(message.paths)
+                        || message.paths.some(path => typeof path !== 'string' || !cleanFilePath(path)
+                            || (schemaVersion >= 3 && cleanFilePath(path) !== path)))) {
+                        return `The saved run "${run.id}" has malformed ${field} paths.`;
+                    }
+                    if (message.writtenFiles !== undefined && !Array.isArray(message.writtenFiles)) {
+                        return `The saved run "${run.id}" has malformed ${field} file references.`;
+                    }
+                    for (const ref of (Array.isArray(message.writtenFiles) ? message.writtenFiles : [])) {
+                        if (!isRecord(ref) || typeof ref.path !== 'string' || !cleanFilePath(ref.path)
+                            || (schemaVersion >= 3 && cleanFilePath(ref.path) !== ref.path)
+                            || (schemaVersion >= 3 && ref.folderId !== messageFolderId)) {
+                            return `The saved run "${run.id}" has an invalid ${field} file reference.`;
+                        }
+                    }
+                    if (message.steps !== undefined && (!Array.isArray(message.steps)
+                        || message.steps.some(step => !isRecord(step)))) {
+                        return `The saved run "${run.id}" has malformed ${field} steps.`;
+                    }
+                }
+            }
+            for (const writtenPath of (Array.isArray(run.writtenPaths) ? run.writtenPaths : [])) {
+                if (typeof writtenPath !== 'string' || !cleanFilePath(writtenPath)
+                    || cleanFilePath(writtenPath) !== writtenPath) {
+                    return `The saved run "${run.id}" has an invalid written path.`;
+                }
+            }
+            if (run.writtenFiles !== undefined && !Array.isArray(run.writtenFiles)) {
+                return `The saved run "${run.id}" has malformed file references.`;
+            }
+            for (const ref of (Array.isArray(run.writtenFiles) ? run.writtenFiles : [])) {
+                if (!isRecord(ref) || typeof ref.path !== 'string'
+                    || (ref.folderId !== undefined && typeof ref.folderId !== 'string')) {
+                    return `The saved run "${run.id}" has an invalid file reference.`;
+                }
+                if (!cleanFilePath(ref.path)
+                    || (schemaVersion >= 3 && cleanFilePath(ref.path) !== ref.path)) {
+                    return `The saved run "${run.id}" has a non-canonical file reference.`;
+                }
+                if (schemaVersion >= 3 && (!ref.folderId || ref.folderId !== run.folderId)) {
+                    return `The saved run "${run.id}" has a file reference outside its project root.`;
+                }
+            }
+            for (const review of (Array.isArray(run.reviews) ? run.reviews : [])) {
+                if (!isRecord(review) || typeof review.path !== 'string'
+                    || !cleanFilePath(review.path)
+                    || (schemaVersion >= 3 && cleanFilePath(review.path) !== review.path)
+                    || (schemaVersion >= 3 && review.folderId !== run.folderId)) {
+                    return `The saved run "${run.id}" has an invalid review reference.`;
+                }
+                if (review.ok !== undefined && typeof review.ok !== 'boolean') {
+                    return `The saved run "${run.id}" has an invalid review result.`;
+                }
+                for (const field of ['requiredSections', 'required', 'missing', 'placeholders', 'thin']) {
+                    if (review[field] !== undefined && (!Array.isArray(review[field])
+                        || review[field].some(value => typeof value !== 'string'))) {
+                        return `The saved run "${run.id}" has malformed review ${field}.`;
+                    }
+                }
+            }
+            for (const phase of (Array.isArray(run.phases) ? run.phases : [])) {
+                if (!isRecord(phase)) return `The saved run "${run.id}" has a malformed phase.`;
+                if (phase.reviewPath !== undefined && (typeof phase.reviewPath !== 'string'
+                    || !cleanFilePath(phase.reviewPath)
+                    || (schemaVersion >= 3 && cleanFilePath(phase.reviewPath) !== phase.reviewPath)
+                    || (schemaVersion >= 3 && phase.reviewFolderId !== run.folderId))) {
+                    return `The saved run "${run.id}" has an invalid phase review reference.`;
+                }
+                if (phase.requiredSections !== undefined && (!Array.isArray(phase.requiredSections)
+                    || phase.requiredSections.some(value => typeof value !== 'string'))) {
+                    return `The saved run "${run.id}" has malformed phase requiredSections.`;
+                }
+            }
+            for (const item of (Array.isArray(run.pipeline) ? run.pipeline : [])) {
+                if (!isRecord(item)) return `The saved run "${run.id}" has a malformed pipeline item.`;
+            }
+        }
+        const persistedRunById = new Map(persistedRuns.map(run => [run.id, run]));
+        for (const run of persistedRuns) {
+            if (run.transcriptMode !== 'run-local-v1' || !run.contextRunId) continue;
+            if (run.contextRunId === run.id) {
+                return `The saved run "${run.id}" points its transcript at itself.`;
+            }
+            const parent = persistedRunById.get(run.contextRunId);
+            // A missing parent is valid after explicit history deletion or the
+            // 60-run retention cap. An existing parent must never cross roots.
+            if (parent && String(parent.folderId || '') !== String(run.folderId || '')) {
+                return `The saved run "${run.id}" has a cross-root transcript parent.`;
+            }
+            const visited = new Set([run.id]);
+            let cursor = parent;
+            while (cursor && cursor.transcriptMode === 'run-local-v1' && cursor.contextRunId) {
+                if (visited.has(cursor.id)) {
+                    return `The saved run "${run.id}" has a cyclic transcript chain.`;
+                }
+                visited.add(cursor.id);
+                cursor = persistedRunById.get(cursor.contextRunId);
+            }
+        }
+        if (validationOptions.requireSelectionOwnership && parsed.activeRunId) {
+            const selectedRun = persistedRuns.find(run => run && run.id === parsed.activeRunId);
+            const activeRunFolderId = selectedRun && runFolderById.get(parsed.activeRunId);
+            if (!selectedRun || !activeRunFolderId) {
+                return 'The saved project activeRunId references a missing run.';
+            }
+            // Runs outlive a deleted project root so their transcript remains
+            // auditable. A terminal orphan may be selected read-only while the
+            // live tree stays on a valid root; a still-existing foreign root may
+            // never be paired with the selected transcript.
+            const terminalOrphan = !folderIds.has(activeRunFolderId)
+                && selectedRun.status !== 'running';
+            if (activeRunFolderId !== parsed.activeFolderId && !terminalOrphan) {
+                return 'The saved project active run belongs to a different project root.';
+            }
+        }
+        return '';
+    }
+
+    let projectStoreLoadError = '';
+
     function readStore() {
         const store = emptyStore();
         try {
             const raw = window.localStorage.getItem(PROJECTS_KEY);
-            if (!raw) return store;
+            if (!raw) {
+                projectStoreLoadError = '';
+                return store;
+            }
             const parsed = JSON.parse(raw);
-            if (!parsed || typeof parsed !== 'object') return store;
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                projectStoreLoadError = 'The saved project store is malformed.';
+                return store;
+            }
+            const validationError = persistedStoreValidationError(parsed);
+            if (validationError) {
+                projectStoreLoadError = validationError;
+                return store;
+            }
+            projectStoreLoadError = '';
+
+            store.revision = Number.isSafeInteger(parsed.revision) && parsed.revision >= 0
+                ? parsed.revision : 0;
+            store.commitId = typeof parsed.commitId === 'string' ? parsed.commitId : '';
 
             migrateStore(parsed, store);
 
@@ -342,22 +949,74 @@
                     const record = parsed.files[path];
                     if (!record || typeof record !== 'object') return;
                     // v1 records have no folder: file them into the default folder.
-                    const folder = typeof record.folder === 'string' && store.folders[record.folder]
+                    const folder = typeof record.folder === 'string' && hasRecord(store.folders, record.folder)
                         ? record.folder
                         : DEFAULT_FOLDER_ID;
-                    store.files[path] = Object.assign({}, record, {
-                        path: typeof record.path === 'string' ? record.path : path,
+                    const canonicalPath = cleanFilePath(
+                        typeof record.path === 'string' ? record.path : path);
+                    let storageKey = canonicalPath;
+                    if (hasRecord(store.files, storageKey)) {
+                        const base = `${folder}::${canonicalPath}`;
+                        storageKey = base;
+                        let suffix = 2;
+                        while (hasRecord(store.files, storageKey)) {
+                            storageKey = `${base}::${suffix}`;
+                            suffix += 1;
+                        }
+                    }
+                    store.files[storageKey] = Object.assign({}, record, {
+                        path: canonicalPath,
                         content: typeof record.content === 'string' ? record.content : '',
                         folder
                     });
                 });
             }
-            if (Array.isArray(parsed.runs)) store.runs = parsed.runs.slice(0, 60);
-            store.openPath = typeof parsed.openPath === 'string' ? parsed.openPath : '';
+            store.openPath = typeof parsed.openPath === 'string'
+                ? cleanFilePath(parsed.openPath) : '';
             store.activeRunId = typeof parsed.activeRunId === 'string' ? parsed.activeRunId : '';
             const wantedFolder = typeof parsed.activeFolderId === 'string' ? parsed.activeFolderId : '';
-            store.activeFolderId = store.folders[wantedFolder] ? wantedFolder : DEFAULT_FOLDER_ID;
-        } catch (_) { /* corrupt store starts empty */ }
+            store.activeFolderId = hasRecord(store.folders, wantedFolder) ? wantedFolder : DEFAULT_FOLDER_ID;
+            const wantedOpenFolder = typeof parsed.openFolderId === 'string' ? parsed.openFolderId : '';
+            const openMatches = Object.keys(store.files)
+                .map(key => store.files[key])
+                .filter(record => record && record.path === store.openPath);
+            const legacyOpen = openMatches.find(record => record.folder === store.activeFolderId)
+                || (openMatches.length === 1 ? openMatches[0] : null);
+            store.openFolderId = hasRecord(store.folders, wantedOpenFolder)
+                && openMatches.some(record => record.folder === wantedOpenFolder)
+                ? wantedOpenFolder
+                : String((legacyOpen && legacyOpen.folder) || '');
+            if (store.openPath && (!openMatches.length || !store.openFolderId)) {
+                store.openPath = '';
+                store.openFolderId = '';
+            }
+            if (Array.isArray(parsed.runs)) {
+                const runFolderById = new Map(parsed.runs
+                    .filter(run => run && typeof run === 'object'
+                        && typeof run.id === 'string' && run.id
+                        && typeof run.folderId === 'string' && run.folderId)
+                    .map(run => [run.id, run.folderId]));
+                store.runs = parsed.runs.slice(0, 60)
+                    .map(run => normalizePersistedRun(
+                        run, store, store.activeFolderId, Number(parsed.version) || 1, runFolderById
+                    ))
+                    .filter(Boolean);
+            }
+            if (store.activeRunId && !store.runs.some(run => run && run.id === store.activeRunId)) {
+                store.activeRunId = '';
+            }
+            const selectedRun = store.activeRunId
+                ? store.runs.find(run => run && run.id === store.activeRunId) : null;
+            // Older builds could persist folder and run selection independently.
+            // On migration the explicit root wins; never hydrate another root's
+            // transcript merely because both identifiers are individually valid.
+            if (selectedRun && hasRecord(store.folders, selectedRun.folderId)
+                && String(selectedRun.folderId || '') !== String(store.activeFolderId || '')) {
+                store.activeRunId = '';
+            }
+        } catch (error) {
+            projectStoreLoadError = `The saved project store could not be parsed (${String((error && error.message) || error)}).`;
+        }
         return store;
     }
 
@@ -384,6 +1043,14 @@
         return isDomNode(value) ? undefined : value;
     }
 
+    function clonePersistable(value) {
+        try {
+            return JSON.parse(JSON.stringify(value, withoutDomNodes));
+        } catch (_) {
+            return null;
+        }
+    }
+
     /**
      * Outcome of the most recent persistence attempt, so a failed write is
      * visible to the UI without changing what any mutator returns.
@@ -398,30 +1065,350 @@
         ok: true,
         failedAt: 0,
         failureCount: 0,
-        lastError: ''
+        lastError: '',
+        lastCode: ''
     };
 
-    function writeStore(store) {
+    let knownStoreRevision = 0;
+    let knownStoreCommitId = '';
+    let lastGoodStoreSnapshot = null;
+    let externalResetObserved = false;
+    const storeWriterId = uid('writer');
+    const RUN_LEASE_SYMBOL = Symbol('codalioBlueprintRunLease');
+    const STORE_LOCK_LEASE_MS = 30000;
+
+    /**
+     * Snapshot live writer intents. Per-writer keys plus a two-stage Bakery-style
+     * claim avoid the stale-read race of a single "check then set" lock: a writer
+     * that has started choosing is visible before it calculates priority.
+     */
+    function storeWriteIntents(now) {
+        const keys = [];
+        for (let index = 0; index < window.localStorage.length; index += 1) {
+            const key = window.localStorage.key(index);
+            if (key && key.indexOf(PROJECTS_WRITE_LOCK_PREFIX) === 0) keys.push(key);
+        }
+        const intents = [];
+        keys.forEach(key => {
+            let value = null;
+            try { value = JSON.parse(window.localStorage.getItem(key) || 'null'); } catch (_) { value = null; }
+            if (!value || !value.token || Number(value.expiresAt) <= now) {
+                try { window.localStorage.removeItem(key); } catch (_) { /* expiry is best-effort */ }
+                return;
+            }
+            intents.push(Object.assign({ key }, value));
+        });
+        return intents;
+    }
+
+    function ownsStoreWriteIntent(lease) {
         try {
-            window.localStorage.setItem(PROJECTS_KEY, JSON.stringify({
-                version: 2,
+            const current = JSON.parse(window.localStorage.getItem(lease.key) || 'null');
+            return Boolean(current && current.token === lease.token
+                && current.stage === 'waiting'
+                && Number(current.expiresAt) > Date.now());
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function hasPriorStoreWriter(lease) {
+        const now = Date.now();
+        return storeWriteIntents(now).some(intent => {
+            if (intent.key === lease.key && intent.token === lease.token) return false;
+            if (intent.stage === 'choosing') return true;
+            if (intent.stage !== 'waiting') return false;
+            const otherTicket = Number.isSafeInteger(intent.ticket) ? intent.ticket : 0;
+            if (otherTicket !== lease.ticket) return otherTicket < lease.ticket;
+            return String(intent.owner || '') < storeWriterId;
+        });
+    }
+
+    /**
+     * localStorage has no transaction primitive. This cooperative Bakery lease
+     * serializes Blueprint windows while preserving the existing synchronous API.
+     * A crashed writer cannot wedge the store because every intent expires.
+     */
+    function acquireStoreWriteLease() {
+        const token = `${storeWriterId}:${uid('commit')}`;
+        const key = `${PROJECTS_WRITE_LOCK_PREFIX}${encodeURIComponent(storeWriterId)}`;
+        const now = Date.now();
+        window.localStorage.setItem(key, JSON.stringify({
+            token,
+            owner: storeWriterId,
+            stage: 'choosing',
+            expiresAt: now + STORE_LOCK_LEASE_MS
+        }));
+        const maxTicket = storeWriteIntents(now).reduce((max, intent) => {
+            const ticket = Number.isSafeInteger(intent.ticket) && intent.ticket > 0 ? intent.ticket : 0;
+            return Math.max(max, ticket);
+        }, 0);
+        const ticket = Math.min(Number.MAX_SAFE_INTEGER - 1, maxTicket + 1);
+        const lease = { key, token, ticket, expiresAt: now + STORE_LOCK_LEASE_MS };
+        window.localStorage.setItem(key, JSON.stringify({
+            token,
+            owner: storeWriterId,
+            stage: 'waiting',
+            ticket,
+            acquiredAt: now,
+            expiresAt: lease.expiresAt
+        }));
+        if (!ownsStoreWriteIntent(lease) || hasPriorStoreWriter(lease)) {
+            releaseStoreWriteLease(lease);
+            return Object.assign(lease, {
+                ok: false,
+                reason: 'Another Blueprint window is currently saving project data.'
+            });
+        }
+        lease.ok = true;
+        return lease;
+    }
+
+    function releaseStoreWriteLease(lease) {
+        if (!lease || !lease.key) return;
+        try {
+            const raw = window.localStorage.getItem(lease.key);
+            if (!raw) return;
+            const current = JSON.parse(raw);
+            if (current && current.token === lease.token) {
+                window.localStorage.removeItem(lease.key);
+            }
+        } catch (_) {
+            // A stale intent expires. Never delete a claim whose ownership cannot
+            // be established, because it may belong to another live window.
+        }
+    }
+
+    function withStorageWriteLease(callback) {
+        if (typeof callback !== 'function') return false;
+        let lease = null;
+        try {
+            lease = acquireStoreWriteLease();
+            if (!lease.ok) return false;
+            return callback(lease);
+        } catch (error) {
+            console.warn('[codalio-blueprint] storage transaction failed', error);
+            return false;
+        } finally {
+            if (lease && lease.ok) releaseStoreWriteLease(lease);
+        }
+    }
+
+    let authoritativeReloadTimer = null;
+    let authoritativeWorkspaceReloadTimer = null;
+    function scheduleAuthoritativeStoreReload(reason) {
+        if (authoritativeReloadTimer) return;
+        authoritativeReloadTimer = setTimeout(() => {
+            authoritativeReloadTimer = null;
+            try {
+                window.dispatchEvent(new CustomEvent('codalio-blueprint-store-change', {
+                    detail: {
+                        reason: String(reason || 'external-change'),
+                        recovery: storageRecoveryState()
+                    }
+                }));
+            } catch (_) { /* controller refresh is best-effort */ }
+        }, 0);
+    }
+
+    function scheduleAuthoritativeWorkspaceReload(reason) {
+        if (authoritativeWorkspaceReloadTimer) return;
+        authoritativeWorkspaceReloadTimer = setTimeout(() => {
+            authoritativeWorkspaceReloadTimer = null;
+            try {
+                window.dispatchEvent(new CustomEvent('codalio-blueprint-workspace-change', {
+                    detail: {
+                        reason: String(reason || 'external-workspace-update'),
+                        recovery: storageRecoveryState()
+                    }
+                }));
+            } catch (_) { /* controller refresh is best-effort */ }
+        }, 0);
+    }
+
+    /** Reload only at a controller-approved safe point, never under a live run. */
+    function reloadStoreFromStorage() {
+        const authoritative = readStore();
+        if (projectStoreLoadError) {
+            persistence.ok = false;
+            persistence.failedAt = Date.now();
+            persistence.failureCount += 1;
+            persistence.lastCode = 'corrupt-store';
+            persistence.lastError = projectStoreLoadError;
+            return false;
+        }
+        assignStoreState(authoritative);
+        knownStoreRevision = store.revision;
+        knownStoreCommitId = store.commitId;
+        lastGoodStoreSnapshot = clonePersistable(store);
+        // Reaching this controller-approved safe point means no live operation
+        // can resurrect the pre-reset snapshot. New work may start from the now
+        // authoritative empty store without requiring a full page reload.
+        externalResetObserved = false;
+        persistence.ok = true;
+        persistence.lastCode = '';
+        persistence.lastError = '';
+        return true;
+    }
+
+    function recordPersistenceFailure(error, code) {
+        persistence.ok = false;
+        persistence.failedAt = Date.now();
+        persistence.failureCount += 1;
+        persistence.lastCode = String(code || 'storage-write-failed');
+        persistence.lastError = String((error && error.message) || error || 'unknown storage error');
+        console.warn('[codalio-blueprint] unable to persist project state', error);
+    }
+
+    function writeStore(store, options) {
+        const borrowedLease = options && options.transactionLease
+            ? options.transactionLease : null;
+        let lease = borrowedLease;
+        try {
+            if (externalResetObserved && !(options && options.allowMissingReset === true)) {
+                recordPersistenceFailure(new Error(
+                    'Project data was erased in another window. Reload or use Clear all data before saving again.'
+                ), 'external-reset');
+                return false;
+            }
+            if (projectStoreLoadError && !(options && options.allowCorruptReset === true)) {
+                recordPersistenceFailure(new Error(
+                    `${projectStoreLoadError} Blueprint preserved the original data and will not overwrite it; use Clear all data to reset explicitly.`
+                ), 'corrupt-store');
+                return false;
+            }
+            if (!lease) lease = acquireStoreWriteLease();
+            if (!lease.ok || !ownsStoreWriteIntent(lease) || hasPriorStoreWriter(lease)) {
+                recordPersistenceFailure(new Error(lease.reason), 'store-busy');
+                return false;
+            }
+            const raw = window.localStorage.getItem(PROJECTS_KEY);
+            if (raw) {
+                let currentRevision = 0;
+                let currentCommitId = '';
+                let current = null;
+                let currentError = '';
+                try {
+                    current = JSON.parse(raw);
+                    if (!current || typeof current !== 'object' || Array.isArray(current)) {
+                        currentError = 'The saved project store is malformed.';
+                    } else {
+                        currentError = persistedStoreValidationError(current);
+                    }
+                    currentRevision = Number.isSafeInteger(current && current.revision)
+                        && current.revision >= 0 ? current.revision : 0;
+                    currentCommitId = typeof (current && current.commitId) === 'string'
+                        ? current.commitId : '';
+                } catch (error) {
+                    currentError = `The saved project store could not be parsed (${String((error && error.message) || error)}).`;
+                }
+                if (currentError) {
+                    projectStoreLoadError = currentError;
+                    if (!(options && options.allowCorruptReset === true)) {
+                        recordPersistenceFailure(new Error(
+                            `${currentError} Blueprint preserved the original data and will not overwrite it; use Clear all data to reset explicitly.`
+                        ), 'corrupt-store');
+                        return false;
+                    }
+                    // Explicit recovery is authorized to replace bytes whose
+                    // revision cannot be trusted. Continue from this window's
+                    // last known valid revision rather than a malformed value.
+                    currentRevision = knownStoreRevision;
+                    currentCommitId = knownStoreCommitId;
+                }
+                if (currentRevision !== knownStoreRevision || currentCommitId !== knownStoreCommitId) {
+                    const conflict = new Error('Project data changed in another window. Reload before making more changes.');
+                    recordPersistenceFailure(conflict, 'concurrent-update');
+                    return false;
+                }
+            } else if (knownStoreRevision !== 0) {
+                if (options && options.allowMissingReset === true) {
+                    knownStoreRevision = 0;
+                    knownStoreCommitId = '';
+                } else {
+                    const conflict = new Error(
+                        'Project data was deleted in another window. Blueprint will reload the empty authoritative store instead of restoring stale files.'
+                    );
+                    externalResetObserved = true;
+                    recordPersistenceFailure(conflict, 'external-reset');
+                    scheduleAuthoritativeStoreReload('external-reset');
+                    return false;
+                }
+            }
+
+            if (options && typeof options.validateUnderLease === 'function') {
+                let valid = false;
+                try { valid = options.validateUnderLease(lease) === true; } catch (_) { valid = false; }
+                if (!valid) {
+                    recordPersistenceFailure(new Error(
+                        String(options.preconditionMessage
+                            || 'The project mutation lost its ownership precondition before commit.')
+                    ), String(options.preconditionCode || 'precondition-failed'));
+                    return false;
+                }
+            }
+
+            const nextRevision = knownStoreRevision + 1;
+            const commitId = lease.token;
+            const candidate = {
+                version: STORE_VERSION,
+                revision: nextRevision,
+                commitId,
                 folders: store.folders,
                 files: store.files,
                 runs: store.runs.slice(0, 60),
                 openPath: store.openPath,
+                openFolderId: store.openFolderId,
                 activeRunId: store.activeRunId,
                 activeFolderId: store.activeFolderId
-            }, withoutDomNodes));
+            };
+            const serialized = JSON.stringify(candidate, withoutDomNodes);
+            const serializedCandidate = JSON.parse(serialized);
+            const outgoingError = persistedStoreValidationError(serializedCandidate, {
+                requireSelectionOwnership: true
+            });
+            if (outgoingError) {
+                recordPersistenceFailure(new Error(
+                    `${outgoingError} Blueprint refused to write an unreadable project store.`
+                ), 'schema-invalid');
+                if (lastGoodStoreSnapshot) assignStoreState(lastGoodStoreSnapshot);
+                return false;
+            }
+            // JSON serialization is the longest synchronous part of a save. Re-
+            // validate after it so an expired or contended lease never reaches
+            // the project key.
+            if (!ownsStoreWriteIntent(lease) || hasPriorStoreWriter(lease)) {
+                recordPersistenceFailure(new Error(
+                    'Another Blueprint window acquired project-write priority before this save committed.'
+                ), 'store-busy');
+                return false;
+            }
+            window.localStorage.setItem(PROJECTS_KEY, serialized);
+            let committed = null;
+            try { committed = JSON.parse(window.localStorage.getItem(PROJECTS_KEY) || 'null'); } catch (_) { committed = null; }
+            if (!ownsStoreWriteIntent(lease) || !committed
+                || committed.revision !== nextRevision || committed.commitId !== commitId) {
+                recordPersistenceFailure(new Error(
+                    'Project data was replaced by another writer before this save could be verified.'
+                ), 'concurrent-update');
+                return false;
+            }
+            store.revision = nextRevision;
+            store.commitId = commitId;
+            knownStoreRevision = nextRevision;
+            knownStoreCommitId = commitId;
+            lastGoodStoreSnapshot = serializedCandidate;
             persistence.ok = true;
             persistence.lastError = '';
+            persistence.lastCode = '';
+            projectStoreLoadError = '';
+            if (options && options.allowMissingReset === true) externalResetObserved = false;
             return true;
         } catch (error) {
-            persistence.ok = false;
-            persistence.failedAt = Date.now();
-            persistence.failureCount += 1;
-            persistence.lastError = String((error && error.message) || error || 'unknown storage error');
-            console.warn('[codalio-blueprint] unable to persist project state', error);
+            recordPersistenceFailure(error, 'storage-write-failed');
             return false;
+        } finally {
+            if (!borrowedLease && lease && lease.ok) releaseStoreWriteLease(lease);
         }
     }
 
@@ -431,6 +1418,38 @@
     }
 
     const store = readStore();
+    knownStoreRevision = store.revision;
+    knownStoreCommitId = store.commitId;
+    lastGoodStoreSnapshot = clonePersistable(store);
+    if (projectStoreLoadError) {
+        persistence.ok = false;
+        persistence.failedAt = Date.now();
+        persistence.failureCount = 1;
+        persistence.lastCode = 'corrupt-store';
+        persistence.lastError = projectStoreLoadError;
+    }
+    if (typeof window.addEventListener === 'function') {
+        window.addEventListener('storage', event => {
+            if (!event || !event.key) return;
+            if (String(event.key).startsWith(RUN_OWNER_PREFIX)
+                || String(event.key).startsWith(PENDING_CANCEL_PREFIX)) {
+                try {
+                    window.dispatchEvent(new CustomEvent('codalio-blueprint-run-lease-change', {
+                        detail: { key: String(event.key) }
+                    }));
+                } catch (_) { /* controller reconciliation is best-effort */ }
+                return;
+            }
+            if (event.key === WORKSPACE_KEY) {
+                scheduleAuthoritativeWorkspaceReload(event.newValue === null
+                    ? 'external-workspace-reset' : 'external-workspace-update');
+                return;
+            }
+            if (event.key !== PROJECTS_KEY) return;
+            if (event.newValue === null) externalResetObserved = true;
+            scheduleAuthoritativeStoreReload(event.newValue === null ? 'external-reset' : 'external-update');
+        });
+    }
 
     // ------------------------------------------------------------------
     // Workspace (tab layout) persistence
@@ -440,20 +1459,125 @@
     // versa. workspace.js owns normalization; core only stores the raw object.
     // ------------------------------------------------------------------
 
+    let workspaceLoadError = '';
+    let knownWorkspaceRevision = 0;
+    let knownWorkspaceCommitId = '';
+    let workspaceRevisionKnown = false;
+
+    function persistedWorkspaceValidationError(parsed) {
+        const version = parsed.version === undefined ? 1 : parsed.version;
+        if (!Number.isSafeInteger(version) || version < 1) {
+            return 'The saved tab layout has an invalid schema version.';
+        }
+        if (version > 2) {
+            return `The saved tab layout uses newer unsupported schema version ${version}.`;
+        }
+        if (parsed.revision !== undefined
+            && (!Number.isSafeInteger(parsed.revision) || parsed.revision < 0)) {
+            return 'The saved tab layout has an invalid revision.';
+        }
+        if (parsed.commitId !== undefined && typeof parsed.commitId !== 'string') {
+            return 'The saved tab layout has an invalid commit identity.';
+        }
+        if (Number(parsed.revision) > 0 && !String(parsed.commitId || '')) {
+            return 'The saved tab layout is missing its commit identity.';
+        }
+        if (parsed.tabs !== undefined && !Array.isArray(parsed.tabs)) {
+            return 'The saved tab layout has a malformed tab collection.';
+        }
+        const tabs = Array.isArray(parsed.tabs) ? parsed.tabs : [];
+        if (tabs.length > 1000) return 'The saved tab layout contains too many tabs to validate safely.';
+        for (const tab of tabs) {
+            if (!tab || typeof tab !== 'object' || Array.isArray(tab)) {
+                return 'The saved tab layout contains a malformed tab.';
+            }
+            if (tab.kind === 'file') {
+                if (typeof tab.path !== 'string' || !cleanFilePath(tab.path)) {
+                    return 'The saved tab layout contains a file tab with an invalid path.';
+                }
+                if (version >= 2 && cleanFilePath(tab.path) !== tab.path) {
+                    return 'The saved tab layout contains a file tab with a non-canonical path.';
+                }
+                if (version >= 2 && (typeof tab.folderId !== 'string' || !tab.folderId)) {
+                    return 'The saved tab layout contains a file tab without its project-root owner.';
+                }
+            }
+        }
+        return '';
+    }
+
     function readWorkspaceRaw() {
         try {
             const raw = window.localStorage.getItem(WORKSPACE_KEY);
-            if (!raw) return null;
+            if (!raw) {
+                workspaceLoadError = '';
+                knownWorkspaceRevision = 0;
+                knownWorkspaceCommitId = '';
+                workspaceRevisionKnown = true;
+                return null;
+            }
             const parsed = JSON.parse(raw);
-            return (parsed && typeof parsed === 'object') ? parsed : null;
-        } catch (_) {
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                workspaceLoadError = 'The saved tab layout is malformed.';
+                return null;
+            }
+            const validationError = persistedWorkspaceValidationError(parsed);
+            if (validationError) {
+                workspaceLoadError = validationError;
+                return null;
+            }
+            workspaceLoadError = '';
+            knownWorkspaceRevision = Number.isSafeInteger(parsed.revision) ? parsed.revision : 0;
+            knownWorkspaceCommitId = typeof parsed.commitId === 'string' ? parsed.commitId : '';
+            workspaceRevisionKnown = true;
+            return parsed;
+        } catch (error) {
+            workspaceLoadError = `The saved tab layout could not be parsed (${String((error && error.message) || error)}).`;
             return null;
         }
     }
 
-    function saveWorkspace(workspace) {
+    function saveWorkspace(workspace, options) {
         if (!workspace || typeof workspace !== 'object') return false;
+        const borrowedLease = options && options.transactionLease
+            ? options.transactionLease : null;
+        let lease = borrowedLease;
         try {
+            const rawBefore = window.localStorage.getItem(WORKSPACE_KEY);
+            let current = null;
+            let currentError = '';
+            if (rawBefore) {
+                try {
+                    current = JSON.parse(rawBefore);
+                    if (!current || typeof current !== 'object' || Array.isArray(current)) {
+                        currentError = 'The saved tab layout is malformed.';
+                    } else currentError = persistedWorkspaceValidationError(current);
+                } catch (error) {
+                    currentError = `The saved tab layout could not be parsed (${String((error && error.message) || error)}).`;
+                }
+            }
+            if (currentError && !(options && options.allowCorruptReset === true)) {
+                workspaceLoadError = currentError;
+                console.warn('[codalio-blueprint] refusing to overwrite a corrupt tab layout', workspaceLoadError);
+                return false;
+            }
+            const currentRevision = Number.isSafeInteger(current && current.revision)
+                ? current.revision : 0;
+            const currentCommitId = typeof (current && current.commitId) === 'string'
+                ? current.commitId : '';
+            if (!workspaceRevisionKnown) {
+                knownWorkspaceRevision = currentRevision;
+                knownWorkspaceCommitId = currentCommitId;
+                workspaceRevisionKnown = true;
+            } else if (!currentError && (currentRevision !== knownWorkspaceRevision
+                || currentCommitId !== knownWorkspaceCommitId)) {
+                workspaceLoadError = 'The tab layout changed in another Blueprint window. Reload before changing tabs again.';
+                console.warn('[codalio-blueprint] refusing to overwrite a newer tab layout', workspaceLoadError);
+                scheduleAuthoritativeWorkspaceReload('workspace-conflict');
+                return false;
+            }
+            if (!lease) lease = acquireStoreWriteLease();
+            if (!lease.ok || !ownsStoreWriteIntent(lease) || hasPriorStoreWriter(lease)) return false;
             // Persist only the shape workspace.js normalizes back, never DOM or
             // handler references that may have been attached to it.
             const tabs = (Array.isArray(workspace.tabs) ? workspace.tabs : []).map(tab => ({
@@ -463,12 +1587,15 @@
                 icon: String(tab.icon || ''),
                 sectionId: String(tab.sectionId || ''),
                 path: String(tab.path || ''),
+                folderId: String(tab.folderId || ''),
                 pinned: tab.pinned === true,
                 openedAt: Number(tab.openedAt) || Date.now(),
                 lastActiveAt: Number(tab.lastActiveAt) || Date.now()
             }));
-            window.localStorage.setItem(WORKSPACE_KEY, JSON.stringify({
-                version: 1,
+            const candidate = {
+                version: 2,
+                revision: currentRevision + 1,
+                commitId: lease.token,
                 tabs,
                 activeTabId: String(workspace.activeTabId || ''),
                 settingsSection: String(workspace.settingsSection || ''),
@@ -477,43 +1604,701 @@
                     ? workspace.viewerModeByPath
                     : {},
                 dividerPx: Number(workspace.dividerPx) || 0
-            }, withoutDomNodes));
+            };
+            const serialized = JSON.stringify(candidate, withoutDomNodes);
+            const serializedCandidate = JSON.parse(serialized);
+            const validationError = persistedWorkspaceValidationError(serializedCandidate);
+            if (validationError) {
+                console.warn('[codalio-blueprint] refusing to persist an unreadable tab layout', validationError);
+                return false;
+            }
+            if (!ownsStoreWriteIntent(lease) || hasPriorStoreWriter(lease)
+                || window.localStorage.getItem(WORKSPACE_KEY) !== rawBefore) {
+                workspaceLoadError = 'The tab layout changed before this save could commit.';
+                return false;
+            }
+            window.localStorage.setItem(WORKSPACE_KEY, serialized);
+            let committed = null;
+            try { committed = JSON.parse(window.localStorage.getItem(WORKSPACE_KEY) || 'null'); } catch (_) { committed = null; }
+            if (!ownsStoreWriteIntent(lease) || !committed
+                || committed.revision !== candidate.revision || committed.commitId !== candidate.commitId) {
+                workspaceLoadError = 'The tab layout was replaced by another writer before this save could be verified.';
+                scheduleAuthoritativeWorkspaceReload('workspace-conflict');
+                return false;
+            }
+            knownWorkspaceRevision = candidate.revision;
+            knownWorkspaceCommitId = candidate.commitId;
+            workspaceRevisionKnown = true;
+            workspaceLoadError = '';
             return true;
         } catch (error) {
             console.warn('[codalio-blueprint] unable to persist the tab layout', error);
             return false;
+        } finally {
+            if (!borrowedLease && lease && lease.ok) releaseStoreWriteLease(lease);
         }
     }
 
-    function clearWorkspace() {
+    function clearWorkspace(options) {
+        const borrowedLease = options && options.transactionLease
+            ? options.transactionLease : null;
+        let lease = borrowedLease;
         try {
+            const rawBefore = window.localStorage.getItem(WORKSPACE_KEY);
+            let current = null;
+            let currentError = '';
+            if (rawBefore) {
+                try {
+                    current = JSON.parse(rawBefore);
+                    currentError = (!current || typeof current !== 'object' || Array.isArray(current))
+                        ? 'The saved tab layout is malformed.'
+                        : persistedWorkspaceValidationError(current);
+                } catch (error) {
+                    currentError = `The saved tab layout could not be parsed (${String((error && error.message) || error)}).`;
+                }
+            }
+            if (currentError && !(options && options.allowCorruptReset === true)) {
+                workspaceLoadError = currentError;
+                console.warn('[codalio-blueprint] refusing to erase a corrupt tab layout', workspaceLoadError);
+                return false;
+            }
+            const currentRevision = Number.isSafeInteger(current && current.revision) ? current.revision : 0;
+            const currentCommitId = typeof (current && current.commitId) === 'string' ? current.commitId : '';
+            if (workspaceRevisionKnown && !currentError
+                && (currentRevision !== knownWorkspaceRevision || currentCommitId !== knownWorkspaceCommitId)) {
+                workspaceLoadError = 'The tab layout changed in another Blueprint window. Reload before clearing it.';
+                scheduleAuthoritativeWorkspaceReload('workspace-conflict');
+                return false;
+            }
+            if (!lease) lease = acquireStoreWriteLease();
+            if (!lease.ok || !ownsStoreWriteIntent(lease) || hasPriorStoreWriter(lease)
+                || window.localStorage.getItem(WORKSPACE_KEY) !== rawBefore) {
+                scheduleAuthoritativeWorkspaceReload('workspace-conflict');
+                return false;
+            }
             window.localStorage.removeItem(WORKSPACE_KEY);
-        } catch (_) { /* nothing to clear */ }
+            if (window.localStorage.getItem(WORKSPACE_KEY) !== null) return false;
+            knownWorkspaceRevision = 0;
+            knownWorkspaceCommitId = '';
+            workspaceRevisionKnown = true;
+            workspaceLoadError = '';
+            return true;
+        } catch (error) {
+            console.warn('[codalio-blueprint] unable to clear the tab layout', error);
+            return false;
+        } finally {
+            if (!borrowedLease && lease && lease.ok) releaseStoreWriteLease(lease);
+        }
+    }
+
+    /** Per-key corruption state for recovery UI and headless diagnostics. */
+    function storageRecoveryState() {
+        return {
+            projects: String(projectStoreLoadError || (externalResetObserved
+                ? 'Project data was erased in another window; this window is blocked from restoring stale data.' : '')),
+            settings: String(settingsLoadError || ''),
+            workspace: String(workspaceLoadError || '')
+        };
     }
 
     /**
-     * Every stored document, optionally scoped to one folder.
-     *
-     * The folder argument is optional on purpose: agent.js, the viewer, the tree
-     * and the storage metrics all call listFiles() with no argument and want every
-     * file. Only the folder-scoped sidebar view passes an id.
+     * Export the exact owned localStorage bytes before a repair/reset. JSON string
+     * escaping is reversible: parsing this file reproduces each `raw` value byte
+     * for byte, including malformed JSON that the normal readers reject.
      */
-    function listFiles(folderId) {
+    function exportRecoverySnapshot() {
+        // Refresh per-key diagnostics without overwriting any raw value.
+        readSettingsRaw();
+        readWorkspaceRaw();
+        const raw = {
+            projects: window.localStorage.getItem(PROJECTS_KEY),
+            settings: window.localStorage.getItem(SETTINGS_KEY),
+            workspace: window.localStorage.getItem(WORKSPACE_KEY)
+        };
+        return JSON.stringify({
+            format: 'codalio-blueprint-storage-recovery',
+            schemaVersion: 1,
+            exportedAt: new Date().toISOString(),
+            errors: storageRecoveryState(),
+            raw
+        }, null, 2);
+    }
+
+    function pendingCancelKey(cancelId) {
+        return `${PENDING_CANCEL_PREFIX}${encodeURIComponent(String(cancelId || ''))}`;
+    }
+
+    const PENDING_CANCEL_LEASE_MS = 60000;
+    const PENDING_CANCEL_HEARTBEAT_MS = 15000;
+
+    function readPendingCancelRecord(key) {
+        try {
+            const parsed = JSON.parse(window.localStorage.getItem(key) || 'null');
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+            const id = String(parsed.id || '').trim();
+            if (!id) return null;
+            return {
+                id,
+                ownerId: String(parsed.ownerId || ''),
+                leaseId: String(parsed.leaseId || ''),
+                runId: String(parsed.runId || ''),
+                state: String(parsed.state || 'possibly-active'),
+                createdAt: String(parsed.createdAt || ''),
+                leaseExpiresAt: Number(parsed.leaseExpiresAt) || 0,
+                key
+            };
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function listPendingCancelRecords() {
+        const records = [];
+        try {
+            const count = Number(window.localStorage.length) || 0;
+            for (let index = 0; index < count; index += 1) {
+                const key = window.localStorage.key(index);
+                if (!key || !String(key).startsWith(PENDING_CANCEL_PREFIX)) continue;
+                let record = readPendingCancelRecord(key);
+                if (!record) {
+                    let id = '';
+                    try { id = decodeURIComponent(String(key).slice(PENDING_CANCEL_PREFIX.length)); } catch (_) { id = ''; }
+                    if (id) record = {
+                        id,
+                        ownerId: '',
+                        leaseId: '',
+                        runId: '',
+                        state: 'possibly-active',
+                        createdAt: '',
+                        leaseExpiresAt: 0,
+                        key
+                    };
+                }
+                if (record && !records.some(item => item.id === record.id)) records.push(record);
+            }
+        } catch (error) {
+            console.warn('[codalio-blueprint] unable to read pending model cancellations', error);
+        }
+        return records;
+    }
+
+    /** Record a possibly active backend turn before its stream request is sent. */
+    function rememberPendingCancel(cancelId, metadata) {
+        const id = String(cancelId || '').trim();
+        if (!id) return '';
+        let lease = null;
+        try {
+            lease = acquireStoreWriteLease();
+            if (!lease.ok) return '';
+            const key = pendingCancelKey(id);
+            const existing = readPendingCancelRecord(key);
+            const now = Date.now();
+            if (existing && existing.ownerId && existing.ownerId !== storeWriterId
+                && existing.leaseExpiresAt > now) {
+                return '';
+            }
+            const info = metadata && typeof metadata === 'object' ? metadata : {};
+            const runId = String(info.runId || '');
+            const runLeaseId = String(info.runLeaseId || '');
+            if (runId) {
+                const runOwner = readRunOwner(runId);
+                if (!runLeaseId || !runOwner || !runOwner.owned || !runOwner.live
+                    || runOwner.leaseId !== runLeaseId) return '';
+                // Reserve dispatch and renew its run fence under the same
+                // cooperative lease. A recovery/takeover cannot slip between
+                // owner validation and cancellation-ledger creation.
+                window.localStorage.setItem(runOwnerKey(runId), JSON.stringify({
+                    runId,
+                    ownerId: storeWriterId,
+                    leaseId: runLeaseId,
+                    leaseExpiresAt: now + PENDING_CANCEL_LEASE_MS
+                }));
+                const renewed = readRunOwner(runId);
+                if (!renewed || !renewed.owned || !renewed.live
+                    || renewed.leaseId !== runLeaseId) return '';
+            }
+            const leaseId = uid('cancel-lease');
+            window.localStorage.setItem(key, JSON.stringify({
+                id,
+                ownerId: storeWriterId,
+                leaseId,
+                runId: String(runId || (existing && existing.runId) || ''),
+                state: 'possibly-active',
+                createdAt: (existing && existing.createdAt) || new Date(now).toISOString(),
+                leaseExpiresAt: now + PENDING_CANCEL_LEASE_MS
+            }));
+            const verified = readPendingCancelRecord(key);
+            return verified && verified.ownerId === storeWriterId
+                && verified.leaseId === leaseId
+                && verified.leaseExpiresAt > Date.now()
+                ? leaseId : '';
+        } catch (error) {
+            console.warn('[codalio-blueprint] unable to persist pending model cancellation', error);
+            return '';
+        } finally {
+            if (lease && lease.ok) releaseStoreWriteLease(lease);
+        }
+    }
+
+    function refreshPendingCancel(cancelId, expectedLeaseId) {
+        const id = String(cancelId || '').trim();
+        const expected = String(expectedLeaseId || '');
+        if (!id) return false;
+        let lease = null;
+        try {
+            lease = acquireStoreWriteLease();
+            if (!lease.ok) {
+                const current = readPendingCancelRecord(pendingCancelKey(id));
+                return Boolean(current && current.ownerId === storeWriterId
+                    && current.leaseId && (!expected || current.leaseId === expected)
+                    && current.leaseExpiresAt > Date.now());
+            }
+            const key = pendingCancelKey(id);
+            const record = readPendingCancelRecord(key);
+            if (!record || record.ownerId !== storeWriterId || !record.leaseId
+                || (expected && record.leaseId !== expected)) return false;
+            window.localStorage.setItem(key, JSON.stringify({
+                id: record.id,
+                ownerId: record.ownerId,
+                leaseId: record.leaseId,
+                runId: record.runId,
+                state: record.state,
+                createdAt: record.createdAt,
+                leaseExpiresAt: Date.now() + PENDING_CANCEL_LEASE_MS
+            }));
+            const verified = readPendingCancelRecord(key);
+            return Boolean(verified && verified.ownerId === storeWriterId
+                && verified.leaseId === record.leaseId
+                && verified.leaseExpiresAt > Date.now());
+        } catch (_) {
+            return false;
+        } finally {
+            if (lease && lease.ok) releaseStoreWriteLease(lease);
+        }
+    }
+
+    /** Remove a ledger entry only after an authoritative terminal/cancel result. */
+    function forgetPendingCancel(cancelId, expectedLeaseId) {
+        const id = String(cancelId || '').trim();
+        if (!id) return false;
+        let lease = null;
+        try {
+            lease = acquireStoreWriteLease();
+            if (!lease.ok) return false;
+            const key = pendingCancelKey(id);
+            const current = readPendingCancelRecord(key);
+            const expected = String(expectedLeaseId || '');
+            // A recovery window may have claimed an expired entry while the old
+            // page was suspended. That old page must not erase the new owner's
+            // cancellation barrier when it resumes.
+            if (current && (current.ownerId !== storeWriterId
+                || (expected && current.leaseId !== expected))) return false;
+            window.localStorage.removeItem(key);
+            return true;
+        } catch (error) {
+            console.warn('[codalio-blueprint] unable to clear pending model cancellation', error);
+            return false;
+        } finally {
+            if (lease && lease.ok) releaseStoreWriteLease(lease);
+        }
+    }
+
+    function listPendingCancels(options) {
+        const recoverableOnly = options && options.recoverableOnly === true;
+        const now = Date.now();
+        return listPendingCancelRecords()
+            .filter(record => !recoverableOnly || !record.ownerId
+                || record.ownerId === storeWriterId || record.leaseExpiresAt <= now)
+            .map(record => record.id);
+    }
+
+    function runOwnerKey(runId) {
+        return `${RUN_OWNER_PREFIX}${encodeURIComponent(String(runId || ''))}`;
+    }
+
+    function readRunOwner(runId) {
+        const id = String(runId || '').trim();
+        if (!id) return null;
+        try {
+            const parsed = JSON.parse(window.localStorage.getItem(runOwnerKey(id)) || 'null');
+            if (!parsed || typeof parsed !== 'object' || String(parsed.runId || '') !== id) return null;
+            const ownerId = String(parsed.ownerId || '');
+            const leaseId = String(parsed.leaseId || '');
+            const leaseExpiresAt = Number(parsed.leaseExpiresAt) || 0;
+            return {
+                runId: id,
+                ownerId,
+                leaseId,
+                leaseExpiresAt,
+                owned: ownerId === storeWriterId,
+                live: Boolean(ownerId) && leaseExpiresAt > Date.now()
+            };
+        } catch (_) {
+            return null;
+        }
+    }
+
+    /**
+     * Destructive mutations must be fenced by the same cooperative storage
+     * lease used to claim run owners. Merely checking controller state is not
+     * sufficient: another window can claim an owner without changing the
+     * project-store revision, leaving an already-open confirmation dialog stale.
+     *
+     * Unknown live run ids are treated as relevant. They can occur in the small
+     * interval between claiming an execution owner and saving its run record.
+     */
+    function liveDestructiveOwner(folderId) {
+        const scope = typeof folderId === 'string' && folderId ? folderId : '';
+        const keys = [];
+        try {
+            for (let index = 0; index < window.localStorage.length; index += 1) {
+                const key = window.localStorage.key(index);
+                if (key && String(key).startsWith(RUN_OWNER_PREFIX)) keys.push(String(key));
+            }
+        } catch (_) {
+            // If ownership state cannot be enumerated, fail closed. Destructive
+            // operations can be retried after storage becomes readable.
+            return { runId: '', live: true, unreadable: true };
+        }
+        for (const key of keys) {
+            let runId = '';
+            try { runId = decodeURIComponent(key.slice(RUN_OWNER_PREFIX.length)); } catch (_) { return { runId: '', live: true, unreadable: true }; }
+            const owner = readRunOwner(runId);
+            if (!owner || !owner.live) continue;
+            if (!scope || runId === MODEL_OPERATION_OWNER_ID) return owner;
+            const run = findRun(runId);
+            if (!run || String(run.folderId || '') === scope) return owner;
+        }
+        return null;
+    }
+
+    function destructiveMutationAllowed(folderId) {
+        return !liveDestructiveOwner(folderId);
+    }
+
+    function validateRunMutationUnderLease(runId, expectedLeaseId, running) {
+        const id = String(runId || '').trim();
+        const expected = String(expectedLeaseId || '');
+        const owner = readRunOwner(id);
+        if (expected) {
+            if (!owner || !owner.owned || !owner.live || owner.leaseId !== expected) return false;
+            window.localStorage.setItem(runOwnerKey(id), JSON.stringify({
+                runId: id,
+                ownerId: storeWriterId,
+                leaseId: expected,
+                leaseExpiresAt: Date.now() + PENDING_CANCEL_LEASE_MS
+            }));
+            const renewed = readRunOwner(id);
+            return Boolean(renewed && renewed.owned && renewed.live
+                && renewed.leaseId === expected);
+        }
+        // Running mutations always require a bound execution token. A detached
+        // history object may update only while no live execution owns the id.
+        return !running && !(owner && owner.live);
+    }
+
+    function claimRunOwnership(runId, options) {
+        const id = String(runId || '').trim();
+        if (!id) return false;
+        const allowOwnedTakeover = !options || options.allowOwnedTakeover !== false;
+        let lease = null;
+        try {
+            lease = acquireStoreWriteLease();
+            if (!lease.ok) return false;
+            const current = readRunOwner(id);
+            if (current && current.live && (!current.owned || !allowOwnedTakeover)) return false;
+            // Every acquisition receives a new fence, including re-entry from
+            // this page. A newer local execution therefore invalidates stale
+            // callbacks just as reliably as a takeover from another window.
+            const leaseId = uid('run-lease');
+            window.localStorage.setItem(runOwnerKey(id), JSON.stringify({
+                runId: id,
+                ownerId: storeWriterId,
+                leaseId,
+                leaseExpiresAt: Date.now() + PENDING_CANCEL_LEASE_MS
+            }));
+            const verified = readRunOwner(id);
+            const claimed = Boolean(verified && verified.owned && verified.live && verified.leaseId === leaseId);
+            if (claimed) {
+                const run = store && Array.isArray(store.runs)
+                    ? store.runs.find(item => item && String(item.id) === id)
+                    : null;
+                if (run) bindRunOwnership(run);
+            }
+            return claimed;
+        } catch (error) {
+            console.warn('[codalio-blueprint] unable to claim run ownership', error);
+            return false;
+        } finally {
+            if (lease && lease.ok) releaseStoreWriteLease(lease);
+        }
+    }
+
+    function refreshRunOwnership(runId, expectedLeaseId) {
+        const id = String(runId || '').trim();
+        const expected = String(expectedLeaseId || '');
+        if (!id || !expected) return false;
+        let lease = null;
+        try {
+            lease = acquireStoreWriteLease();
+            if (!lease.ok) {
+                const current = readRunOwner(id);
+                return Boolean(current && current.owned && current.live
+                    && current.leaseId === expected);
+            }
+            const current = readRunOwner(id);
+            if (!current || !current.owned || !current.live || current.leaseId !== expected) return false;
+            window.localStorage.setItem(runOwnerKey(id), JSON.stringify({
+                runId: id,
+                ownerId: storeWriterId,
+                leaseId: current.leaseId,
+                leaseExpiresAt: Date.now() + PENDING_CANCEL_LEASE_MS
+            }));
+            const verified = readRunOwner(id);
+            return Boolean(verified && verified.owned && verified.live
+                && verified.leaseId === current.leaseId);
+        } catch (_) {
+            return false;
+        } finally {
+            if (lease && lease.ok) releaseStoreWriteLease(lease);
+        }
+    }
+
+    function releaseRunOwnership(runId, expectedLeaseId) {
+        const id = String(runId || '').trim();
+        if (!id) return false;
+        let lease = null;
+        try {
+            lease = acquireStoreWriteLease();
+            if (!lease.ok) return false;
+            const current = readRunOwner(id);
+            const expected = String(expectedLeaseId || '');
+            if (current && (!current.owned || (expected && current.leaseId !== expected))) return false;
+            window.localStorage.removeItem(runOwnerKey(id));
+            const released = !readRunOwner(id);
+            if (released) {
+                const run = store.runs.find(item => item && String(item.id) === id);
+                if (run && (!expected || run[RUN_LEASE_SYMBOL] === expected)) {
+                    try { delete run[RUN_LEASE_SYMBOL]; } catch (_) { /* transient only */ }
+                }
+            }
+            return released;
+        } catch (_) {
+            return false;
+        } finally {
+            if (lease && lease.ok) releaseStoreWriteLease(lease);
+        }
+    }
+
+    function bindRunOwnership(run) {
+        if (!run || !run.id) return '';
+        const owner = readRunOwner(run.id);
+        if (!owner || !owner.owned || !owner.live || !owner.leaseId) return '';
+        try {
+            Object.defineProperty(run, RUN_LEASE_SYMBOL, {
+                value: owner.leaseId,
+                configurable: true,
+                enumerable: false,
+                writable: false
+            });
+        } catch (_) {
+            return '';
+        }
+        return owner.leaseId;
+    }
+
+    function runLeaseId(run) {
+        return run && typeof run === 'object' ? String(run[RUN_LEASE_SYMBOL] || '') : '';
+    }
+
+    function expireOwnedPendingCancelLeases() {
+        let lease = null;
+        try {
+            lease = acquireStoreWriteLease();
+            if (!lease.ok) return;
+            listPendingCancelRecords().forEach(snapshot => {
+                if (snapshot.ownerId !== storeWriterId || !snapshot.leaseId) return;
+                const record = readPendingCancelRecord(snapshot.key);
+                if (!record || record.ownerId !== storeWriterId
+                    || record.leaseId !== snapshot.leaseId) return;
+                window.localStorage.setItem(record.key, JSON.stringify({
+                    id: record.id,
+                    ownerId: record.ownerId,
+                    leaseId: record.leaseId,
+                    runId: record.runId,
+                    state: record.state,
+                    createdAt: record.createdAt,
+                    leaseExpiresAt: 0
+                }));
+            });
+            const keys = [];
+            for (let index = 0; index < window.localStorage.length; index += 1) {
+                const key = window.localStorage.key(index);
+                if (key && String(key).startsWith(RUN_OWNER_PREFIX)) keys.push(key);
+            }
+            keys.forEach(key => {
+                const runId = decodeURIComponent(String(key).slice(RUN_OWNER_PREFIX.length));
+                const owner = readRunOwner(runId);
+                if (!owner || !owner.owned || !owner.leaseId) return;
+                window.localStorage.setItem(key, JSON.stringify({
+                    runId,
+                    ownerId: storeWriterId,
+                    leaseId: owner.leaseId,
+                    leaseExpiresAt: 0
+                }));
+            });
+        } catch (_) { /* natural expiry remains the fallback */ }
+        finally {
+            if (lease && lease.ok) releaseStoreWriteLease(lease);
+        }
+    }
+    if (typeof window.addEventListener === 'function') {
+        window.addEventListener('pagehide', expireOwnedPendingCancelLeases);
+    }
+
+    function storedFileEntries(folderId) {
         const scope = typeof folderId === 'string' && folderId ? folderId : '';
         return Object.keys(store.files)
-            .filter(path => store.files[path] && typeof store.files[path].content === 'string')
-            .filter(path => !scope || store.files[path].folder === scope)
+            .map(key => ({ key, record: store.files[key] }))
+            .filter(item => item.record && typeof item.record.content === 'string')
+            .filter(item => !scope || item.record.folder === scope);
+    }
+
+    function cleanFilePath(path) {
+        return String(path || '').replace(/^\/+/, '').trim();
+    }
+
+    function findFileEntry(path, folderId, allowFallback) {
+        const cleanPath = cleanFilePath(path);
+        if (!cleanPath) return null;
+        const wantedFolder = typeof folderId === 'string' && folderId ? folderId : '';
+        const matches = storedFileEntries().filter(item =>
+            String(item.record.path || item.key) === cleanPath);
+        if (wantedFolder) {
+            const scoped = matches.find(item => item.record.folder === wantedFolder);
+            if (scoped || allowFallback === false) return scoped || null;
+        }
+        // Falling back across roots is safe only while the path is globally
+        // unique. Returning the first ambiguous match makes a caller mutate or
+        // display whichever root happened to occupy the legacy storage key.
+        return matches.length === 1 ? matches[0] : null;
+    }
+
+    function availableStorageKey(path, folderId) {
+        const cleanPath = cleanFilePath(path);
+        if (!store.files[cleanPath]) return cleanPath;
+        const base = `${folderId}::${cleanPath}`;
+        if (!store.files[base]) return base;
+        let suffix = 2;
+        while (store.files[`${base}::${suffix}`]) suffix += 1;
+        return `${base}::${suffix}`;
+    }
+
+    /** Every stored document path, optionally scoped to one folder. */
+    function listFiles(folderId) {
+        return storedFileEntries(folderId)
+            .map(item => String(item.record.path || item.key))
             .sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
     }
 
-    function readFile(path) {
-        return store.files[path] || null;
+    function readFile(path, folderId) {
+        const hasExplicitFolder = typeof folderId === 'string' && folderId;
+        const wantedFolder = hasExplicitFolder
+            ? folderId
+            : (store.folders[store.activeFolderId] ? store.activeFolderId : '');
+        const entry = findFileEntry(path, wantedFolder, !hasExplicitFolder);
+        return entry ? entry.record : null;
+    }
+
+    /** Stable public identity for a file in a multi-root project. */
+    function fileRef(path, folderId) {
+        const cleanPath = cleanFilePath(path);
+        const hasExplicitFolder = typeof folderId === 'string' && Boolean(folderId);
+        if (hasExplicitFolder && !store.folders[folderId]) return null;
+        const wantedFolder = hasExplicitFolder ? folderId : '';
+        const entry = findFileEntry(cleanPath, wantedFolder, wantedFolder ? false : true);
+        if (!entry) return null;
+        return { path: String(entry.record.path || cleanPath), folderId: String(entry.record.folder || '') };
+    }
+
+    function fileRefKey(path, folderId) {
+        const cleanPath = cleanFilePath(path);
+        const cleanFolder = String(folderId || '');
+        return `${encodeURIComponent(cleanFolder)}::${encodeURIComponent(cleanPath)}`;
+    }
+
+    const FILE_SNAPSHOT_FIELDS = Object.freeze([
+        'path', 'content', 'createdAt', 'updatedAt', 'runId', 'skill',
+        'folder', 'origin', 'createdBy'
+    ]);
+
+    /** Immutable record-level precondition for edit/delete confirmation dialogs. */
+    function fileSnapshot(record) {
+        if (!record || typeof record !== 'object') return null;
+        const snapshot = {};
+        FILE_SNAPSHOT_FIELDS.forEach(field => {
+            snapshot[field] = String(record[field] === undefined ? '' : record[field]);
+        });
+        return snapshot;
+    }
+
+    function recordMatchesFileSnapshot(record, snapshot) {
+        if (snapshot === null) return !record;
+        if (!record || !snapshot || typeof snapshot !== 'object') return false;
+        return FILE_SNAPSHOT_FIELDS.every(field => String(
+            record[field] === undefined ? '' : record[field]
+        ) === String(snapshot[field] === undefined ? '' : snapshot[field]));
+    }
+
+    function fileMatchesSnapshot(path, folderId, snapshot) {
+        const wantedFolder = typeof folderId === 'string' && folderId ? folderId : '';
+        const entry = findFileEntry(path, wantedFolder, false);
+        return recordMatchesFileSnapshot(entry ? entry.record : null, snapshot);
     }
 
     function writeFile(path, content, meta) {
-        const cleanPath = String(path || '').replace(/^\/+/, '').trim();
+        const cleanPath = cleanFilePath(path);
         if (!cleanPath) return null;
-        const previous = store.files[cleanPath] || null;
+        const mutationRunId = meta && typeof meta.runId === 'string' ? meta.runId : '';
+        const mutationLeaseId = String((meta && meta.runLeaseId) || '');
+        const requestedFolder = meta && typeof meta.folder === 'string' ? meta.folder : '';
+        if (mutationRunId) {
+            const owner = readRunOwner(mutationRunId);
+            const mutationRun = findRun(mutationRunId);
+            if (!owner || !owner.owned || !owner.live || !mutationLeaseId
+                || owner.leaseId !== mutationLeaseId
+                || !mutationRun || !requestedFolder
+                || String(mutationRun.folderId || '') !== requestedFolder) {
+                console.warn(`[codalio-blueprint] refusing stale run file write for ${mutationRunId}`);
+                return null;
+            }
+        }
+        // An async run/import carries an explicit root as an integrity boundary.
+        // If that root vanished, never drift into whichever root is active now.
+        if (requestedFolder && !store.folders[requestedFolder]) {
+            console.warn(`[codalio-blueprint] refusing to write ${cleanPath}: project root ${requestedFolder} no longer exists`);
+            return null;
+        }
+        const explicitFolder = requestedFolder;
+        const activeFolderId = store.folders[store.activeFolderId]
+            ? store.activeFolderId : DEFAULT_FOLDER_ID;
+        let previousEntry = explicitFolder
+            ? findFileEntry(cleanPath, explicitFolder, false)
+            : findFileEntry(cleanPath, activeFolderId, false);
+        // Preserve the historical edit contract: without an explicit folder, a
+        // globally unique existing path is edited in place even if another root
+        // is active. Explicit folder writes (imports and agent runs) can create
+        // the same relative path independently in multiple roots.
+        if (!previousEntry && !explicitFolder) {
+            const matches = storedFileEntries().filter(item =>
+                String(item.record.path || item.key) === cleanPath);
+            if (matches.length === 1) previousEntry = matches[0];
+        }
+        const previous = previousEntry ? previousEntry.record : null;
+        if (meta && hasOwn(meta, 'expectedFile')
+            && !recordMatchesFileSnapshot(previous, meta.expectedFile)) {
+            return null;
+        }
 
         // Safety Policy:
         // Standalone project access can read and create files freely,
@@ -523,21 +2308,31 @@
             const isImportAction = Boolean(meta && meta.origin === 'imported');
             if (!isImportAction) {
                 console.warn(`[codalio-blueprint] protected user source file: ${cleanPath}. Writing revision to docs/ instead.`);
-                const safePath = cleanPath.startsWith('docs/') ? cleanPath : `docs/${cleanPath}.revised.md`;
-                return writeFile(safePath, content, Object.assign({}, meta, { origin: 'blueprint', createdBy: 'blueprint' }));
+                const lastSlash = cleanPath.lastIndexOf('/');
+                const lastDot = cleanPath.lastIndexOf('.');
+                const hasExtension = lastDot > lastSlash;
+                const safeBase = cleanPath.startsWith('docs/')
+                    ? `${hasExtension ? cleanPath.slice(0, lastDot) : cleanPath}.revised${hasExtension ? cleanPath.slice(lastDot) : '.md'}`
+                    : `docs/${cleanPath}.revised.md`;
+                const safePath = withCollisionHandling(safeBase, { overwriteExistingFile: 'version' }, previous.folder);
+                return writeFile(safePath, content, Object.assign({}, meta, {
+                    folder: previous.folder,
+                    origin: 'blueprint',
+                    createdBy: 'blueprint'
+                }));
             }
         }
 
+        const shouldPersist = !meta || meta.persist !== false;
+        const previousOpenPath = store.openPath;
+        const previousOpenFolderId = store.openFolderId;
         const now = new Date().toISOString();
-        const wantedFolder = (meta && typeof meta.folder === 'string' && store.folders[meta.folder])
-            ? meta.folder
-            : '';
         const inheritedFolder = (previous && typeof previous.folder === 'string' && store.folders[previous.folder])
             ? previous.folder
             : '';
-        const folder = wantedFolder
+        const folder = explicitFolder
             || inheritedFolder
-            || (store.folders[store.activeFolderId] ? store.activeFolderId : DEFAULT_FOLDER_ID);
+            || activeFolderId;
 
         const origin = (meta && meta.origin)
             || (previous && previous.origin)
@@ -546,7 +2341,8 @@
             || (previous && previous.createdBy)
             || (origin === 'imported' ? 'user' : 'blueprint');
 
-        store.files[cleanPath] = {
+        const storageKey = previousEntry ? previousEntry.key : availableStorageKey(cleanPath, folder);
+        const nextRecord = {
             path: cleanPath,
             content: String(content === null || content === undefined ? '' : content),
             createdAt: previous ? previous.createdAt : now,
@@ -557,52 +2353,236 @@
             origin,
             createdBy
         };
+        const priorFolderUpdatedAt = store.folders[folder] && store.folders[folder].updatedAt;
+        store.files[storageKey] = nextRecord;
         touchFolder(folder);
         store.openPath = cleanPath;
+        store.openFolderId = folder;
         // Bulk callers (a folder import) pass persist:false and write the store
         // once at the end. Persisting here would JSON.stringify the ENTIRE store
         // per file, which is O(n^2): importing 255 files serialised the whole
         // project 255 times while it grew, and that was the import freeze.
-        if (!meta || meta.persist !== false) writeStore(store);
-        return store.files[cleanPath];
+        if (shouldPersist && !writeStore(store, mutationRunId ? {
+            validateUnderLease: () => {
+                const mutationRun = findRun(mutationRunId);
+                return Boolean(mutationRun
+                    && requestedFolder
+                    && String(mutationRun.folderId || '') === requestedFolder
+                    && validateRunMutationUnderLease(mutationRunId, mutationLeaseId, true));
+            },
+            preconditionCode: 'run-owner-lost',
+            preconditionMessage: 'The file write lost its run execution lease or project-root owner before commit.'
+        } : undefined)) {
+            if (previousEntry) store.files[storageKey] = previous;
+            else delete store.files[storageKey];
+            if (store.folders[folder] && priorFolderUpdatedAt) {
+                store.folders[folder].updatedAt = priorFolderUpdatedAt;
+            }
+            store.openPath = previousOpenPath;
+            store.openFolderId = previousOpenFolderId;
+            return null;
+        }
+        return nextRecord;
     }
 
-    function isReadOnlyFile(path) {
-        const rec = readFile(path);
+    function isReadOnlyFile(path, folderId) {
+        const rec = readFile(path, folderId);
         return Boolean(rec && rec.origin === 'imported');
     }
 
-    function canEditFile(path) {
-        const rec = readFile(path);
+    function canEditFile(path, folderId) {
+        const rec = readFile(path, folderId);
         if (!rec) return true;
         return rec.origin !== 'imported';
     }
 
-    function deleteFile(path) {
-        if (!store.files[path]) return false;
-        delete store.files[path];
-        if (store.openPath === path) store.openPath = listFiles()[0] || '';
-        writeStore(store);
+    function deleteFile(path, folderId, expectedFile) {
+        const wantedFolder = (typeof folderId === 'string' && folderId)
+            ? folderId : (store.folders[store.activeFolderId] ? store.activeFolderId : '');
+        const entry = findFileEntry(path, wantedFolder, false);
+        if (!entry) return false;
+        if (arguments.length >= 3 && !recordMatchesFileSnapshot(entry.record, expectedFile)) return false;
+        const previousOpenPath = store.openPath;
+        const previousOpenFolderId = store.openFolderId;
+        delete store.files[entry.key];
+        if (store.openPath === entry.record.path && store.openFolderId === entry.record.folder) {
+            store.openPath = '';
+            store.openFolderId = '';
+        }
+        if (!writeStore(store, {
+            validateUnderLease: () => destructiveMutationAllowed(entry.record.folder),
+            preconditionCode: 'operation-active',
+            preconditionMessage: 'A Blueprint operation became active before the file deletion committed.'
+        })) {
+            store.files[entry.key] = entry.record;
+            store.openPath = previousOpenPath;
+            store.openFolderId = previousOpenFolderId;
+            return false;
+        }
         return true;
     }
 
-    function renameFile(fromPath, toPath) {
-        const record = store.files[fromPath];
-        if (!record) return null;
-        const target = String(toPath || '').replace(/^\/+/, '').trim();
-        if (!target || store.files[target]) return null;
-        delete store.files[fromPath];
-        record.path = target;
-        record.updatedAt = new Date().toISOString();
-        store.files[target] = record;
-        if (store.openPath === fromPath) store.openPath = target;
-        writeStore(store);
-        return record;
+    /** Delete every virtual file as one durable transaction. */
+    function clearFiles() {
+        const previousFiles = store.files;
+        const previousOpenPath = store.openPath;
+        const previousOpenFolderId = store.openFolderId;
+        store.files = safeRecordMap();
+        store.openPath = '';
+        store.openFolderId = '';
+        if (!writeStore(store, {
+            validateUnderLease: () => destructiveMutationAllowed(),
+            preconditionCode: 'operation-active',
+            preconditionMessage: 'A Blueprint operation became active before all project files were cleared.'
+        })) {
+            store.files = previousFiles;
+            store.openPath = previousOpenPath;
+            store.openFolderId = previousOpenFolderId;
+            return false;
+        }
+        return true;
     }
 
-    function setOpenPath(path) {
-        store.openPath = String(path || '');
-        writeStore(store);
+    function renameFile(fromPath, toPath, folderId, expectedFile) {
+        const wantedFolder = (typeof folderId === 'string' && folderId)
+            ? folderId : (store.folders[store.activeFolderId] ? store.activeFolderId : '');
+        const entry = findFileEntry(fromPath, wantedFolder, false);
+        if (!entry) return null;
+        const snapshot = arguments.length >= 4 ? expectedFile : fileSnapshot(entry.record);
+        // One atomic primitive owns every durable reference rewrite. Keeping a
+        // second rename implementation here previously left run/review/message
+        // handles pointing at the old path.
+        return updateFile(fromPath, toPath, entry.record.content, wantedFolder, snapshot);
+    }
+
+    /**
+     * Rename/move and edit one Blueprint-owned file as a single project-store
+     * commit, including every durable run/review/message reference to its path.
+     */
+    function updateFile(fromPath, toPath, content, folderId, expectedFile) {
+        const wantedFolder = (typeof folderId === 'string' && folderId)
+            ? folderId : (store.folders[store.activeFolderId] ? store.activeFolderId : '');
+        const entry = findFileEntry(fromPath, wantedFolder, false);
+        if (!entry) return null;
+        if (arguments.length >= 5 && !recordMatchesFileSnapshot(entry.record, expectedFile)) return null;
+        const target = cleanFilePath(toPath);
+        if (!target) return null;
+        const record = entry.record;
+        if (target !== record.path && findFileEntry(target, record.folder, false)) return null;
+        const nextContent = String(content === undefined ? record.content : content);
+        if (record.origin === 'imported' && nextContent !== record.content) return null;
+        if (target === record.path && nextContent === record.content) return record;
+
+        const before = clonePersistable(store);
+        if (!before) return null;
+        const originalOwners = new Set(storedFileEntries()
+            .filter(item => item.record && item.record.path === record.path)
+            .map(item => String(item.record.folder || ''))
+            .filter(Boolean));
+        const unambiguousOriginalOwner = originalOwners.size === 1 ? [...originalOwners][0] : '';
+        const renamed = Object.assign({}, record, {
+            path: target,
+            content: nextContent,
+            updatedAt: new Date().toISOString()
+        });
+        delete store.files[entry.key];
+        store.files[availableStorageKey(target, record.folder)] = renamed;
+        if (store.openPath === record.path && store.openFolderId === record.folder) {
+            store.openPath = target;
+        }
+        touchFolder(record.folder);
+
+        if (target !== record.path) {
+            const replaceRefs = (holder, inheritedOwner) => {
+                if (!holder || typeof holder !== 'object') return;
+                const holderOwner = String(holder.folderId || inheritedOwner || '');
+                if (Array.isArray(holder.writtenFiles)) {
+                    holder.writtenFiles.forEach(ref => {
+                        if (!ref || ref.path !== record.path) return;
+                        const refOwner = String(ref.folderId || holderOwner || unambiguousOriginalOwner);
+                        if (refOwner === record.folder) {
+                            ref.path = target;
+                            ref.folderId = record.folder;
+                        }
+                    });
+                }
+                if (String(holderOwner || unambiguousOriginalOwner) === record.folder) {
+                    ['writtenPaths', 'paths'].forEach(key => {
+                        if (Array.isArray(holder[key])) {
+                            holder[key] = holder[key].map(item => item === record.path ? target : item);
+                        }
+                    });
+                }
+                if (holder.targetPath === record.path
+                    && String(holder.targetFolderId || holderOwner || unambiguousOriginalOwner) === record.folder) {
+                    holder.targetPath = target;
+                }
+                (Array.isArray(holder.reviews) ? holder.reviews : []).forEach(review => {
+                    if (review && review.path === record.path
+                        && String(review.folderId || holderOwner || unambiguousOriginalOwner) === record.folder) {
+                        review.path = target;
+                        review.folderId = record.folder;
+                    }
+                });
+                (Array.isArray(holder.phases) ? holder.phases : []).forEach(step => {
+                    if (step && step.reviewPath === record.path
+                        && String(step.reviewFolderId || holderOwner || unambiguousOriginalOwner) === record.folder) {
+                        step.reviewPath = target;
+                        step.reviewFolderId = record.folder;
+                    }
+                });
+            };
+            store.runs.forEach(run => {
+                const runOwner = String((run && run.folderId) || '');
+                replaceRefs(run, runOwner);
+                (Array.isArray(run && run.messages) ? run.messages : [])
+                    .forEach(message => replaceRefs(message, runOwner));
+            });
+        }
+
+        if (!writeStore(store, {
+            validateUnderLease: () => destructiveMutationAllowed(record.folder),
+            preconditionCode: 'operation-active',
+            preconditionMessage: 'A Blueprint operation became active before the file update committed.'
+        })) {
+            assignStoreState(before);
+            knownStoreRevision = store.revision;
+            knownStoreCommitId = store.commitId;
+            return null;
+        }
+        return renamed;
+    }
+
+    function setOpenPath(path, folderId) {
+        const cleanPath = cleanFilePath(path);
+        const previousOpenPath = store.openPath;
+        const previousOpenFolderId = store.openFolderId;
+        if (!cleanPath) {
+            store.openPath = '';
+            store.openFolderId = '';
+            if (!writeStore(store)) {
+                store.openPath = previousOpenPath;
+                store.openFolderId = previousOpenFolderId;
+                return false;
+            }
+            return true;
+        }
+        const hasExplicitFolder = typeof folderId === 'string' && Boolean(folderId);
+        if (hasExplicitFolder && !store.folders[folderId]) {
+            return false;
+        }
+        const explicitFolder = hasExplicitFolder ? folderId : '';
+        const entry = findFileEntry(cleanPath, explicitFolder || store.activeFolderId, !explicitFolder);
+        // Never persist a phantom or ambiguous selection. A stale host snapshot
+        // can outlive a deleted file, and two roots may legitimately share path.
+        store.openPath = entry ? cleanPath : '';
+        store.openFolderId = entry ? String(entry.record.folder || '') : '';
+        if (!writeStore(store)) {
+            store.openPath = previousOpenPath;
+            store.openFolderId = previousOpenFolderId;
+            return false;
+        }
+        return Boolean(entry);
     }
 
     // ------------------------------------------------------------------
@@ -635,10 +2615,47 @@
         return getFolder(store.activeFolderId) || getFolder(DEFAULT_FOLDER_ID);
     }
 
+    function folderSnapshot(folderId) {
+        const folder = getFolder(String(folderId || ''));
+        if (!folder) return null;
+        return {
+            id: String(folder.id || folderId || ''),
+            name: String(folder.name || ''),
+            updatedAt: String(folder.updatedAt || ''),
+            revision: Number(store.revision) || 0,
+            commitId: String(store.commitId || ''),
+            files: storedFileEntries(folder.id)
+                .map(item => `${String(item.record.path || item.key)}\u0000${String(item.record.updatedAt || '')}\u0000${String(item.record.content || '').length}`)
+                .sort()
+        };
+    }
+
+    function folderMatchesSnapshot(folderId, snapshot) {
+        if (!snapshot || typeof snapshot !== 'object') return false;
+        const current = folderSnapshot(folderId);
+        return Boolean(current)
+            && current.id === String(snapshot.id || '')
+            && current.name === String(snapshot.name || '')
+            && current.updatedAt === String(snapshot.updatedAt || '')
+            && current.revision === Number(snapshot.revision)
+            && current.commitId === String(snapshot.commitId || '')
+            && JSON.stringify(current.files) === JSON.stringify(Array.isArray(snapshot.files) ? snapshot.files : []);
+    }
+
     function setActiveFolder(folderId) {
         if (!store.folders[folderId]) return null;
+        const previous = store.activeFolderId;
+        const previousActiveRunId = store.activeRunId;
         store.activeFolderId = folderId;
-        writeStore(store);
+        const selectedRun = findRun(store.activeRunId);
+        if (selectedRun && String(selectedRun.folderId || '') !== String(folderId)) {
+            store.activeRunId = '';
+        }
+        if (!writeStore(store)) {
+            store.activeFolderId = previous;
+            store.activeRunId = previousActiveRunId;
+            return null;
+        }
         return store.folders[folderId];
     }
 
@@ -672,9 +2689,23 @@
         }
 
         const folder = emptyFolder(id, unique, origin || 'created');
+        const previousActiveFolderId = store.activeFolderId;
+        const previousActiveRunId = store.activeRunId;
         store.folders[id] = folder;
         store.activeFolderId = id;
-        writeStore(store);
+        // A newly-created project root has no run context. Keeping the prior
+        // root's active run selected leaks its transcript/compaction across the
+        // project boundary and leaves the persisted selection internally split.
+        store.activeRunId = '';
+        if (!writeStore(store)) {
+            delete store.folders[id];
+            store.activeFolderId = previousActiveFolderId;
+            store.activeRunId = previousActiveRunId;
+            return {
+                folder: null,
+                error: `The folder could not be saved (${persistence.lastError || 'browser storage unavailable'}).`
+            };
+        }
         return { folder, error: '' };
     }
 
@@ -687,9 +2718,12 @@
      * rename button is backed by the engine rather than being decoration: a caller
      * that reaches past the UI still cannot rename it.
      */
-    function renameFolder(folderId, name) {
+    function renameFolder(folderId, name, expectedFolder) {
         const folder = store.folders[folderId];
         if (!folder) return { folder: null, error: 'That folder no longer exists.' };
+        if (arguments.length >= 3 && !folderMatchesSnapshot(folderId, expectedFolder)) {
+            return { folder: null, error: 'That folder changed after this dialog opened. Reopen it before renaming.' };
+        }
         if (folderId === DEFAULT_FOLDER_ID) {
             return { folder: null, error: 'The default project folder cannot be renamed.' };
         }
@@ -699,9 +2733,15 @@
         const clash = listFolders().some(other => other.id !== folderId
             && other.name.toLowerCase() === wanted.toLowerCase());
         if (clash) return { folder: null, error: `A folder named "${wanted}" already exists.` };
+        const previousName = folder.name;
+        const previousUpdatedAt = folder.updatedAt;
         folder.name = wanted;
         touchFolder(folderId);
-        writeStore(store);
+        if (!writeStore(store)) {
+            folder.name = previousName;
+            folder.updatedAt = previousUpdatedAt;
+            return { folder: null, error: `The folder rename could not be saved (${persistence.lastError || 'browser storage unavailable'}).` };
+        }
         return { folder, error: '' };
     }
 
@@ -710,18 +2750,46 @@
      * it is where unfiled work lives, and removing it would orphan documents.
      * Returns the deleted document count so the UI can say what happened.
      */
-    function deleteFolder(folderId) {
+    function deleteFolder(folderId, expectedFolder) {
         const folder = store.folders[folderId];
         if (!folder) return { deleted: false, count: 0, error: 'That folder no longer exists.' };
+        if (arguments.length >= 2 && !folderMatchesSnapshot(folderId, expectedFolder)) {
+            return { deleted: false, count: 0, error: 'That folder changed after this dialog opened. Reopen it before deleting.' };
+        }
         if (folderId === DEFAULT_FOLDER_ID) {
             return { deleted: false, count: 0, error: 'The default project folder cannot be deleted.' };
         }
         const doomed = listFiles(folderId);
-        doomed.forEach(path => { delete store.files[path]; });
+        const deletedOpenFile = store.openFolderId === folderId;
+        const doomedEntries = storedFileEntries(folderId);
+        const previousActiveFolderId = store.activeFolderId;
+        const previousActiveRunId = store.activeRunId;
+        const previousOpenPath = store.openPath;
+        const previousOpenFolderId = store.openFolderId;
+        doomedEntries.forEach(item => { delete store.files[item.key]; });
         delete store.folders[folderId];
         if (store.activeFolderId === folderId) store.activeFolderId = DEFAULT_FOLDER_ID;
-        if (doomed.indexOf(store.openPath) >= 0) store.openPath = listFiles()[0] || '';
-        writeStore(store);
+        const selectedRun = findRun(store.activeRunId);
+        if (selectedRun && String(selectedRun.folderId || '') === String(folderId)) {
+            store.activeRunId = '';
+        }
+        if (deletedOpenFile) {
+            store.openPath = '';
+            store.openFolderId = '';
+        }
+        if (!writeStore(store, {
+            validateUnderLease: () => destructiveMutationAllowed(folderId),
+            preconditionCode: 'operation-active',
+            preconditionMessage: 'A Blueprint operation became active in this project before its deletion committed.'
+        })) {
+            store.folders[folderId] = folder;
+            doomedEntries.forEach(item => { store.files[item.key] = item.record; });
+            store.activeFolderId = previousActiveFolderId;
+            store.activeRunId = previousActiveRunId;
+            store.openPath = previousOpenPath;
+            store.openFolderId = previousOpenFolderId;
+            return { deleted: false, count: 0, error: `The folder deletion could not be saved (${persistence.lastError || 'browser storage unavailable'}).` };
+        }
         return { deleted: true, count: doomed.length, error: '' };
     }
 
@@ -773,6 +2841,109 @@
         'vendor', 'bower_components', '.next', '.nuxt', '.cache', 'coverage', '.gradle'
     ];
 
+    const SENSITIVE_SOURCE_DIRS = new Set([
+        '.aws', '.azure', '.gnupg', '.ssh', '.kube', '.docker', '.terraform',
+        '.git', '.hg', '.svn'
+    ]);
+    const SAFE_EXTENSIONLESS_SOURCE_NAMES = new Set([
+        'dockerfile', 'makefile', 'procfile', 'gemfile', 'rakefile', 'vagrantfile',
+        'license', 'readme', 'changelog', '.gitignore', '.dockerignore', '.editorconfig'
+    ]);
+
+    /** High-confidence credential paths that must never enter model context. */
+    function isSensitiveSourcePath(path) {
+        const normalized = String(path || '').replace(/\\/g, '/').replace(/^\/+/, '').toLowerCase();
+        const parts = normalized.split('/').filter(Boolean);
+        const base = parts[parts.length - 1] || '';
+        if (parts.some(part => SENSITIVE_SOURCE_DIRS.has(part))) return true;
+        if (base === '.env' || (base.startsWith('.env.')
+            && !/\.(example|sample|template|dist)$/.test(base))) return true;
+        if (['.npmrc', '.pypirc', '.netrc', '.dockercfg', 'id_rsa', 'id_dsa', 'id_ed25519',
+            'credentials', 'credentials.json', 'service-account.json'].includes(base)) return true;
+        if (/^(?:secrets?|credentials?|service[-_]?account|firebase[-_]?adminsdk)(?:\.|-|_)/.test(base)) return true;
+        if (/\.(?:pem|key|p12|pfx|jks|keystore|kdbx)$/.test(base)) return true;
+        return false;
+    }
+
+    /**
+     * Redact high-confidence inline secrets at the final model boundary. This is
+     * deliberately conservative: it preserves source structure while reducing
+     * the chance that a token pasted into an ordinary config/source file is sent.
+     * This is defense in depth, not a substitute for keeping secrets out of the
+     * imported project in the first place.
+     */
+    function sanitizeSourceForModel(value) {
+        let content = String(value || '');
+        let redactions = 0;
+        const replace = (pattern, replacer) => {
+            content = content.replace(pattern, (...args) => {
+                redactions += 1;
+                return typeof replacer === 'function' ? replacer(...args) : replacer;
+            });
+        };
+        replace(/-----BEGIN (?:(?:RSA|EC|OPENSSH|DSA|ENCRYPTED) )?PRIVATE KEY-----[\s\S]*?-----END (?:(?:RSA|EC|OPENSSH|DSA|ENCRYPTED) )?PRIVATE KEY-----/gi,
+            '[REDACTED_PRIVATE_KEY]');
+        replace(/-----BEGIN PGP PRIVATE KEY BLOCK-----[\s\S]*?-----END PGP PRIVATE KEY BLOCK-----/gi,
+            '[REDACTED_PRIVATE_KEY]');
+        replace(/\b(?:sk-(?:proj-)?[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[A-Z0-9]{16})\b/g,
+            '[REDACTED_SECRET]');
+        replace(/\b(?:xox[baprs]-[A-Za-z0-9-]{12,}|(?:sk|rk)_live_[A-Za-z0-9]{12,}|AIza[A-Za-z0-9_-]{20,})\b/g,
+            '[REDACTED_SECRET]');
+        replace(/\b(?:hf_[A-Za-z0-9]{20,}|glpat-[A-Za-z0-9_-]{20,}|whsec_[A-Za-z0-9_-]{20,}|npm_[A-Za-z0-9]{24,}|pypi-[A-Za-z0-9_-]{24,})\b/g,
+            '[REDACTED_SECRET]');
+        replace(/\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{20,}\b/g,
+            '[REDACTED_SECRET]');
+        replace(/\b(?:mfa\.[A-Za-z0-9_-]{20,}|[A-Za-z0-9_-]{23,28}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{25,40})\b/g,
+            '[REDACTED_SECRET]');
+        replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g,
+            '[REDACTED_JWT]');
+        replace(/\b(Authorization\s*:\s*Bearer\s+)[A-Za-z0-9._~+\/-]{12,}/gi,
+            (_match, prefix) => `${prefix}[REDACTED_SECRET]`);
+        replace(/\b(Authorization\s*:\s*Basic\s+)[A-Za-z0-9+/=]{8,}/gi,
+            (_match, prefix) => `${prefix}[REDACTED_SECRET]`);
+        replace(/(["']?(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|password|passwd|private[_-]?key|secret)["']?\s*[:=]\s*)(["'])([^\r\n"']{6,})(\2)/gi,
+            (_match, prefix, quote) => `${prefix}${quote}[REDACTED_SECRET]${quote}`);
+        replace(/(["']?(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|password|passwd|private[_-]?key|secret)["']?\s*[:=]\s*)([^\s,;}"']{6,})/gi,
+            (_match, prefix) => `${prefix}[REDACTED_SECRET]`);
+        replace(/(["']?(?:[a-z][a-z0-9]*[_-])*(?:key|token|secret|password|passwd)["']?\s*[:=]\s*)(["'])([^\r\n"']{6,})(\2)/gi,
+            (_match, prefix, quote) => `${prefix}${quote}[REDACTED_SECRET]${quote}`);
+        replace(/(["']?(?:[a-z][a-z0-9]*[_-])*(?:key|token|secret|password|passwd)["']?\s*[:=]\s*)([^\s,;}"']{6,})/gi,
+            (_match, prefix) => `${prefix}[REDACTED_SECRET]`);
+        replace(/([a-z][a-z0-9+.-]*:\/\/[^\s/:@]+:)[^\s/@]+(@)/gi,
+            (_match, prefix, suffix) => `${prefix}[REDACTED_SECRET]${suffix}`);
+        replace(/(--(?:password|passwd|api[-_]?key|access[-_]?token|auth[-_]?token|client[-_]?secret|private[-_]?key|secret)(?:\s+|=))(["'])([^\r\n"']{6,})(\2)/gi,
+            (_match, prefix, quote) => `${prefix}${quote}[REDACTED_SECRET]${quote}`);
+        replace(/(--(?:password|passwd|api[-_]?key|access[-_]?token|auth[-_]?token|client[-_]?secret|private[-_]?key|secret)(?:\s+|=))([^\s,;"']{6,})/gi,
+            (_match, prefix) => `${prefix}[REDACTED_SECRET]`);
+        replace(/(<((?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|password|passwd|private[_-]?key|secret))\b[^>]*>)([\s\S]*?)(<\/\2\s*>)/gi,
+            (_match, open, _tag, body, close) => body.trim()
+                ? `${open}[REDACTED_SECRET]${close}` : _match);
+
+        // Unknown token families still tend to be long, quoted, mixed-alphabet
+        // strings. Use entropy as a final conservative net, while deliberately
+        // leaving ordinary hashes, UUIDs, prose, and identifiers alone.
+        const entropyOf = token => {
+            const counts = new Map();
+            for (const char of token) counts.set(char, (counts.get(char) || 0) + 1);
+            let entropy = 0;
+            counts.forEach(count => {
+                const probability = count / token.length;
+                entropy -= probability * Math.log2(probability);
+            });
+            return entropy;
+        };
+        content = content.replace(/(["'`])([A-Za-z0-9+\/_=-]{32,})(\1)/g,
+            (match, quote, token) => {
+                if (/^[a-f0-9]+$/i.test(token) || /^[0-9a-f-]{32,}$/i.test(token)) return match;
+                const classes = [/[a-z]/, /[A-Z]/, /[0-9]/, /[+\/_=-]/]
+                    .filter(pattern => pattern.test(token)).length;
+                if (classes < 3 || entropyOf(token) < 3.75) return match;
+                redactions += 1;
+                return `${quote}[REDACTED_HIGH_ENTROPY_SECRET]${quote}`;
+            });
+        return { content, redactions };
+    }
+
     function extensionOf(name) {
         const clean = String(name || '');
         const dot = clean.lastIndexOf('.');
@@ -791,7 +2962,7 @@
     }
 
     function isSkippedPath(relativePath) {
-        const parts = relativePath.split('/');
+        const parts = String(relativePath || '').split('/').map(part => part.toLowerCase());
         // Drop the leading directory (the folder the user picked) for the check,
         // but still catch a skipped dir at any depth.
         return parts.some(part => IMPORT_SKIP_DIRS.indexOf(part) >= 0);
@@ -813,9 +2984,11 @@
         const cfg = Object.assign({
             maxFileKb: 1024,
             maxFiles: 1000,
-            maxTotalKb: 32768,
-            skipBinary: true
+            maxTotalKb: 2048,
+            skipBinary: true,
+            incompleteReason: ''
         }, options || {});
+        const upstreamIncompleteReason = clampText(String(cfg.incompleteReason || '').trim(), 500);
 
         const list = Array.prototype.slice.call(files || []);
         // `notEnumerated` counts files past the point where a budget was hit. They
@@ -839,6 +3012,7 @@
             // truncatedByBudget: that is a configured limit the user can raise in
             // Settings, this is a hard browser limit they cannot.
             storageFull: false,
+            scanIncomplete: Boolean(upstreamIncompleteReason),
             // How many imported files are safely on disk. Equals imported.length
             // unless storage filled, in which case the tail was rolled back.
             persisted: 0,
@@ -860,12 +3034,21 @@
         }
 
         const openPathBeforeImport = store.openPath;
+        const openFolderBeforeImport = store.openFolderId;
+        const activeFolderBeforeImport = store.activeFolderId;
+        const storeBeforeImport = clonePersistable(store);
+        if (!storeBeforeImport) {
+            result.error = 'The current project could not be snapshotted safely before import.';
+            return result;
+        }
         const created = createFolder(folderName || suggestedFolderName(list), 'imported');
         if (created.error) {
             result.error = created.error;
             return result;
         }
         result.folder = created.folder;
+
+        try {
 
         // Convert each budget once, then enforce BOTH independently — exactly as
         // sourceFilesForModel() does. An earlier version mixed units here
@@ -883,11 +3066,68 @@
         // through here unchanged and the `>= maxFiles` test simply never fires.
         const maxFiles = Math.max(1, Number(cfg.maxFiles) || 400);
         let totalBytes = 0;
+        const importedPaths = new Set();
+
+        const rollbackCancelledImport = () => {
+            const folderId = result.folder && result.folder.id;
+            const importedBeforeRollback = result.imported.length;
+            const partialBeforeRollback = clonePersistable(store);
+            if (!partialBeforeRollback) return false;
+            if (folderId) {
+                storedFileEntries(folderId).forEach(item => { delete store.files[item.key]; });
+                delete store.folders[folderId];
+            }
+            store.activeFolderId = store.folders[activeFolderBeforeImport]
+                ? activeFolderBeforeImport : DEFAULT_FOLDER_ID;
+            store.openPath = openPathBeforeImport;
+            store.openFolderId = openFolderBeforeImport;
+            const persisted = writeStore(store);
+            result.rolledBack = persisted;
+            result.partialImported = importedBeforeRollback;
+            if (persisted) {
+                result.imported = [];
+                result.persisted = 0;
+                return true;
+            }
+
+            // The attempted deletion existed only in memory. Reconcile from the
+            // durable winner before returning so a later save cannot erase the
+            // successfully persisted partial import by accident.
+            const reloaded = reloadStoreFromStorage();
+            if (!reloaded) {
+                assignStoreState(partialBeforeRollback);
+                knownStoreRevision = store.revision;
+                knownStoreCommitId = store.commitId;
+            }
+            const survived = new Set(folderId
+                ? storedFileEntries(folderId).map(item => String(item.record.path || item.key))
+                : []);
+            result.imported = result.imported.filter(item => survived.has(item.path));
+            result.persisted = result.imported.length;
+            return persisted;
+        };
+
+        const assertImportActive = () => {
+            if (cfg.signal && cfg.signal.aborted) {
+                const rolledBack = rollbackCancelledImport();
+                const error = new BlueprintAbort(rolledBack
+                    ? 'Folder import was cancelled and its partial project was removed.'
+                    : 'Folder import was cancelled, but its partial project could not be removed from storage. Reload before continuing.');
+                error.rolledBack = rolledBack;
+                error.partialImported = result.partialImported;
+                throw error;
+            }
+            if (result.folder && !store.folders[result.folder.id]) {
+                const error = new Error('The destination project root was removed while the folder import was running.');
+                error.code = 'project-root-missing';
+                throw error;
+            }
+        };
 
         // ---- chunked persistence -------------------------------------------
         // The previous shape wrote the whole store ONCE at the end. For a large
         // import that is a single synchronous JSON.stringify + setItem of
-        // everything -- the freeze -- and at ~32 MB it throws
+            // everything -- the freeze -- and once the origin quota is reached it throws
         // QuotaExceededError, which writeStore() catches and turns into `false`,
         // discarding every file that was read.
         //
@@ -902,20 +3142,49 @@
          * Returns false once storage is full, so the caller stops reading files it
          * can no longer store.
          */
-        const persistChunk = () => {
+        const persistChunk = finalizing => {
             sincePersist = 0;
+            const destination = result.folder && store.folders[result.folder.id];
+            if (destination) {
+                destination.importedCount = result.imported.length;
+                if (!finalizing && destination.importState !== 'incomplete') destination.importState = 'importing';
+                touchFolder(destination.id);
+            }
             if (writeStore(store)) {
                 result.persisted = result.imported.length;
                 return true;
             }
-            // localStorage refused the write but still holds the LAST GOOD state,
-            // so re-reading it is authoritative. This cannot clobber an earlier
-            // persisted copy of a path this chunk reused.
-            const good = readStore();
-            store.files = good.files;
+            // localStorage refused the write. Reload only through the guarded
+            // candidate path: malformed bytes must not replace the last good live
+            // snapshot, and an external deletion must never be reinterpreted as a
+            // quota failure with a phantom folder.
+            const failureCode = String(persistence.lastCode || 'storage-write-failed');
+            const reloaded = reloadStoreFromStorage();
+            if (!reloaded) {
+                assignStoreState(storeBeforeImport);
+                knownStoreRevision = store.revision;
+                knownStoreCommitId = store.commitId;
+            }
+            if (['concurrent-update', 'store-busy', 'external-reset', 'corrupt-store'].includes(failureCode)) {
+                const descriptions = {
+                    'store-busy': 'Another Blueprint window is saving project data. Wait for it to finish, then import again.',
+                    'concurrent-update': 'Project data changed in another window during import. Reload and import again.',
+                    'external-reset': 'Project data was erased in another window during import. The stale partial import was discarded.',
+                    'corrupt-store': 'Project data from another window is malformed. The last good project remains available for export, but saving is blocked.'
+                };
+                const error = new BlueprintModelError(descriptions[failureCode], {
+                    code: failureCode,
+                    retryable: failureCode === 'store-busy'
+                });
+                throw error;
+            }
             // Keep only the imports that genuinely survived, then recount, so
             // `persisted` never includes rolled-back files.
-            result.imported = result.imported.filter(item => good.files[item.path]);
+            const folderId = result.folder && result.folder.id;
+            const survived = new Set(folderId
+                ? storedFileEntries(folderId).map(item => String(item.record.path || item.key))
+                : []);
+            result.imported = result.imported.filter(item => survived.has(item.path));
             result.persisted = result.imported.length;
             result.storageFull = true;
             return false;
@@ -923,6 +3192,7 @@
 
         let sinceYield = 0;
         for (let index = 0; index < list.length; index += 1) {
+            assertImportActive();
             // Walking a huge FileList is one long synchronous block, so the page
             // cannot paint the busy state the caller just set and the tab looks
             // hung. Yield every 40 files: enough to stay fast on a small import,
@@ -934,6 +3204,7 @@
                     cfg.onProgress(index, list.length, result.imported.length);
                 }
                 await new Promise(resolve => setTimeout(resolve, 0));
+                assertImportActive();
             }
 
             const file = list[index];
@@ -944,9 +3215,17 @@
                 noteSkip(relativePath, 'ignored directory');
                 continue;
             }
+            if (isSensitiveSourcePath(relativePath)) {
+                noteSkip(relativePath, 'sensitive credential file');
+                continue;
+            }
             const ext = extensionOf(relativePath);
-            if (ext && IMPORTABLE_EXTENSIONS.indexOf(ext) < 0) {
-                noteSkip(relativePath, `unsupported type .${ext}`);
+            const baseName = relativePath.split('/').pop().toLowerCase();
+            const safeExtensionless = !ext && SAFE_EXTENSIONLESS_SOURCE_NAMES.has(baseName);
+            const safeEnvironmentTemplate = /^\.env\.(?:example|sample|template|dist)$/.test(baseName);
+            if ((!ext && !safeExtensionless)
+                || (ext && !safeEnvironmentTemplate && IMPORTABLE_EXTENSIONS.indexOf(ext) < 0)) {
+                noteSkip(relativePath, ext ? `unsupported type .${ext}` : 'unsupported extensionless file');
                 continue;
             }
             if (result.imported.length >= maxFiles) {
@@ -967,8 +3246,14 @@
 
             let content = '';
             try {
-                content = await readAsText(file);
+                content = await readAsText(file, cfg.signal, cfg.fileReadTimeoutMs);
+                assertImportActive();
             } catch (error) {
+                // Signal-driven read cancellation must pass through the central
+                // import abort path so partial files and the temporary root are
+                // rolled back before the rejection escapes.
+                if (cfg.signal && cfg.signal.aborted) assertImportActive();
+                if (error && error.code === 'project-root-missing') throw error;
                 noteSkip(relativePath, 'could not be read');
                 continue;
             }
@@ -982,14 +3267,30 @@
 
             // Store under a path that keeps the picked folder's internal structure
             // but drops its leading directory name, so paths stay short and stable.
-            const storedPath = stripLeadingDirectory(relativePath);
-            writeFile(storedPath, content, {
+            const storedPath = canonicalImportPath(relativePath);
+            if (!storedPath) {
+                noteSkip(relativePath, 'unsafe or empty path');
+                continue;
+            }
+            if (importedPaths.has(storedPath)
+                || findFileEntry(storedPath, result.folder.id, false)) {
+                noteSkip(relativePath, `canonical path collision (${storedPath})`);
+                continue;
+            }
+            const written = writeFile(storedPath, content, {
                 folder: result.folder.id,
                 origin: 'imported',
-                persist: false
+                persist: false,
+                expectedFile: null
             });
+            if (!written) {
+                assertImportActive();
+                noteSkip(relativePath, 'could not be stored');
+                continue;
+            }
             totalBytes += size;
-            result.imported.push({ path: storedPath, bytes: size });
+            importedPaths.add(written.path);
+            result.imported.push({ path: written.path, folderId: result.folder.id, bytes: size });
 
             sincePersist += 1;
             if (sincePersist >= CHUNK_FILES && !persistChunk()) {
@@ -1002,20 +3303,70 @@
         // writeFile() moves openPath to whatever it last wrote; putting the user's
         // previously open document back means importing a folder does not silently
         // switch the viewer to some arbitrary file from it.
-        store.openPath = openPathBeforeImport;
+        const lastImported = result.imported[result.imported.length - 1];
+        if (!lastImported || (store.openFolderId === result.folder.id && store.openPath === lastImported.path)) {
+            store.openPath = openPathBeforeImport;
+            store.openFolderId = openFolderBeforeImport;
+        }
 
+        const destination = result.folder && store.folders[result.folder.id];
+        if (destination) {
+            destination.importedCount = result.imported.length;
+            destination.importState = result.storageFull || result.truncatedByBudget
+                || result.scanIncomplete
+                ? 'incomplete' : 'complete';
+            destination.importError = result.storageFull
+                ? 'Browser storage filled before every selected file could be imported.'
+                : result.truncatedByBudget
+                    ? 'The configured import budget was reached before every selected file was examined.'
+                    : upstreamIncompleteReason;
+            result.folder = destination;
+        }
         // Flush the trailing partial chunk. openPath changed even if there is
         // nothing new to write, so the store is persisted either way.
-        if (!persistChunk()) {
-            writeStore(store);
-        }
+        persistChunk(true);
+        result.folder = (result.folder && store.folders[result.folder.id]) || result.folder;
+        result.incomplete = Boolean(result.folder && result.folder.importState === 'incomplete');
         return result;
+        } catch (error) {
+            const code = String((error && error.code) || persistence.lastCode || 'import-failed');
+            if (!(code === 'aborted' && error && error.rolledBack === true)) {
+                const destination = result.folder && store.folders[result.folder.id];
+                if (destination) {
+                    destination.importState = 'incomplete';
+                    destination.importedCount = storedFileEntries(destination.id).length;
+                    destination.importError = clampText(
+                        String((error && error.message) || 'The folder import stopped unexpectedly.'), 500);
+                    if (!writeStore(store)) {
+                        const reloaded = reloadStoreFromStorage();
+                        if (!reloaded) {
+                            assignStoreState(storeBeforeImport);
+                            knownStoreRevision = store.revision;
+                            knownStoreCommitId = store.commitId;
+                        }
+                    }
+                }
+            }
+            throw error;
+        }
     }
 
     function stripLeadingDirectory(relativePath) {
         const parts = relativePath.split('/');
         if (parts.length <= 1) return relativePath;
         return parts.slice(1).join('/');
+    }
+
+    function canonicalImportPath(relativePath) {
+        const raw = stripLeadingDirectory(String(relativePath || '').replace(/\\/g, '/'));
+        const parts = [];
+        for (const value of raw.split('/')) {
+            const segment = value.trim();
+            if (!segment || segment === '.') continue;
+            if (segment === '..' || /[\u0000-\u001f\u007f]/.test(segment)) return '';
+            parts.push(segment);
+        }
+        return cleanFilePath(parts.join('/'));
     }
 
     /** "my-app/src/main.js" -> "my-app", used to name an imported folder. */
@@ -1101,19 +3452,95 @@
      * stripLeadingDirectory() working unchanged.
      */
     async function collectFilesFromDirectoryHandle(rootHandle, options) {
-        const cfg = Object.assign({ onProgress: null }, options || {});
+        const cfg = Object.assign({
+            onProgress: null,
+            maxFiles: 10000,
+            maxEntries: 50000,
+            operationTimeoutMs: 30000,
+            scanTimeoutMs: 120000
+        }, options || {});
+        const maxFiles = Number.isFinite(Number(cfg.maxFiles))
+            ? Math.max(1, Math.min(50000, Math.floor(Number(cfg.maxFiles)))) : 10000;
+        const maxEntries = Number.isFinite(Number(cfg.maxEntries))
+            ? Math.max(1, Math.min(200000, Math.floor(Number(cfg.maxEntries)))) : 50000;
+        const operationTimeoutMs = Number.isFinite(Number(cfg.operationTimeoutMs))
+            ? Math.max(1, Math.min(120000, Number(cfg.operationTimeoutMs))) : 30000;
+        const scanTimeoutMs = Number.isFinite(Number(cfg.scanTimeoutMs))
+            ? Math.max(50, Math.min(600000, Number(cfg.scanTimeoutMs))) : 120000;
+        const scanDeadline = Date.now() + scanTimeoutMs;
         const out = {
             files: [],
             prunedDirs: 0,
             unreadable: 0,
             lockedDirs: 0,
             lockedSample: [],
+            truncated: false,
+            maxFiles,
+            maxEntries,
+            scannedEntries: 0,
+            entryLimitReached: false,
+            deadlineReached: false,
+            scanTimeoutMs,
             error: ''
         };
         // Symlink/junction loops would recurse forever; cap depth well past any
         // real project tree.
         const MAX_DEPTH = 64;
         const MAX_LOCKED_SAMPLE = 10;
+        const assertScanActive = () => {
+            if (cfg.signal && cfg.signal.aborted) {
+                throw new BlueprintAbort('Folder scan was cancelled.');
+            }
+            if (Date.now() >= scanDeadline) {
+                out.truncated = true;
+                out.deadlineReached = true;
+                const error = new Error('The folder scan reached its total time budget.');
+                error.code = 'scan-budget';
+                throw error;
+            }
+        };
+        const awaitScanOperation = (operation, label) => new Promise((resolve, reject) => {
+            let settled = false;
+            let timer = null;
+            const cleanup = () => {
+                if (timer) clearTimeout(timer);
+                if (cfg.signal && typeof cfg.signal.removeEventListener === 'function') {
+                    cfg.signal.removeEventListener('abort', onAbort);
+                }
+            };
+            const finish = (fn, value) => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                fn(value);
+            };
+            const onAbort = () => finish(reject, new BlueprintAbort('Folder scan was cancelled.'));
+            if (cfg.signal && cfg.signal.aborted) {
+                onAbort();
+                return;
+            }
+            if (cfg.signal && typeof cfg.signal.addEventListener === 'function') {
+                cfg.signal.addEventListener('abort', onAbort, { once: true });
+            }
+            const remainingMs = Math.max(1, scanDeadline - Date.now());
+            const timeoutMs = Math.min(operationTimeoutMs, remainingMs);
+            timer = setTimeout(() => {
+                const hitDeadline = timeoutMs >= remainingMs;
+                if (hitDeadline) {
+                    out.truncated = true;
+                    out.deadlineReached = true;
+                }
+                const error = new Error(hitDeadline
+                    ? 'The folder scan reached its total time budget.'
+                    : `${label} exceeded ${Math.round(operationTimeoutMs / 1000)} seconds`);
+                error.code = hitDeadline ? 'scan-budget' : 'scan-timeout';
+                finish(reject, error);
+            }, timeoutMs);
+            Promise.resolve(operation).then(
+                value => finish(resolve, value),
+                error => finish(reject, error)
+            );
+        });
 
         if (!rootHandle || typeof rootHandle.values !== 'function') {
             out.error = 'The picked directory could not be read.';
@@ -1121,10 +3548,28 @@
         }
 
         async function walk(dirHandle, prefix, depth) {
-            if (depth > MAX_DEPTH) return;
+            assertScanActive();
+            if (depth > MAX_DEPTH || out.truncated) return out.truncated;
             let sinceYield = 0;
+            let iterator = null;
             try {
-                for await (const entry of dirHandle.values()) {
+                const iterable = dirHandle.values();
+                iterator = iterable && typeof iterable[Symbol.asyncIterator] === 'function'
+                    ? iterable[Symbol.asyncIterator]() : null;
+                if (!iterator || typeof iterator.next !== 'function') {
+                    throw new Error('directory iterator is unavailable');
+                }
+                while (!out.truncated) {
+                    const next = await awaitScanOperation(iterator.next(), 'directory listing');
+                    if (!next || next.done) break;
+                    const entry = next.value;
+                    assertScanActive();
+                    if (out.scannedEntries >= maxEntries) {
+                        out.truncated = true;
+                        out.entryLimitReached = true;
+                        break;
+                    }
+                    out.scannedEntries += 1;
                     // Same repaint trick the importer uses: a directory listing
                     // can be long, and the scan must not freeze the page.
                     sinceYield += 1;
@@ -1134,6 +3579,7 @@
                             cfg.onProgress(out.files.length);
                         }
                         await new Promise(resolve => setTimeout(resolve, 0));
+                        assertScanActive();
                     }
 
                     const name = String((entry && entry.name) || '');
@@ -1141,18 +3587,23 @@
                     const relativePath = prefix + name;
 
                     if (entry.kind === 'directory') {
-                        if (IMPORT_SKIP_DIRS.indexOf(name) >= 0) {
+                        if (IMPORT_SKIP_DIRS.indexOf(name.toLowerCase()) >= 0) {
                             out.prunedDirs += 1;
                             continue;
                         }
-                        await walk(entry, relativePath + '/', depth + 1);
+                        if (await walk(entry, relativePath + '/', depth + 1)) break;
                     } else if (entry.kind === 'file') {
+                        if (out.files.length >= maxFiles) {
+                            out.truncated = true;
+                            break;
+                        }
                         // getFile() rejects when the OS file vanished or is
                         // exclusively locked; one such file must not abort the
                         // scan — importFolder() reports per-file failures the
                         // same way for the input path.
                         try {
-                            const file = await entry.getFile();
+                            const file = await awaitScanOperation(entry.getFile(), 'file metadata read');
+                            assertScanActive();
                             file.relativePath = relativePath;
                             out.files.push(file);
                         } catch (_) {
@@ -1160,7 +3611,10 @@
                         }
                     }
                 }
+                return out.truncated;
             } catch (error) {
+                if (error && error.code === 'aborted') throw error;
+                if (error && error.code === 'scan-budget') return true;
                 // Listing THIS directory failed (locked DB dir, revoked
                 // permission, transient filesystem state). Count it, keep a
                 // short human sample, and return so the parent's loop moves on
@@ -1170,6 +3624,14 @@
                 const label = prefix.replace(/\/$/, '');
                 if (out.lockedSample.length < MAX_LOCKED_SAMPLE) {
                     out.lockedSample.push({ path: label, reason: describeFsError(error) });
+                }
+                return out.truncated;
+            } finally {
+                if (out.truncated && iterator && typeof iterator.return === 'function') {
+                    try {
+                        const closing = iterator.return();
+                        if (closing && typeof closing.catch === 'function') closing.catch(() => {});
+                    } catch (_) { /* iterator cleanup is best-effort */ }
                 }
             }
         }
@@ -1191,17 +3653,64 @@
         return out;
     }
 
-    /** Read a File/Blob as UTF-8 text, promisified. */
-    function readAsText(file) {
-        if (file && typeof file.text === 'function') return file.text();
+    /** Read a File/Blob as UTF-8 text without letting one OS read wedge the app. */
+    function readAsText(file, signal, timeoutMs) {
         return new Promise((resolve, reject) => {
+            let reader = null;
+            let settled = false;
+            const limit = Number.isFinite(Number(timeoutMs))
+                ? Math.max(1, Math.min(120000, Number(timeoutMs))) : 30000;
+            let timer = null;
+            const cleanup = () => {
+                if (timer) clearTimeout(timer);
+                if (signal && typeof signal.removeEventListener === 'function') {
+                    signal.removeEventListener('abort', onAbort);
+                }
+            };
+            const finish = (fn, value) => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                fn(value);
+            };
+            const onAbort = () => {
+                if (reader && typeof reader.abort === 'function') {
+                    try { reader.abort(); } catch (_) { /* already completed */ }
+                }
+                finish(reject, new BlueprintAbort('Folder import was cancelled while reading a file.'));
+            };
+            if (signal && signal.aborted) {
+                onAbort();
+                return;
+            }
+            if (signal && typeof signal.addEventListener === 'function') {
+                signal.addEventListener('abort', onAbort, { once: true });
+            }
+            timer = setTimeout(() => {
+                if (reader && typeof reader.abort === 'function') {
+                    try { reader.abort(); } catch (_) { /* already completed */ }
+                }
+                const error = new Error(`file read exceeded ${Math.round(limit / 1000)} seconds`);
+                error.code = 'file-read-timeout';
+                finish(reject, error);
+            }, limit);
             try {
-                const reader = new FileReader();
-                reader.onload = () => resolve(String(reader.result || ''));
-                reader.onerror = () => reject(reader.error || new Error('read failed'));
+                if (file && typeof file.text === 'function') {
+                    Promise.resolve(file.text()).then(
+                        value => finish(resolve, String(value || '')),
+                        error => finish(reject, error)
+                    );
+                    return;
+                }
+                reader = new FileReader();
+                reader.onload = () => finish(resolve, String(reader.result || ''));
+                reader.onerror = () => finish(reject, reader.error || new Error('read failed'));
+                reader.onabort = () => {
+                    if (!settled) finish(reject, new BlueprintAbort('Folder import file read was aborted.'));
+                };
                 reader.readAsText(file);
             } catch (error) {
-                reject(error);
+                finish(reject, error);
             }
         });
     }
@@ -1235,6 +3744,12 @@
         'kt', 'c', 'h', 'cpp', 'cc', 'hpp', 'cs', 'php', 'swift', 'sh', 'sql',
         'vue', 'svelte'
     ];
+
+    /** Text formats whose bodies can provide implementation/config evidence. */
+    const IMPLEMENTATION_EXTENSIONS = CODE_EXTENSIONS.concat([
+        'css', 'scss', 'sass', 'less', 'html', 'htm', 'json', 'jsonc',
+        'yaml', 'yml', 'toml', 'xml', 'ini', 'cfg', 'conf', 'properties'
+    ]);
 
     /** Symbol caps tried, cheapest first, when deepening Tier 1. */
     const DEPTH_LADDER = [25, 60, 120];
@@ -1586,17 +4101,19 @@
     /**
      * Build a whole-codebase digest that fits a token budget.
      *
-     * Tier 1 (structural, ~62% of budget): every first-party file is digested,
-     * so coverage is 100% and the model can name any file it wants to read.
+     * Tier 1 (structural, ~62% of budget): first-party files are digested while
+     * room remains. Oversized projects degrade low-value entries to named stubs
+     * and, if necessary, disclose omitted paths rather than overrunning context.
      * Adaptive depth spends the remaining Tier-1 room on the highest-scoring
      * files; if Tier 1 overflows, the LOWEST-scoring files degrade to a
      * one-line stub rather than being dropped, keeping coverage total.
      *
      * Tier 2 (verbatim, the rest): full text of the highest-scoring CODE files
-     * that fit. Restricted to code and to files >= 40 lines, because in
+     * that fit. Normally restricted to code and to files >= 40 lines, because in
      * calibration an unrestricted Tier 2 spent 32% of the whole budget on two
      * HTML files while the file that actually explained the system (router.py)
-     * could never fit.
+     * could never fit. If that would leave the model with signatures only, one
+     * high-value implementation is sent in full or as a clearly marked excerpt.
      *
      * Returns { digestText, fullTextFiles, tokens, coverage, trimmed, deepened,
      * excluded, files } — `files` carries per-file digests for the UI to show
@@ -1605,14 +4122,51 @@
     function buildCodebaseDigest(records, options) {
         const cfg = Object.assign({ budgetTokens: 16000, minFullTextLines: 40 }, options || {});
         const budget = Math.max(512, Number(cfg.budgetTokens) || 16000);
-        const tier1Budget = Math.round(budget * 0.62);
-        const tier2Budget = Math.max(0, budget - tier1Budget - 200);
         const minLines = Math.max(1, Number(cfg.minFullTextLines) || 40);
+        const priorityPaths = new Set((Array.isArray(cfg.priorityFullTextPaths)
+            ? cfg.priorityFullTextPaths : []).map(String));
 
         const input = (Array.isArray(records) ? records : [])
             .filter(record => record && typeof record.content === 'string' && record.path);
         const scored = scoreFilesForDigest(input);
-        const real = scored.filter(file => file.score > -50);
+        const real = scored.filter(file => file.score > -50 || priorityPaths.has(file.path));
+
+        // Manual attachments are explicit user choices. Reserve room for them
+        // before expanding the structural map, while retaining at least a small
+        // map and fixed prompt-envelope allowance. Attachments that cannot fit
+        // are reported instead of being appended outside the advertised budget.
+        const fixedOverheadTokens = 200;
+        // Mirror skills.sourceBlock's per-file framing, including collision-safe
+        // fences and boundary tags. Counting only file bodies badly underpriced
+        // projects made of many small files because each block adds metadata.
+        const sourceEnvelopeTokens = file => {
+            const content = String(file.content || '');
+            const runs = content.match(/`+/g) || [];
+            const longest = runs.reduce((max, item) => Math.max(max, item.length), 0);
+            const fence = '`'.repeat(Math.max(3, longest + 1));
+            const safePath = String(file.path || '').replace(/[\r\n]+/g, ' ');
+            return estimateTokens([
+                `### ${safePath} (${file.lines.toLocaleString()} lines)`,
+                '',
+                `<BLUEPRINT_SOURCE_9999 characters="${content.length}">`,
+                fence,
+                content,
+                fence,
+                '</BLUEPRINT_SOURCE_9999>'
+            ].join('\n'));
+        };
+        const requestedPriorityTokens = real
+            .filter(file => priorityPaths.has(file.path))
+            .reduce((total, file) => total + sourceEnvelopeTokens(file), 0);
+        const maxPriorityReserve = Math.max(0, budget - 512 - fixedOverheadTokens);
+        const priorityReserve = Math.min(requestedPriorityTokens, maxPriorityReserve);
+        const availableAfterOverhead = Math.max(0, budget - fixedOverheadTokens);
+        const tier1Floor = Math.min(512, availableAfterOverhead);
+        const tier1Budget = Math.max(
+            tier1Floor,
+            Math.min(Math.round(budget * 0.62), budget - priorityReserve - fixedOverheadTokens)
+        );
+        const tier2Budget = Math.max(0, budget - tier1Budget - fixedOverheadTokens);
 
         const digests = real.map(file => Object.assign({}, file, {
             digest: digestFileStructure(file.path, file.content, 8),
@@ -1664,21 +4218,90 @@
             }
         }
 
-        // Tier 2: verbatim text for substantial code files, highest score first.
+        // Tier 2: verbatim text for explicit attachments first, then substantial
+        // code files by score. A non-fitting candidate is skipped so a smaller
+        // useful file later in the ranking still gets a chance.
         const fullTextFiles = [];
+        const fullTextRecords = [];
+        const rejectedPriorityFiles = [];
         let tier2Tokens = 0;
-        for (let i = 0; i < digests.length; i += 1) {
-            const item = digests[i];
-            if (CODE_EXTENSIONS.indexOf(item.extension) < 0) continue;
-            if (item.lines < minLines) continue;
-            const tokens = estimateTokens(item.content);
+        // Use `real`, not only map entries: a priority attachment may be one of
+        // the paths omitted from a very large structural map and still deserves
+        // a chance to consume the space explicitly reserved for it.
+        const tier2Candidates = real.slice().sort((left, right) => {
+            const priorityDelta = Number(priorityPaths.has(right.path)) - Number(priorityPaths.has(left.path));
+            return priorityDelta || right.score - left.score;
+        });
+        for (let i = 0; i < tier2Candidates.length; i += 1) {
+            const item = tier2Candidates[i];
+            const isPriority = priorityPaths.has(item.path);
+            if (!isPriority && CODE_EXTENSIONS.indexOf(item.extension) < 0) continue;
+            if (!isPriority && item.lines < minLines) continue;
+            const tokens = sourceEnvelopeTokens(item);
             // A single file may not eat more than 75% of Tier 2, or one giant
-            // module crowds out every other file the model might need.
-            if (tokens > tier2Budget * 0.75) continue;
-            if (tier2Tokens + tokens > tier2Budget) break;
+            // heuristic module crowds out every other file the model might need.
+            // Explicit attachments are exempt from that heuristic but never from
+            // the total budget.
+            if (!isPriority && tokens > tier2Budget * 0.75) continue;
+            if (tier2Tokens + tokens > tier2Budget) {
+                if (isPriority) rejectedPriorityFiles.push(item.path);
+                continue;
+            }
             tier2Tokens += tokens;
             fullTextFiles.push(item.path);
+            fullTextRecords.push({ path: item.path, content: item.content, excerpted: false });
         }
+
+        // A code-reading skill is not allowed to infer runtime behaviour from
+        // signatures alone. If the normal size/length heuristic selected no
+        // implementation, add the best non-priority code file in full when it
+        // fits, otherwise use a deterministic head+tail excerpt. Explicit files
+        // that exceeded the combined budget remain rejected rather than being
+        // silently downgraded from "attached in full" to an excerpt.
+        if (!fullTextRecords.length && tier2Budget > 0) {
+            const fallback = tier2Candidates.find(item =>
+                IMPLEMENTATION_EXTENSIONS.indexOf(item.extension) >= 0 && !priorityPaths.has(item.path));
+            if (fallback) {
+                const remaining = Math.max(0, tier2Budget - tier2Tokens);
+                const fullTokens = sourceEnvelopeTokens(fallback);
+                if (fullTokens <= remaining) {
+                    tier2Tokens += fullTokens;
+                    fullTextFiles.push(fallback.path);
+                    fullTextRecords.push({ path: fallback.path, content: fallback.content, excerpted: false });
+                } else {
+                    const headingTokens = estimateTokens(`### ${fallback.path} (excerpt)\n\n`);
+                    const availableContentTokens = Math.max(0, remaining - headingTokens - 8);
+                    const maxChars = Math.floor(availableContentTokens * 3.8);
+                    if (maxChars >= 240) {
+                        const marker = '\n\n[... Blueprint omitted the middle of this file to stay within the source budget ...]\n\n';
+                        const bodyBudget = Math.max(120, maxChars - marker.length);
+                        const headChars = Math.floor(bodyBudget * 0.7);
+                        const tailChars = Math.max(1, bodyBudget - headChars);
+                        const excerpt = fallback.content.length <= bodyBudget
+                            ? fallback.content
+                            : fallback.content.slice(0, headChars) + marker + fallback.content.slice(-tailChars);
+                        const excerptRecord = Object.assign({}, fallback, {
+                            content: excerpt,
+                            lines: excerpt.split('\n').length
+                        });
+                        const excerptTokens = sourceEnvelopeTokens(excerptRecord);
+                        if (excerptTokens <= remaining) {
+                            tier2Tokens += excerptTokens;
+                            fullTextFiles.push(fallback.path);
+                            fullTextRecords.push({ path: fallback.path, content: excerpt, excerpted: true });
+                        }
+                    }
+                }
+            }
+        }
+
+        priorityPaths.forEach(path => {
+            if (real.some(item => item.path === path)
+                && fullTextFiles.indexOf(path) < 0
+                && rejectedPriorityFiles.indexOf(path) < 0) {
+                rejectedPriorityFiles.push(path);
+            }
+        });
 
         const excluded = scored.length - real.length;
 
@@ -1694,7 +4317,7 @@
                 + (omitted.length > 8 ? `, and ${(omitted.length - 8).toLocaleString()} more` : '')
                 + '. They exist in the project but were not examined — do not assume their contents.]';
             let noteTokens = estimateTokens(omissionNote);
-            while (tier1Tokens + noteTokens > tier1Budget && digests.length > 1) {
+            while (tier1Tokens + noteTokens > tier1Budget && digests.length > 0) {
                 const dropped = digests.pop();
                 tier1Tokens -= estimateTokens(dropped.digest.text);
                 omitted.unshift(dropped.path);
@@ -1718,11 +4341,16 @@
         const coverage = real.length
             ? digests.filter(item => !item.trimmed).length / real.length
             : 0;
+        const renderedSourceTokens = (digestText || fullTextRecords.length)
+            ? tier1Tokens + tier2Tokens + fixedOverheadTokens
+            : 0;
 
         return {
             digestText,
             fullTextFiles,
-            tokens: tier1Tokens + tier2Tokens,
+            fullTextRecords,
+            rejectedPriorityFiles,
+            tokens: renderedSourceTokens,
             tier1Tokens,
             tier2Tokens,
             budget,
@@ -1762,23 +4390,550 @@
         return findRun(store.activeRunId);
     }
 
+    /** Atomically select a run and its owning project root. */
+    function selectRun(runId, folderId) {
+        const run = findRun(String(runId || ''));
+        if (!run) return false;
+        const suppliedFolderId = typeof folderId === 'string' ? folderId : '';
+        if (suppliedFolderId && run.folderId && suppliedFolderId !== run.folderId) {
+            return false;
+        }
+        const requestedFolderId = String(folderId || run.folderId || '');
+        // Historical runs survive project-root deletion for audit/transcript
+        // access. Preserve their original missing owner on the run, but keep the
+        // live workspace on a valid root so no artifact can drift into another
+        // project with the same relative path.
+        const targetFolderId = store.folders[requestedFolderId]
+            ? requestedFolderId
+            : (store.folders[store.activeFolderId] ? store.activeFolderId : DEFAULT_FOLDER_ID);
+        const previousActiveRunId = store.activeRunId;
+        const previousActiveFolderId = store.activeFolderId;
+        store.activeRunId = run.id;
+        store.activeFolderId = targetFolderId;
+        if (!writeStore(store)) {
+            store.activeRunId = previousActiveRunId;
+            store.activeFolderId = previousActiveFolderId;
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Restore the owner-qualified project selection in one project-store commit.
+     * Host snapshots can carry folder, file and run fields from slightly
+     * different moments; callers resolve precedence first, then this function
+     * either persists the complete tuple or leaves the prior tuple untouched.
+     */
+    function restoreSelection(selection) {
+        const value = selection && typeof selection === 'object' ? selection : {};
+        const previous = {
+            activeFolderId: store.activeFolderId,
+            openPath: store.openPath,
+            openFolderId: store.openFolderId,
+            activeRunId: store.activeRunId
+        };
+
+        const hasExplicitActiveFolder = hasOwn(value, 'activeFolderId')
+            && typeof value.activeFolderId === 'string'
+            && hasRecord(store.folders, value.activeFolderId);
+        let activeFolderId = hasExplicitActiveFolder ? value.activeFolderId : store.activeFolderId;
+        let activeRunId = store.activeRunId;
+        if (typeof value.activeRunId === 'string') {
+            const requestedRun = findRun(value.activeRunId);
+            // An explicit stale id is not permission to select an unrelated run.
+            activeRunId = requestedRun ? requestedRun.id : '';
+        }
+
+        let openPath = store.openPath;
+        let openFolderId = store.openFolderId;
+        if (typeof value.openPath === 'string') {
+            const cleanPath = cleanFilePath(value.openPath);
+            const hasExplicitFolder = hasOwn(value, 'openFolderId');
+            const explicitFolder = hasExplicitFolder && typeof value.openFolderId === 'string'
+                && hasRecord(store.folders, value.openFolderId) ? value.openFolderId : '';
+            // A present-but-invalid owner is stale/corrupt qualified state. Clear
+            // it rather than falling across roots. Only truly ownerless legacy
+            // snapshots may use the active-root/unique-path migration fallback.
+            let entry = null;
+            if (cleanPath && hasExplicitFolder && explicitFolder) {
+                entry = findFileEntry(cleanPath, explicitFolder, false);
+            } else if (cleanPath && !hasExplicitFolder && hasExplicitActiveFolder) {
+                entry = findFileEntry(cleanPath, activeFolderId, false);
+            } else if (cleanPath && !hasExplicitFolder) {
+                entry = findFileEntry(cleanPath, '', true);
+            }
+            openPath = entry ? cleanPath : '';
+            openFolderId = entry ? String(entry.record.folder || '') : '';
+            if (entry && store.folders[openFolderId]) activeFolderId = openFolderId;
+        }
+
+        const selectedRun = findRun(activeRunId);
+        const folderPinnedBySnapshot = hasExplicitActiveFolder
+            || typeof value.openPath === 'string';
+        if (selectedRun) {
+            const runFolderId = String(selectedRun.folderId || '');
+            const terminalOrphan = !store.folders[runFolderId]
+                && selectedRun.status !== 'running';
+            if (typeof value.activeRunId === 'string' && !folderPinnedBySnapshot
+                && store.folders[runFolderId]) {
+                // A run-only restore is an explicit request to reopen that run;
+                // move the root with it, as selectRun() does.
+                activeFolderId = runFolderId;
+            } else if (!terminalOrphan
+                && (!store.folders[runFolderId] || runFolderId !== activeFolderId)) {
+                // Folder/file precedence wins. Never pair one root's tree and
+                // source context with another live root's transcript/compaction.
+                // A terminal orphan is intentionally read-only and may remain
+                // selected while the live tree stays on a valid root.
+                activeRunId = '';
+            }
+        }
+
+        const unchanged = activeFolderId === previous.activeFolderId
+            && openPath === previous.openPath
+            && openFolderId === previous.openFolderId
+            && activeRunId === previous.activeRunId;
+        if (unchanged) return true;
+
+        store.activeFolderId = activeFolderId;
+        store.openPath = openPath;
+        store.openFolderId = openFolderId;
+        store.activeRunId = activeRunId;
+        if (!writeStore(store)) {
+            store.activeFolderId = previous.activeFolderId;
+            store.openPath = previous.openPath;
+            store.openFolderId = previous.openFolderId;
+            store.activeRunId = previous.activeRunId;
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Repair a crash-interrupted cross-key tab commit on cold load. Workspace
+     * tabs and project selection live under separate localStorage keys; if the
+     * process exits after the tab key commits, a valid active file tab is the
+     * most recent user intent and therefore wins over the older project tuple.
+     */
+    function reconcileWorkspaceSelection(workspace) {
+        if (!workspace || typeof workspace !== 'object'
+            || !Array.isArray(workspace.tabs)) {
+            return { ok: true, changed: false, error: '' };
+        }
+        const activeTabId = String(workspace.activeTabId || '');
+        const tab = workspace.tabs.find(item => item && String(item.id || '') === activeTabId);
+        if (!tab || tab.kind !== 'file') {
+            return { ok: true, changed: false, error: '' };
+        }
+        const folderId = String(tab.folderId || '');
+        const path = cleanFilePath(String(tab.path || ''));
+        const record = folderId && path ? readFile(path, folderId) : null;
+        if (!record || record.path !== path || record.folder !== folderId) {
+            return {
+                ok: false,
+                changed: false,
+                error: 'The active saved file tab no longer has an exact project-root file owner.'
+            };
+        }
+        const selectedRun = activeRun();
+        const alreadyAligned = store.activeFolderId === folderId
+            && store.openPath === path
+            && store.openFolderId === folderId
+            && (!selectedRun || String(selectedRun.folderId || '') === folderId);
+        if (alreadyAligned) return { ok: true, changed: false, error: '' };
+        if (!restoreSelection({ activeFolderId: folderId, openPath: path, openFolderId: folderId })) {
+            return {
+                ok: false,
+                changed: false,
+                error: String(persistence.lastError || 'the reconciled project selection could not be saved')
+            };
+        }
+        return { ok: true, changed: true, error: '' };
+    }
+
+    // Session-local tombstones prevent a late async checkpoint from resurrecting
+    // a run the user deleted while cancellation acknowledgement was still in
+    // flight. Reload clears them only after every old callback is gone.
+    const deletedRunIds = new Set();
     /** Returns false when the in-memory change could not be persisted. */
     function saveRun(run) {
+        if (!run || !run.id) return false;
+        const executionOwner = readRunOwner(run.id);
+        const running = run.status === 'running';
+        const expectedLeaseId = runLeaseId(run);
+        const fencedExecutionMutation = Boolean(expectedLeaseId);
+        const ownerInvalid = fencedExecutionMutation
+            ? (!executionOwner || !executionOwner.owned || !executionOwner.live
+                || executionOwner.leaseId !== expectedLeaseId)
+            : running
+                ? true
+                : Boolean(executionOwner && executionOwner.live && !executionOwner.owned);
+        if (ownerInvalid) {
+            recordPersistenceFailure(new Error(
+                'This run is owned by another Blueprint window or its execution lease expired.'
+            ), 'run-owner-lost');
+            return false;
+        }
         const index = store.runs.findIndex(item => item && item.id === run.id);
-        if (index >= 0) store.runs[index] = run;
+        const isNew = index < 0;
+        if (isNew && deletedRunIds.has(run.id)) return false;
+        const previousRuns = store.runs.slice();
+        const previousActiveRunId = store.activeRunId;
+        const previousActiveFolderId = store.activeFolderId;
+        // persistenceError describes the current process's last attempted write;
+        // it is not durable run state. Never serialize a stale failure after a
+        // later checkpoint succeeds.
+        delete run.persistenceError;
+        if (!isNew) store.runs[index] = run;
         else store.runs.unshift(run);
         store.runs = store.runs.slice(0, 60);
-        store.activeRunId = run.id;
-        return writeStore(store);
+        // Saving progress is not navigation. A late callback from an older
+        // parallel run must never steal focus from the run the user opened (or
+        // from a newer run). New runs still become active, and the currently
+        // active run remains active while it checkpoints. An explicitly empty
+        // selection stays empty; a late checkpoint must not undo Clear chat or
+        // cross back into an older project root.
+        if (isNew) {
+            if (run.folderId && store.folders[run.folderId]) {
+                store.activeFolderId = run.folderId;
+            }
+            store.activeRunId = run.id;
+        } else if (store.activeRunId === run.id) {
+            store.activeRunId = run.id;
+        }
+        if (!writeStore(store, {
+            validateUnderLease: () => validateRunMutationUnderLease(
+                run.id, expectedLeaseId, running),
+            preconditionCode: 'run-owner-lost',
+            preconditionMessage: 'This run lost its execution lease before its checkpoint committed.'
+        })) {
+            store.activeRunId = previousActiveRunId;
+            store.activeFolderId = previousActiveFolderId;
+            if (isNew) {
+                store.runs = previousRuns;
+            } else {
+                // Preserve live object identity and the newest partial output for
+                // recovery/export. Replacing the run from a snapshot here would
+                // detach every step reference still held by the streaming UI.
+                run.persistenceError = String(persistence.lastError || 'Project storage is unavailable.');
+            }
+            return false;
+        }
+        return true;
     }
 
-    function deleteRun(runId) {
+    function deleteRun(runId, options) {
+        const opts = options && typeof options === 'object' ? options : {};
+        const expectedLeaseId = String(opts.expectedLeaseId || '');
+        const ownerAtStart = readRunOwner(runId);
+        const deletionOwnsLease = Boolean(expectedLeaseId && ownerAtStart
+            && ownerAtStart.owned && ownerAtStart.live
+            && ownerAtStart.leaseId === expectedLeaseId);
+        if ((expectedLeaseId && !deletionOwnsLease)
+            || (!expectedLeaseId && ownerAtStart && ownerAtStart.live)) {
+            recordPersistenceFailure(new Error(
+                'This run is actively owned by another execution and cannot be deleted.'
+            ), 'run-owner-lost');
+            return false;
+        }
+        const deletedRun = store.runs.find(run => run && run.id === runId) || null;
+        const existed = Boolean(deletedRun);
+        const previousRuns = store.runs.slice();
+        const previousActiveRunId = store.activeRunId;
         store.runs = store.runs.filter(run => run && run.id !== runId);
-        if (store.activeRunId === runId) store.activeRunId = store.runs[0]?.id || '';
-        return writeStore(store);
+        if (store.activeRunId === runId) {
+            const sameRoot = store.runs.find(run => run && deletedRun
+                && String(run.folderId || '') === String(deletedRun.folderId || ''));
+            store.activeRunId = sameRoot ? sameRoot.id : '';
+        }
+        if (!writeStore(store, {
+            validateUnderLease: () => {
+                const current = readRunOwner(runId);
+                if (expectedLeaseId) {
+                    return Boolean(current && current.owned && current.live
+                        && current.leaseId === expectedLeaseId);
+                }
+                return !current || !current.live;
+            },
+            preconditionCode: 'run-owner-lost',
+            preconditionMessage: 'This run became active before its deletion committed.'
+        })) {
+            store.runs = previousRuns;
+            store.activeRunId = previousActiveRunId;
+            return false;
+        }
+        if (existed) deletedRunIds.add(runId);
+        // Never perform an unfenced release after the durable delete. Another
+        // execution could claim this id between the commit and cleanup.
+        const ownedLeaseId = expectedLeaseId || String(
+            (ownerAtStart && ownerAtStart.owned && ownerAtStart.leaseId) || ''
+        );
+        if (ownedLeaseId) releaseRunOwnership(runId, ownedLeaseId);
+        return true;
     }
 
-    function createRun(skill, idea) {
+    function clearRuns() {
+        const previousRuns = store.runs.slice();
+        const previousActiveRunId = store.activeRunId;
+        store.runs = [];
+        store.activeRunId = '';
+        if (!writeStore(store, {
+            validateUnderLease: () => destructiveMutationAllowed(),
+            preconditionCode: 'operation-active',
+            preconditionMessage: 'A Blueprint operation became active before run history was cleared.'
+        })) {
+            store.runs = previousRuns;
+            store.activeRunId = previousActiveRunId;
+            return false;
+        }
+        previousRuns.forEach(run => {
+            if (run && run.id) {
+                deletedRunIds.add(run.id);
+                releaseRunOwnership(run.id);
+            }
+        });
+        return true;
+    }
+
+    function assignStoreState(next) {
+        const source = next && typeof next === 'object' ? next : emptyStore();
+        const restoreObjectInPlace = (target, incoming) => {
+            if (!target || !incoming || target === incoming
+                || typeof target !== 'object' || typeof incoming !== 'object'
+                || Array.isArray(target) || Array.isArray(incoming)) return incoming;
+            Object.keys(target).forEach(key => {
+                if (!hasOwn(incoming, key)) delete target[key];
+            });
+            Object.keys(incoming).forEach(key => {
+                const currentValue = target[key];
+                const nextValue = incoming[key];
+                if (Array.isArray(currentValue) && Array.isArray(nextValue)) {
+                    const byId = new Map(currentValue
+                        .filter(item => item && typeof item === 'object' && item.id)
+                        .map(item => [String(item.id), item]));
+                    const restored = nextValue.map(item => {
+                        const existingItem = item && typeof item === 'object' && item.id
+                            ? byId.get(String(item.id)) : null;
+                        return existingItem
+                            ? restoreObjectInPlace(existingItem, item)
+                            : item;
+                    });
+                    currentValue.splice(0, currentValue.length, ...restored);
+                    target[key] = currentValue;
+                } else if (currentValue && nextValue
+                    && typeof currentValue === 'object' && typeof nextValue === 'object'
+                    && !Array.isArray(currentValue) && !Array.isArray(nextValue)) {
+                    target[key] = restoreObjectInPlace(currentValue, nextValue);
+                } else {
+                    target[key] = nextValue;
+                }
+            });
+            return target;
+        };
+        const existingRuns = new Map((Array.isArray(store.runs) ? store.runs : [])
+            .filter(run => run && run.id)
+            .map(run => [String(run.id), run]));
+        const incomingRunIds = new Set((Array.isArray(source.runs) ? source.runs : [])
+            .filter(run => run && run.id)
+            .map(run => String(run.id)));
+        existingRuns.forEach((_run, id) => {
+            // An authoritative reload/rollback that no longer contains a run is
+            // a durable deletion precondition. Keep stale async/history object
+            // references from adding it back as if it were brand new.
+            if (!incomingRunIds.has(id)) deletedRunIds.add(id);
+        });
+        store.version = STORE_VERSION;
+        store.revision = Number.isSafeInteger(source.revision) && source.revision >= 0
+            ? source.revision : 0;
+        store.commitId = typeof source.commitId === 'string' ? source.commitId : '';
+        store.folders = source.folders && typeof source.folders === 'object'
+            ? safeRecordMap(source.folders) : emptyStore().folders;
+        if (!hasRecord(store.folders, DEFAULT_FOLDER_ID)) {
+            store.folders[DEFAULT_FOLDER_ID] = emptyFolder(DEFAULT_FOLDER_ID, 'Blueprint project', 'default');
+        }
+        store.files = source.files && typeof source.files === 'object'
+            ? safeRecordMap(source.files) : safeRecordMap();
+        store.runs = (Array.isArray(source.runs) ? source.runs : []).map(incoming => {
+            if (!incoming || !incoming.id) return incoming;
+            const existing = existingRuns.get(String(incoming.id));
+            if (!existing || existing === incoming) return incoming;
+            const boundLeaseId = String(existing[RUN_LEASE_SYMBOL] || '');
+            restoreObjectInPlace(existing, incoming);
+            const currentOwner = boundLeaseId ? readRunOwner(existing.id) : null;
+            if (boundLeaseId && currentOwner && currentOwner.owned
+                && currentOwner.live && currentOwner.leaseId === boundLeaseId) {
+                try {
+                    Object.defineProperty(existing, RUN_LEASE_SYMBOL, {
+                        value: boundLeaseId,
+                        configurable: true,
+                        enumerable: false,
+                        writable: false
+                    });
+                } catch (_) { /* the next ownership assertion still fails closed */ }
+            } else {
+                try { delete existing[RUN_LEASE_SYMBOL]; } catch (_) { /* transient only */ }
+            }
+            return existing;
+        }).filter(Boolean);
+        store.openPath = String(source.openPath || '');
+        store.openFolderId = String(source.openFolderId || '');
+        store.activeRunId = String(source.activeRunId || '');
+        store.activeFolderId = hasRecord(store.folders, source.activeFolderId)
+            ? source.activeFolderId : DEFAULT_FOLDER_ID;
+    }
+
+    function restoreStorageValues(values, expectedCurrent, keys) {
+        let conflict = false;
+        try {
+            const targets = Array.isArray(keys) ? keys : Object.keys(values);
+            // Validate the complete rollback set before changing any key. This
+            // avoids a half-rollback when a later key has already been replaced
+            // by another window.
+            targets.forEach(key => {
+                if (expectedCurrent && Object.prototype.hasOwnProperty.call(expectedCurrent, key)
+                    && window.localStorage.getItem(key) !== expectedCurrent[key]) {
+                    conflict = true;
+                }
+            });
+            if (conflict) return { ok: false, conflict: true };
+            targets.forEach(key => {
+                if (expectedCurrent && Object.prototype.hasOwnProperty.call(expectedCurrent, key)
+                    && window.localStorage.getItem(key) !== expectedCurrent[key]) {
+                    conflict = true;
+                    return;
+                }
+                if (values[key] === null) window.localStorage.removeItem(key);
+                else window.localStorage.setItem(key, values[key]);
+            });
+            return { ok: !conflict, conflict };
+        } catch (error) {
+            console.warn('[codalio-blueprint] unable to roll back storage transaction', error);
+            return { ok: false, conflict };
+        }
+    }
+
+    /**
+     * Reset project, settings and workspace keys as one recoverable transaction.
+     * localStorage has no native transaction, so every raw value is snapshotted
+     * and restored if any later key refuses the change.
+     */
+    function clearAllData(nextSettings) {
+        let transactionLease = null;
+        try {
+        transactionLease = acquireStoreWriteLease();
+        if (!transactionLease.ok) {
+            return {
+                ok: false,
+                rolledBack: true,
+                error: 'Another Blueprint window is saving data. Wait for it to finish, then try again.'
+            };
+        }
+        if (!destructiveMutationAllowed()) {
+            return {
+                ok: false,
+                rolledBack: true,
+                error: 'A Blueprint operation is active. Stop it before clearing all data.'
+            };
+        }
+        const keys = [PROJECTS_KEY, SETTINGS_KEY, WORKSPACE_KEY];
+        const rawBefore = {};
+        try {
+            keys.forEach(key => { rawBefore[key] = window.localStorage.getItem(key); });
+        } catch (error) {
+            return { ok: false, rolledBack: true, error: String(error.message || error) };
+        }
+
+        let stateBefore = clonePersistable(store);
+        if (!stateBefore || persistedStoreValidationError(stateBefore)) {
+            stateBefore = clonePersistable(lastGoodStoreSnapshot);
+        }
+        if (!stateBefore) {
+            return { ok: false, rolledBack: true, error: 'The current project state could not be snapshotted safely.' };
+        }
+        const recoveryBefore = storageRecoveryState();
+        const projectLoadErrorBefore = projectStoreLoadError;
+        const externalResetBefore = externalResetObserved;
+        const priorRuns = store.runs.slice();
+        const fresh = emptyStore();
+        fresh.revision = store.revision;
+        assignStoreState(fresh);
+
+        let failedStage = '';
+        const writtenKeys = [];
+        const expectedCurrent = {};
+        if (!writeStore(store, {
+            allowCorruptReset: true,
+            allowMissingReset: true,
+            transactionLease
+        })) failedStage = 'project data';
+        else {
+            writtenKeys.push(PROJECTS_KEY);
+            expectedCurrent[PROJECTS_KEY] = window.localStorage.getItem(PROJECTS_KEY);
+            if (!writeSettings(Object.assign({}, nextSettings || DEFAULT_SETTINGS), {
+                allowCorruptReset: true,
+                expectedRaw: rawBefore[SETTINGS_KEY],
+                transactionLease
+            })) failedStage = 'settings';
+            else {
+                writtenKeys.push(SETTINGS_KEY);
+                expectedCurrent[SETTINGS_KEY] = window.localStorage.getItem(SETTINGS_KEY);
+                if (!clearWorkspace({ allowCorruptReset: true, transactionLease })) failedStage = 'tab layout';
+                else {
+                    writtenKeys.push(WORKSPACE_KEY);
+                    expectedCurrent[WORKSPACE_KEY] = null;
+                }
+            }
+        }
+
+        if (failedStage) {
+            const rollback = restoreStorageValues(rawBefore, expectedCurrent, writtenKeys);
+            const concurrent = persistence.lastCode === 'concurrent-update' || rollback.conflict;
+            const rolledBack = rollback.ok;
+            const authoritative = rolledBack && !concurrent ? stateBefore : readStore();
+            assignStoreState(authoritative);
+            knownStoreRevision = store.revision;
+            knownStoreCommitId = store.commitId;
+            lastGoodStoreSnapshot = clonePersistable(store);
+            if (rolledBack && !concurrent) {
+                projectStoreLoadError = projectLoadErrorBefore;
+                externalResetObserved = externalResetBefore;
+                settingsLoadError = recoveryBefore.settings;
+                workspaceLoadError = recoveryBefore.workspace;
+            } else {
+                // Re-read the independent blobs too so the exposed recovery state
+                // describes the authoritative bytes that won the transaction.
+                readSettingsRaw();
+                readWorkspaceRaw();
+            }
+            return {
+                ok: false,
+                rolledBack,
+                error: concurrent
+                    ? 'Project data changed in another window. This window reloaded the newer stored state; try again.'
+                    : rolledBack
+                    ? `Could not erase ${failedStage}; the previous Blueprint data was restored.`
+                    : `Could not erase ${failedStage}, and rollback also failed. Reload before continuing.`
+            };
+        }
+
+        priorRuns.forEach(run => {
+            if (run && run.id) {
+                deletedRunIds.add(run.id);
+                releaseRunOwnership(run.id);
+            }
+        });
+        return { ok: true, rolledBack: false, error: '' };
+        } finally {
+            if (transactionLease && transactionLease.ok) releaseStoreWriteLease(transactionLease);
+        }
+    }
+
+    function createRun(skill, idea, options) {
+        const opts = options && typeof options === 'object' ? options : {};
+        const requestedFolderId = typeof opts.folderId === 'string' ? opts.folderId : '';
+        const runFolderId = requestedFolderId && store.folders[requestedFolderId]
+            ? requestedFolderId
+            : (store.folders[store.activeFolderId] ? store.activeFolderId : DEFAULT_FOLDER_ID);
         const run = {
             id: uid('run'),
             skillId: skill.id,
@@ -1788,13 +4943,32 @@
             createdAt: new Date().toISOString(),
             status: 'running',
             projectName: '',
+            folderId: runFolderId,
             slug: '',
             phases: [],
             transcript: [],
             writtenPaths: [],
+            writtenFiles: [],
             error: ''
         };
-        saveRun(run);
+        if (requestedFolderId && !store.folders[requestedFolderId]) {
+            run.persistenceError = 'The project root for this run no longer exists.';
+            return run;
+        }
+        if (!claimRunOwnership(run.id)) {
+            run.persistenceError = 'The run could not claim a durable execution owner.';
+            return run;
+        }
+        if (!bindRunOwnership(run)) {
+            run.persistenceError = 'The run could not bind its durable execution fence.';
+            releaseRunOwnership(run.id);
+            return run;
+        }
+        deletedRunIds.delete(run.id);
+        if (!saveRun(run)) {
+            run.persistenceError = String(persistence.lastError || 'Project storage is unavailable.');
+            releaseRunOwnership(run.id);
+        }
         return run;
     }
 
@@ -1826,43 +5000,259 @@
         const opts = options || {};
         const messages = Array.isArray(opts.messages) ? opts.messages : [];
         const run = opts.run || null;
-        const activeFolderObj = opts.activeFolder || activeFolder();
+        // A compaction attached to a run must describe that run's root even if
+        // the user is currently browsing another root in the workspace.
+        const runFolderObj = run && run.folderId ? getFolder(run.folderId) : null;
+        const activeFolderObj = runFolderObj || opts.activeFolder || activeFolder();
         const settings = opts.settings || readSettings();
+        const priorCompactions = [];
+        const priorIds = new Set();
+        const rememberCompaction = candidate => {
+            if (!candidate || typeof candidate !== 'object') return;
+            const key = String(candidate.id || candidate.at || candidate.rawText || '');
+            if (key && priorIds.has(key)) return;
+            if (key) priorIds.add(key);
+            priorCompactions.push(candidate);
+        };
+        messages.forEach(message => {
+            if (message && message.role === 'compaction') rememberCompaction(message.compaction);
+        });
+        if (run && run.compaction) rememberCompaction(run.compaction);
+        const latestPriorCompaction = priorCompactions[priorCompactions.length - 1] || null;
 
         // 1. Chronological User Requests
-        const userRequests = [];
+        let userRequests = [];
+        const requestsByFingerprint = new Map();
+        const MAX_REQUEST_CHARS = 1600;
+        const MAX_REQUEST_TOTAL_CHARS = 12000;
+        let requestSequence = 0;
+        const requestFingerprint = value => {
+            let hash = 2166136261;
+            const text = String(value || '');
+            for (let index = 0; index < text.length; index += 1) {
+                hash ^= text.charCodeAt(index);
+                hash = Math.imul(hash, 16777619);
+            }
+            return (hash >>> 0).toString(16).padStart(8, '0');
+        };
+        const boundedRequest = value => {
+            const text = String(value || '').trim();
+            if (text.length <= MAX_REQUEST_CHARS) return text;
+            const constraints = [];
+            const matcher = /\b(?:must|never|do not|don't|required|constraint|only|cannot|can't|shall)\b|hard[_ -]?constraint/ig;
+            let match = null;
+            while ((match = matcher.exec(text)) && constraints.length < 4) {
+                const start = Math.max(0, match.index - 180);
+                const end = Math.min(text.length, match.index + match[0].length + 260);
+                constraints.push(text.slice(start, end).trim());
+            }
+            const marker = `… [${text.length.toLocaleString()} character request truncated; fingerprint ${requestFingerprint(text)}] …`;
+            const joined = [text.slice(0, 420).trim(), marker, ...constraints, text.slice(-260).trim()]
+                .filter(Boolean).join('\n');
+            return joined.length <= MAX_REQUEST_CHARS
+                ? joined : `${joined.slice(0, MAX_REQUEST_CHARS - 13).trimEnd()}… [truncated]`;
+        };
+        const rememberRequest = request => {
+            const trimmed = String(request || '').trim();
+            if (!trimmed || trimmed.startsWith('/clear') || trimmed.startsWith('/compact')) return;
+            const key = trimmed.length > MAX_REQUEST_CHARS
+                ? `${trimmed.length}:${requestFingerprint(trimmed)}` : trimmed.toLocaleLowerCase();
+            // Keep the newest occurrence of a repeated instruction. A prior
+            // compaction must never consume the whole budget before the current
+            // user turn is considered.
+            requestsByFingerprint.set(key, {
+                text: boundedRequest(trimmed),
+                order: requestSequence += 1
+            });
+        };
+        priorCompactions.forEach(compaction => {
+            (Array.isArray(compaction.userRequests) ? compaction.userRequests : []).forEach(rememberRequest);
+        });
         messages.forEach(msg => {
             if (!msg) return;
             if (msg.role === 'user' && typeof msg.text === 'string') {
-                const trimmed = msg.text.trim();
-                if (trimmed && !trimmed.startsWith('/clear') && !trimmed.startsWith('/compact')) {
-                    userRequests.push(trimmed);
-                }
+                rememberRequest(msg.text);
             }
         });
-        if (!userRequests.length && run && run.idea) {
-            userRequests.push(run.idea);
-        }
-        if (!userRequests.length) {
-            userRequests.push('Product requirements and architecture planning');
+        if (!requestsByFingerprint.size && run && run.idea) rememberRequest(run.idea);
+        const finalCandidates = [...requestsByFingerprint.values()]
+            .sort((left, right) => left.order - right.order);
+        if (!finalCandidates.length) {
+            userRequests = ['Product requirements and architecture planning'];
+        } else {
+            // Fill newest-first, then reverse the retained slice for chronology.
+            // Reserve room for a visible omission marker when older history does
+            // not fit. The latest request is capped far below the total budget,
+            // so it is always retained in full.
+            const omissionReserve = finalCandidates.length > 1 ? 120 : 0;
+            const retainedNewestFirst = [];
+            let retainedChars = 0;
+            for (let index = finalCandidates.length - 1; index >= 0; index -= 1) {
+                const value = finalCandidates[index].text;
+                const budget = MAX_REQUEST_TOTAL_CHARS - omissionReserve;
+                if (retainedChars + value.length > budget) continue;
+                retainedNewestFirst.push(value);
+                retainedChars += value.length;
+            }
+            userRequests = retainedNewestFirst.reverse();
+            const omitted = finalCandidates.length - userRequests.length;
+            if (omitted > 0) {
+                userRequests.unshift(`… [${omitted} earlier user request${omitted === 1 ? '' : 's'} omitted to preserve the newest instruction] …`);
+            }
         }
 
         // 2. Tracked Documents & Artifacts
-        const writtenPaths = (run && Array.isArray(run.writtenPaths) && run.writtenPaths.length)
-            ? run.writtenPaths
-            : listFiles().filter(p => p.startsWith('docs/'));
+        const compactionFolderId = (activeFolderObj && activeFolderObj.id)
+            || (run && run.folderId)
+            || (store.folders[store.activeFolderId] ? store.activeFolderId : DEFAULT_FOLDER_ID);
+        const writtenRefs = run && Array.isArray(run.writtenFiles) && run.writtenFiles.length
+            ? run.writtenFiles.map(item => ({
+                path: String((item && item.path) || ''),
+                folderId: String((item && item.folderId) || run.folderId || compactionFolderId)
+            })).filter(item => item.path)
+            : (run && Array.isArray(run.writtenPaths) && run.writtenPaths.length
+                ? run.writtenPaths.map(path => ({ path, folderId: run.folderId || compactionFolderId }))
+                : listFiles(compactionFolderId).filter(p => p.startsWith('docs/'))
+                    .map(path => ({ path, folderId: compactionFolderId })));
 
-        const artifacts = writtenPaths.map(p => {
-            const file = readFile(p);
+        const artifactMap = new Map();
+        priorCompactions.forEach(compaction => {
+            (Array.isArray(compaction.artifacts) ? compaction.artifacts : []).forEach(item => {
+                if (!item || !item.path) return;
+                const normalized = {
+                    path: String(item.path),
+                    folderId: String(item.folderId || ''),
+                    size: Math.max(0, Number(item.size) || 0),
+                    lines: Math.max(0, Number(item.lines) || 0)
+                };
+                artifactMap.set(`${normalized.folderId}\u0000${normalized.path}`, normalized);
+            });
+        });
+        writtenRefs.forEach(ref => {
+            const file = readFile(ref.path, ref.folderId);
             const size = file ? file.content.length : 0;
             const lines = file ? file.content.split('\n').length : 0;
-            return { path: p, size, lines };
+            artifactMap.set(`${ref.folderId}\u0000${ref.path}`, {
+                path: ref.path, folderId: ref.folderId, size, lines
+            });
         });
+        const artifacts = [...artifactMap.values()].slice(-100);
 
         // 3. Project & Source Context
         const folderName = (activeFolderObj && activeFolderObj.name) || 'Default Project';
-        const folderFiles = (activeFolderObj && activeFolderObj.id) ? listFiles(activeFolderObj.id) : listFiles();
+        const folderFiles = listFiles(compactionFolderId);
         const sourceFileCount = folderFiles.filter(p => !p.startsWith('docs/')).length;
+
+        // Clarifying answers and bounded canonical assistant decisions are state,
+        // not decoration. Omitting them makes a resumed agent forget the user's
+        // scope and repeat or contradict work after compaction.
+        const clarificationLines = (run && Array.isArray(run.answers) ? run.answers : [])
+            .filter(item => item && item.answer !== undefined)
+            .slice(0, 20)
+            .map(item => `- ${String(item.question || item.id || 'Clarification')}: ${clampText(item.answer, 600)}`);
+        const factCandidates = new Map();
+        let factSequence = 0;
+        const MAX_REQUIRED_FACTS = 40;
+        const MAX_REQUIRED_FACT_CHARS = 12000;
+        const rememberFact = (fact, priority) => {
+            const value = clampText(String(fact || '').trim(), 600);
+            if (!value) return;
+            const key = value.toLocaleLowerCase();
+            const candidate = {
+                value,
+                priority: Number(priority) || 0,
+                order: factSequence += 1
+            };
+            const prior = factCandidates.get(key);
+            if (!prior || candidate.priority >= prior.priority) factCandidates.set(key, candidate);
+        };
+        priorCompactions.forEach(compaction => {
+            (Array.isArray(compaction.requiredFacts) ? compaction.requiredFacts : [])
+                .forEach(fact => rememberFact(fact, 0));
+        });
+        (run && Array.isArray(run.answers) ? run.answers : [])
+            .filter(item => item && String(item.answer || '').trim())
+            .slice(0, 20)
+            .forEach(item => rememberFact(item.answer, 3));
+        artifacts.forEach(item => rememberFact(item.path, 2));
+        rememberFact(folderName, 2);
+        (run && Array.isArray(run.selectedOptions) ? run.selectedOptions : []).forEach(option => {
+            if (option && typeof option === 'object') {
+                rememberFact(`${String(option.id || option.section || 'option')}: ${String(option.value || option.label || option.answer || '')}`, 3);
+            } else rememberFact(option, 3);
+        });
+        const constraintPattern = /\b(?:must|never|do not|don't|required|constraint|only|cannot|can't|shall)\b|hard[_ -]?constraint/i;
+        const constraintMatcher = /\b(?:must|never|do not|don't|required|constraint|only|cannot|can't|shall)\b|hard[_ -]?constraint/ig;
+        const rememberConstraints = value => {
+            const text = String(value || '');
+            constraintMatcher.lastIndex = 0;
+            let match = null;
+            let retained = 0;
+            while ((match = constraintMatcher.exec(text)) && retained < 20) {
+                const mark = match.index;
+                const priorBreaks = [
+                    text.lastIndexOf('\n', mark - 1),
+                    text.lastIndexOf('.', mark - 1),
+                    text.lastIndexOf('!', mark - 1),
+                    text.lastIndexOf('?', mark - 1)
+                ];
+                let start = Math.max(...priorBreaks) + 1;
+                const nextBreaks = ['\n', '.', '!', '?']
+                    .map(char => text.indexOf(char, mark + match[0].length))
+                    .filter(index => index >= 0);
+                let end = nextBreaks.length ? Math.min(...nextBreaks) + 1 : text.length;
+                let fact = text.slice(start, end).trim();
+                if (fact.length > 600) {
+                    // Center the retained window on the matched commitment. The
+                    // old prefix-only clamp could validate a summary while
+                    // silently dropping a late "must/never/only" clause.
+                    const markInFact = Math.max(0, mark - start);
+                    start = Math.max(0, Math.min(markInFact - 180, fact.length - 600));
+                    fact = fact.slice(start, start + 600).trim();
+                }
+                rememberFact(fact, 4);
+                retained += 1;
+                if (constraintMatcher.lastIndex === match.index) constraintMatcher.lastIndex += 1;
+            }
+        };
+        const decisionCandidates = [];
+        messages.forEach(message => {
+            if (!message) return;
+            const messageText = String(message.text || '').trim();
+            if (messageText && constraintPattern.test(messageText)) rememberConstraints(messageText);
+            if (message.role !== 'assistant') return;
+            if (messageText) {
+                decisionCandidates.push(`- Assistant: ${clampText(messageText, 600)}`);
+            }
+            (Array.isArray(message.steps) ? message.steps : []).forEach(step => {
+                if (!step) return;
+                const detail = String(step.text || step.summary || step.error || '').trim();
+                if (!detail) return;
+                decisionCandidates.push(`- ${String(step.label || 'Step')} [${String(step.status || 'unknown')}]: ${clampText(detail, 600)}`);
+                if (constraintPattern.test(detail)) rememberConstraints(detail);
+            });
+        });
+        (run && Array.isArray(run.phases) ? run.phases : []).forEach(phase => {
+            if (!phase || (phase.status !== 'running' && phase.status !== 'pending')) return;
+            rememberFact(`${String(phase.label || 'Phase')} [${String(phase.status)}]`, 3);
+        });
+        let requiredFactChars = 0;
+        const requiredFacts = [...factCandidates.values()]
+            .sort((left, right) => right.priority - left.priority || right.order - left.order)
+            .filter(candidate => {
+                if (requiredFactChars + candidate.value.length > MAX_REQUIRED_FACT_CHARS) return false;
+                requiredFactChars += candidate.value.length;
+                return true;
+            })
+            .slice(0, MAX_REQUIRED_FACTS)
+            .sort((left, right) => left.order - right.order)
+            .map(candidate => candidate.value);
+        // The current tail is more useful than the oldest status prose. Preserve
+        // chronology inside the retained window.
+        const decisionLines = decisionCandidates.slice(-12);
+        const priorContext = latestPriorCompaction
+            ? clampText(latestPriorCompaction.summary || latestPriorCompaction.rawText || '', 12000)
+            : '';
 
         // 4. Progress items
         const completedMilestones = [];
@@ -1899,6 +5289,9 @@
 
         const projectName = (run && run.projectName) || 'Blueprint Project';
         const skillName = (run && run.skillName) || 'Product Planning';
+        const requiredFactLines = requiredFacts.length
+            ? requiredFacts.map(fact => `- ${fact}`).join('\n')
+            : '- No additional durable facts were recorded.';
 
         const summaryBody = [
             `### 1. Task Overview`,
@@ -1913,9 +5306,9 @@
             inProgressLines,
             ``,
             `### 3. Key Findings & Decisions`,
-            `- Standalone folder access established: agent interfaces directly with project codebase without requiring editor file chips.`,
-            `- Safety boundaries strictly enforced: imported user source files are read-only; revisions are cleanly diverted to docs/.`,
-            `- Blueprint document generation follows zero-innerHTML, modular markdown standards.`,
+            priorContext ? `**Prior compacted context (retained verbatim as data)**\n${priorContext}` : '',
+            clarificationLines.length ? `**User clarifications**\n${clarificationLines.join('\n')}` : '- No clarifying answers were recorded.',
+            decisionLines.length ? `**Assistant decisions and step evidence**\n${decisionLines.join('\n')}` : '- No assistant decisions were recorded.',
             ``,
             `### 4. Active Context`,
             `- **Active Folder**: \`${folderName}\` (${folderFiles.length} total files, ${sourceFileCount} source modules)`,
@@ -1926,6 +5319,9 @@
             `2. Run companion planning skills (/mvp, /arch, /gtm) or execute document revisions.`,
             ``,
             `### 6. Commitments & Constraints`,
+            `**Required facts retained verbatim**`,
+            requiredFactLines,
+            ``,
             `- Preserve documentation and source integrity at all times.`,
             `- Adhere to Anti-gravity agent protocols: structured steps, live execution feedback, zero data loss.`
         ].join('\n');
@@ -1956,6 +5352,9 @@
                 });
             }
         });
+        priorCompactions.forEach(compaction => {
+            originalChars += String(compaction.rawText || compaction.summary || '').length;
+        });
         if (run && run.idea) originalChars += run.idea.length;
         if (!originalChars) originalChars = 1200;
 
@@ -1967,7 +5366,10 @@
         return {
             id: uid('compact'),
             at: new Date().toISOString(),
+            mode: 'deterministic',
+            fallbackReason: '',
             userRequests,
+            requiredFacts,
             summary: summaryBody,
             rawText: rawCompaction,
             artifacts,
@@ -2232,16 +5634,633 @@
     }
 
     class BlueprintModelError extends Error {
-        constructor(message) {
+        constructor(message, details) {
             super(message || 'Model request failed');
             this.name = 'BlueprintModelError';
+            const info = details && typeof details === 'object' ? details : {};
+            this.code = String(info.code || 'model-error');
+            this.status = Number.isFinite(Number(info.status)) ? Number(info.status) : 0;
+            this.retryable = info.retryable === true;
+            this.retryAfterMs = Number.isFinite(Number(info.retryAfterMs))
+                ? Math.max(0, Number(info.retryAfterMs)) : 0;
+            this.partialText = String(info.partialText || '');
+            this.partialThinking = String(info.partialThinking || '');
+        }
+    }
+
+    function safeNotify(callback, payload) {
+        if (typeof callback !== 'function') return;
+        try { callback(payload); } catch (error) {
+            console.warn('[codalio-blueprint] model lifecycle callback failed', error);
+        }
+    }
+
+    function abortableDelay(ms, signal) {
+        const delay = Math.max(0, Number(ms) || 0);
+        if (!delay) return Promise.resolve();
+        return new Promise((resolve, reject) => {
+            let settled = false;
+            const finish = callback => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                if (signal) signal.removeEventListener('abort', onAbort);
+                callback();
+            };
+            const onAbort = () => finish(() => reject(new BlueprintAbort()));
+            const timer = setTimeout(() => finish(resolve), delay);
+            if (signal) {
+                if (signal.aborted) onAbort();
+                else signal.addEventListener('abort', onAbort, { once: true });
+            }
+        });
+    }
+
+    function retryAfterMs(response) {
+        try {
+            const raw = response && response.headers && typeof response.headers.get === 'function'
+                ? response.headers.get('retry-after') : '';
+            if (!raw) return 0;
+            const seconds = Number(raw);
+            if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+            const at = Date.parse(raw);
+            return Number.isFinite(at) ? Math.max(0, at - Date.now()) : 0;
+        } catch (_) {
+            return 0;
+        }
+    }
+
+    function timeoutMs(options, key, settingSeconds, fallbackSeconds) {
+        const direct = Number(options && options[key]);
+        if (Number.isFinite(direct) && direct >= 0) return direct;
+        const seconds = Number(settingSeconds);
+        return Math.max(0, (Number.isFinite(seconds) ? seconds : fallbackSeconds) * 1000);
+    }
+
+    const ENDPOINT_ENRICHMENT_FIELDS = Object.freeze(['endpoint_id', 'endpoint_url', 'model']);
+
+    /**
+     * Copy only inert endpoint-routing data from the host hook. Object.assign is
+     * unsafe at this trust boundary: accessors execute during the copy and an own
+     * or inherited toJSON can replace the complete safety envelope at stringify
+     * time (including cancel_id). A null-prototype record plus data descriptors
+     * makes the exact bytes sent to fetch auditable.
+     */
+    function safeEndpointEnrichment(value) {
+        if (!value || (typeof value !== 'object' && typeof value !== 'function')) return null;
+        let descriptors;
+        try { descriptors = Object.getOwnPropertyDescriptors(value); } catch (_) { return null; }
+        const safe = Object.create(null);
+        for (const key of ENDPOINT_ENRICHMENT_FIELDS) {
+            const descriptor = descriptors[key];
+            if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) continue;
+            if (typeof descriptor.value !== 'string') continue;
+            safe[key] = descriptor.value.slice(0, 4096);
+        }
+        return safe;
+    }
+
+    async function streamModelAttempt(options, attemptInfo) {
+        const settings = attemptInfo.settings;
+        const cancelId = attemptInfo.cancelId;
+        const controller = new AbortController();
+        const externalSignal = options.signal;
+        // Resolve this dependency before recording/sending anything. Discovering
+        // a missing stream parser after HTTP 2xx would leave a generation running
+        // with no consumer and, historically, no cancellation barrier.
+        const readJsonLineStream = streamReader();
+        const requestLimit = timeoutMs(options, 'requestTimeoutMs', settings.modelRequestTimeoutSeconds, 1200);
+        const idleLimit = timeoutMs(options, 'idleTimeoutMs', settings.modelIdleTimeoutSeconds, 300);
+        const requestedOutputTokens = Number(options.maxOutputTokens);
+        const effectiveOutputTokens = Number.isFinite(requestedOutputTokens) && requestedOutputTokens > 0
+            ? Math.floor(requestedOutputTokens)
+            : Math.max(1, Number(settings.lensMaxOutputTokens) || 4096);
+        // Tokens are not characters, so use a deliberately generous multiplier,
+        // but retain an absolute renderer-safety ceiling if an endpoint ignores
+        // max_output_tokens. The combined visible + thinking stream is bounded.
+        const outputCharLimit = Math.min(8 * 1024 * 1024,
+            Math.max(64 * 1024, effectiveOutputTokens * 16));
+        let abortKind = '';
+        let requestTimer = null;
+        let idleTimer = null;
+        let cancelLeaseTimer = null;
+
+        const abortFor = kind => {
+            if (controller.signal.aborted) return;
+            abortKind = kind;
+            try { controller.abort(); } catch (_) { /* already settled */ }
+        };
+        const onExternalAbort = () => {
+            abortFor('external');
+        };
+        if (externalSignal) {
+            if (externalSignal.aborted) throw new BlueprintAbort();
+            externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+        }
+        if (requestLimit > 0) requestTimer = setTimeout(() => abortFor('request-timeout'), requestLimit);
+
+        // Do not rely on fetch/body-reader implementations to reject when their
+        // signal is aborted. Provider shims and test doubles occasionally ignore
+        // it; racing every awaited transport operation against the signal makes
+        // local stop and timeout guarantees deterministic.
+        const awaitAttempt = promise => {
+            if (controller.signal.aborted) {
+                const error = new Error('model request aborted');
+                error.name = 'AbortError';
+                return Promise.reject(error);
+            }
+            let onAbort = null;
+            const aborted = new Promise((_, reject) => {
+                onAbort = () => {
+                    const error = new Error('model request aborted');
+                    error.name = 'AbortError';
+                    reject(error);
+                };
+                controller.signal.addEventListener('abort', onAbort, { once: true });
+            });
+            return Promise.race([Promise.resolve(promise), aborted]).finally(() => {
+                if (onAbort) controller.signal.removeEventListener('abort', onAbort);
+            });
+        };
+
+        const armIdleTimer = () => {
+            if (idleTimer) clearTimeout(idleTimer);
+            if (idleLimit > 0) idleTimer = setTimeout(() => abortFor('idle-timeout'), idleLimit);
+        };
+
+        let text = '';
+        let thinking = '';
+        let finishReason = '';
+        let usage = null;
+        let completed = false;
+        let meaningfulOutput = false;
+        const outputTooLarge = () => new BlueprintModelError(
+            `The model response exceeded Blueprint's ${outputCharLimit.toLocaleString()} character safety limit.`,
+            {
+                code: 'output-too-large',
+                retryable: false,
+                partialText: text,
+                partialThinking: thinking
+            }
+        );
+        const appendBounded = (target, delta) => {
+            const remaining = Math.max(0, outputCharLimit - text.length - thinking.length);
+            const accepted = String(delta || '').slice(0, remaining);
+            if (target === 'thinking') thinking += accepted;
+            else text += accepted;
+            if (String(delta || '').length > remaining) {
+                abortFor('output-too-large');
+                throw outputTooLarge();
+            }
+            return accepted;
+        };
+        const replaceTerminalOutput = (nextText, nextThinking) => {
+            const responseText = String(nextText || '');
+            const responseThinking = String(nextThinking || '');
+            if (responseText.length + responseThinking.length > outputCharLimit) {
+                text = responseText.slice(0, outputCharLimit);
+                thinking = responseThinking.slice(0, Math.max(0, outputCharLimit - text.length));
+                throw outputTooLarge();
+            }
+            text = responseText;
+            thinking = responseThinking;
+        };
+        const abortWithPartial = message => {
+            const error = new BlueprintAbort(message);
+            error.partialText = text;
+            error.partialThinking = thinking;
+            return error;
+        };
+
+        const timeoutFailure = () => {
+            const limit = abortKind === 'idle-timeout' ? idleLimit : requestLimit;
+            return new BlueprintModelError(
+                abortKind === 'idle-timeout'
+                    ? `The model stream was silent for ${Math.round(limit / 1000)} seconds.`
+                    : `The model request exceeded ${Math.round(limit / 1000)} seconds before completing.`,
+                {
+                    code: abortKind || 'request-timeout',
+                    retryable: !meaningfulOutput,
+                    partialText: text,
+                    partialThinking: thinking
+                }
+            );
+        };
+
+        try {
+            const sanitizedMessage = sanitizeSourceForModel(options.message).content;
+            const sanitizedSystemPrompt = sanitizeSourceForModel(options.systemPrompt).content;
+            const requestedTemperature = Number(options.temperature);
+            const fixedPayload = Object.freeze({
+                message: sanitizedMessage,
+                system_prompt: sanitizedSystemPrompt,
+                interaction_mode: 'chat',
+                use_workspace_context: false,
+                long_running: true,
+                temperature: Number.isFinite(requestedTemperature) ? requestedTemperature : settings.temperature,
+                max_output_tokens: effectiveOutputTokens,
+                cancel_id: cancelId
+            });
+            let endpointEnrichment = Object.create(null);
+            if (typeof window.withConfiguredModelEndpointPayload === 'function') {
+                try {
+                    // The host may enrich endpoint routing, but receives a clone:
+                    // mutating its argument cannot alter Blueprint's fixed safety
+                    // envelope or the sanitized source strings captured above.
+                    endpointEnrichment = safeEndpointEnrichment(
+                        window.withConfiguredModelEndpointPayload(Object.assign({}, fixedPayload))
+                    );
+                } catch (error) {
+                    throw new BlueprintModelError(
+                        `The selected model endpoint could not be prepared (${error && error.message ? error.message : 'configuration error'}).`,
+                        { code: 'endpoint-configuration' }
+                    );
+                }
+            }
+            if (!endpointEnrichment) {
+                throw new BlueprintModelError('The selected model endpoint returned an invalid request configuration.', {
+                    code: 'endpoint-configuration'
+                });
+            }
+            if (!String(endpointEnrichment.endpoint_id || '').trim()
+                && !String(endpointEnrichment.endpoint_url || '').trim()) {
+                throw new BlueprintModelError('Choose an active Local or API model endpoint in SimpleRAG Settings before running Blueprint.', {
+                    code: 'missing-endpoint'
+                });
+            }
+            // The host hook may add endpoint configuration, but it may not alter
+            // the sanitized request or the cancellation identity Blueprint tracks.
+            // Serialize before recording the ledger/dispatched state: circular
+            // objects and BigInt must fail locally without creating a phantom
+            // backend generation or a permanent cancellation barrier.
+            const payload = Object.assign(Object.create(null), endpointEnrichment, fixedPayload);
+            let serializedPayload = '';
+            try {
+                serializedPayload = JSON.stringify(payload);
+            } catch (error) {
+                throw new BlueprintModelError(
+                    `The selected model endpoint produced an unserializable request (${String((error && error.message) || error)}).`,
+                    { code: 'endpoint-configuration', retryable: false }
+                );
+            }
+            if (!serializedPayload) {
+                throw new BlueprintModelError('The selected model endpoint produced an empty request payload.', {
+                    code: 'endpoint-configuration', retryable: false
+                });
+            }
+            try {
+                const serializedObject = JSON.parse(serializedPayload);
+                const fixedMismatch = Object.keys(fixedPayload).some(key =>
+                    serializedObject[key] !== fixedPayload[key]);
+                if (fixedMismatch) throw new Error('fixed request fields changed during serialization');
+            } catch (error) {
+                throw new BlueprintModelError(
+                    `The selected model endpoint produced an unsafe request (${String((error && error.message) || error)}).`,
+                    { code: 'endpoint-configuration', retryable: false }
+                );
+            }
+
+            let response;
+            try {
+                // From this point onward a transport failure is ambiguous: the
+                // backend may have accepted the cancel id even if this page never
+                // receives a response. streamModelTurn uses this bit to prevent an
+                // overlapping retry without an explicit cancellation ack.
+                if (options.runId) {
+                    const runOwner = readRunOwner(String(options.runId));
+                    const expectedRunLease = String(options.runLeaseId || '');
+                    if (!runOwner || !runOwner.owned || !runOwner.live || !expectedRunLease
+                        || runOwner.leaseId !== expectedRunLease) {
+                        throw new BlueprintModelError(
+                            'The model request was not sent because this window no longer owns the run.',
+                            { code: 'run-owner-lost', retryable: false }
+                        );
+                    }
+                }
+                const cancelLeaseId = rememberPendingCancel(cancelId, {
+                    runId: options.runId,
+                    runLeaseId: options.runLeaseId
+                });
+                if (!cancelLeaseId) {
+                    throw new BlueprintModelError(
+                        'The model request was not sent because its crash-recovery cancellation record could not be saved.',
+                        { code: 'cancel-ledger-failed', retryable: false }
+                    );
+                }
+                attemptInfo.ledgerRecorded = true;
+                attemptInfo.cancelLeaseId = cancelLeaseId;
+                cancelLeaseTimer = setInterval(() => {
+                    if (!refreshPendingCancel(cancelId, cancelLeaseId)) {
+                        abortFor('cancel-ledger-lost');
+                    }
+                }, PENDING_CANCEL_HEARTBEAT_MS);
+                if (typeof options.onAttemptDispatched === 'function') {
+                    let permitted = false;
+                    try { permitted = options.onAttemptDispatched(attemptInfo) !== false; } catch (_) { permitted = false; }
+                    if (!permitted) {
+                        forgetPendingCancel(cancelId, cancelLeaseId);
+                        throw new BlueprintModelError(
+                            'The model request was not sent because its cancellation recovery record could not be saved.',
+                            { code: 'cancel-ledger-failed', retryable: false }
+                        );
+                    }
+                }
+                if (options.runId) {
+                    const reservedOwner = readRunOwner(String(options.runId));
+                    const reservedLease = String(options.runLeaseId || '');
+                    if (!reservedOwner || !reservedOwner.owned || !reservedOwner.live
+                        || reservedOwner.leaseId !== reservedLease) {
+                        forgetPendingCancel(cancelId, cancelLeaseId);
+                        throw new BlueprintModelError(
+                            'The model request was not sent because this window lost the run after reserving dispatch.',
+                            { code: 'run-owner-lost', retryable: false }
+                        );
+                    }
+                }
+                attemptInfo.dispatched = true;
+                response = await awaitAttempt(fetch(`${API_BASE}/chat/stream`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: serializedPayload,
+                    signal: controller.signal
+                }));
+            } catch (error) {
+                // Configuration and pre-dispatch durability failures are already
+                // classified. Re-wrapping them as a retryable network error could
+                // make streamModelTurn retry even though no request was sent (most
+                // critically when the crash-recovery cancellation ledger failed).
+                if (error instanceof BlueprintModelError) throw error;
+                if (externalSignal && externalSignal.aborted) {
+                    throw new BlueprintAbort();
+                }
+                if (abortKind === 'request-timeout') {
+                    throw new BlueprintModelError(`The model request exceeded ${Math.round(requestLimit / 1000)} seconds before completing.`, {
+                        code: 'request-timeout', retryable: true
+                    });
+                }
+                if (abortKind === 'idle-timeout') {
+                    throw new BlueprintModelError(`The model stream was silent for ${Math.round(idleLimit / 1000)} seconds.`, {
+                        code: 'idle-timeout', retryable: true
+                    });
+                }
+                if (abortKind === 'cancel-ledger-lost') {
+                    throw new BlueprintModelError(
+                        'The model turn lost its durable cancellation lease and was stopped safely.',
+                        { code: 'cancel-ledger-lost', retryable: false }
+                    );
+                }
+                if (error && error.name === 'AbortError' && controller.signal.aborted) {
+                    throw new BlueprintAbort();
+                }
+                throw new BlueprintModelError(
+                    `Could not reach the SimpleRAG chat endpoint (${error && error.message ? error.message : 'network error'}).`,
+                    { code: 'network', retryable: true }
+                );
+            }
+
+            if (!response || typeof response.ok !== 'boolean') {
+                throw new BlueprintModelError('The SimpleRAG chat endpoint returned an invalid response.', {
+                    code: 'invalid-response', retryable: true
+                });
+            }
+            if (!response.ok) {
+                // Receiving a concrete HTTP error response is terminal for this
+                // request at SimpleRAG's streaming route: it sends 200 before
+                // entering the generator. There is no live stream to cancel, and
+                // treating a validation/proxy rejection as ambiguous strands the
+                // durable cancel ledger forever when no handle was registered.
+                attemptInfo.backendTerminalAcknowledged = true;
+                let detail = `The model request failed (HTTP ${response.status}).`;
+                try {
+                    const body = await awaitAttempt(response.json());
+                    const raw = body && (body.detail || body.error || body.message);
+                    if (typeof raw === 'string' && raw.trim()) detail = raw.trim();
+                    else if (raw && typeof raw === 'object' && typeof raw.message === 'string') detail = raw.message;
+                } catch (error) {
+                    if (externalSignal && externalSignal.aborted) throw new BlueprintAbort();
+                    if (abortKind === 'request-timeout' || abortKind === 'idle-timeout') {
+                        throw timeoutFailure();
+                    }
+                    if (abortKind === 'cancel-ledger-lost') {
+                        throw new BlueprintModelError(
+                            'The model turn lost its durable cancellation lease and was stopped safely.',
+                            {
+                                code: 'cancel-ledger-lost',
+                                retryable: false,
+                                partialText: text,
+                                partialThinking: thinking
+                            }
+                        );
+                    }
+                    // Keep the generic HTTP detail when the body is malformed.
+                }
+                const status = Number(response.status) || 0;
+                throw new BlueprintModelError(detail, {
+                    code: `http-${status || 'error'}`,
+                    status,
+                    retryable: [408, 425, 429, 500, 502, 503, 504].includes(status),
+                    retryAfterMs: retryAfterMs(response)
+                });
+            }
+
+            const onDelta = typeof options.onDelta === 'function' ? options.onDelta : null;
+            const onThinking = typeof options.onThinking === 'function' ? options.onThinking : null;
+            armIdleTimer();
+            try {
+                let resolveTerminal;
+                const terminal = new Promise(resolve => { resolveTerminal = resolve; });
+                const reading = Promise.resolve(readJsonLineStream(response, event => {
+                    // A terminal event is authoritative. Ignore malformed
+                    // trailing frames so they cannot mutate a completed answer.
+                    if (completed) return;
+                    // Ordering is observed at callback entry. A terminal frame
+                    // delivered before an adjacent Stop remains authoritative;
+                    // one delivered after a visible local abort/timeout cannot
+                    // resurrect the turn as a success.
+                    if ((externalSignal && externalSignal.aborted)
+                        || (controller.signal.aborted && abortKind !== 'completed')) {
+                        if (externalSignal && externalSignal.aborted && !abortKind) abortFor('external');
+                        return;
+                    }
+                    const type = String((event && event.type) || '');
+                    // Parse terminal frames BEFORE observing a local abort. A done
+                    // frame already delivered by the backend cannot be downgraded
+                    // merely because Stop won the adjacent event-loop tick.
+                    if (type === 'error') {
+                        attemptInfo.backendTerminalAcknowledged = true;
+                        throw new BlueprintModelError(
+                            String((event && (event.message || event.error || event.detail)) || 'The model stream reported an error.'),
+                            {
+                                code: String((event && event.code) || 'stream-error'),
+                                retryable: event && event.retryable === true,
+                                partialText: text,
+                                partialThinking: thinking
+                            }
+                        );
+                    }
+                    if (type === 'done') {
+                        attemptInfo.backendTerminalAcknowledged = true;
+                        replaceTerminalOutput(
+                            event && typeof event.response === 'string' ? event.response : text,
+                            event && typeof event.thinking === 'string' ? event.thinking : thinking
+                        );
+                        completed = true;
+                        finishReason = String((event && event.finish_reason) || '');
+                        usage = (event && event.usage) || null;
+                        resolveTerminal();
+                        return;
+                    }
+                    if (type === 'cancelled' || type === 'canceled') {
+                        attemptInfo.backendTerminalAcknowledged = true;
+                        replaceTerminalOutput(
+                            event && typeof event.response === 'string' ? event.response : text,
+                            event && typeof event.thinking === 'string' ? event.thinking : thinking
+                        );
+                        completed = true;
+                        finishReason = 'cancelled';
+                        attemptInfo.backendCancellationAcknowledged = true;
+                        resolveTerminal();
+                        return;
+                    }
+                    if (controller.signal.aborted) return;
+                    if (externalSignal && externalSignal.aborted) {
+                        abortFor('external');
+                        return;
+                    }
+                    if (type === 'content') {
+                        const delta = String((event && event.delta) || '');
+                        if (delta) {
+                            // Preserve formatting whitespace, but do not let a
+                            // provider keep a dead generation alive forever by
+                            // trickling spaces or newlines without real progress.
+                            if (hasMeaningfulText(delta)) {
+                                meaningfulOutput = true;
+                                armIdleTimer();
+                            }
+                            const accepted = appendBounded('text', delta);
+                            if (onDelta && accepted) onDelta(accepted, text);
+                        }
+                    } else if (type === 'thinking') {
+                        const delta = String((event && event.delta) || '');
+                        if (delta) {
+                            if (hasMeaningfulText(delta)) {
+                                meaningfulOutput = true;
+                                armIdleTimer();
+                            }
+                            const accepted = appendBounded('thinking', delta);
+                            if (onThinking && accepted) onThinking(accepted, thinking);
+                        }
+                    }
+                })).catch(error => {
+                    // Once a valid terminal frame arrived, EOF and any trailing
+                    // transport/parser failure are non-authoritative.
+                    if (completed) return;
+                    throw error;
+                });
+                // Some providers keep the HTTP connection open after their done
+                // frame. Completion is defined by that terminal frame, not EOF.
+                // Suppress the expected AbortError from closing the body after the
+                // race so it cannot become an unhandled rejection.
+                reading.catch(() => {});
+                await Promise.race([awaitAttempt(reading), terminal]);
+                if (completed) {
+                    abortKind = 'completed';
+                    if (!controller.signal.aborted) {
+                        try { controller.abort(); } catch (_) { /* body already closed */ }
+                    }
+                }
+            } catch (error) {
+                if (!completed) {
+                    if (externalSignal && externalSignal.aborted) {
+                        throw abortWithPartial();
+                    }
+                    if (abortKind === 'request-timeout' || abortKind === 'idle-timeout') {
+                        throw timeoutFailure();
+                    }
+                    if (abortKind === 'output-too-large') {
+                        throw outputTooLarge();
+                    }
+                    if (error && error.name === 'AbortError' && controller.signal.aborted) {
+                        throw abortWithPartial();
+                    }
+                    if (error instanceof BlueprintModelError) {
+                        if (!error.partialText) error.partialText = text;
+                        if (!error.partialThinking) error.partialThinking = thinking;
+                        throw error;
+                    }
+                    throw new BlueprintModelError(
+                        `The model stream failed (${error && error.message ? error.message : 'stream error'}).`,
+                        {
+                            code: 'stream-read',
+                            retryable: !meaningfulOutput,
+                            partialText: text,
+                            partialThinking: thinking
+                        }
+                    );
+                }
+            }
+
+            if (!completed && externalSignal && externalSignal.aborted) {
+                throw abortWithPartial();
+            }
+            if (!completed) {
+                throw new BlueprintModelError('The model stream ended before completion. Try the step again.', {
+                    code: 'incomplete-stream',
+                    retryable: !meaningfulOutput,
+                    partialText: text,
+                    partialThinking: thinking
+                });
+            }
+            const normalizedFinish = finishReason.trim().toLowerCase();
+            if (['cancelled', 'canceled', 'abort', 'aborted'].includes(normalizedFinish)) {
+                const stopped = new BlueprintAbort('The model turn was cancelled.');
+                stopped.cancelAcknowledged = true;
+                stopped.partialText = text;
+                stopped.partialThinking = thinking;
+                throw stopped;
+            }
+            text = text.trim();
+            thinking = thinking.trim();
+            if (NO_ENDPOINT_PATTERN.test(text)) {
+                throw new BlueprintModelError(text, {
+                    code: 'missing-endpoint', partialText: text, partialThinking: thinking
+                });
+            }
+            if (normalizedFinish === 'length' || normalizedFinish === 'max_tokens') {
+                throw new BlueprintModelError(
+                    'The model hit its output token limit before the step was complete. Raise the relevant token budget in Blueprint settings and retry.',
+                    {
+                        code: 'output-limit',
+                        partialText: text,
+                        partialThinking: thinking
+                    }
+                );
+            }
+            if (normalizedFinish && !['stop', 'end_turn', 'eos', 'eos_token', 'complete', 'completed'].includes(normalizedFinish)) {
+                throw new BlueprintModelError(`The model stopped with finish reason "${finishReason}".`, {
+                    code: 'unexpected-finish', partialText: text, partialThinking: thinking
+                });
+            }
+            if (!hasMeaningfulText(text)) {
+                throw new BlueprintModelError('The model completed without returning any document text.', {
+                    code: 'empty-response', retryable: true, partialThinking: thinking
+                });
+            }
+            return { text, thinking, finishReason, usage, cancelId };
+        } finally {
+            if (requestTimer) clearTimeout(requestTimer);
+            if (idleTimer) clearTimeout(idleTimer);
+            if (cancelLeaseTimer) clearInterval(cancelLeaseTimer);
+            if (externalSignal) externalSignal.removeEventListener('abort', onExternalAbort);
         }
     }
 
     function streamReader() {
         const reader = window.RagChatStreaming && window.RagChatStreaming.readJsonLineStream;
         if (typeof reader !== 'function') {
-            throw new BlueprintModelError('The SimpleRAG streaming runtime is unavailable. Reload the app and try again.');
+            throw new BlueprintModelError('The SimpleRAG streaming runtime is unavailable. Reload the app and try again.', {
+                code: 'stream-runtime-unavailable', retryable: false
+            });
         }
         return reader;
     }
@@ -2252,114 +6271,190 @@
      */
     async function streamModelTurn(options) {
         const settings = readSettings();
-        const cancelId = options.cancelId || uid('cancel');
-        const controller = new AbortController();
-        const payloadBase = {
-            message: String(options.message || ''),
-            system_prompt: String(options.systemPrompt || ''),
-            interaction_mode: 'chat',
-            use_workspace_context: false,
-            long_running: true,
-            temperature: Number.isFinite(options.temperature) ? options.temperature : settings.temperature,
-            max_output_tokens: options.maxOutputTokens || settings.lensMaxOutputTokens,
-            cancel_id: cancelId
-        };
-        const payload = typeof window.withConfiguredModelEndpointPayload === 'function'
-            ? window.withConfiguredModelEndpointPayload(payloadBase)
-            : payloadBase;
+        const opts = options && typeof options === 'object' ? options : {};
+        const configuredRetries = Number(opts.maxRetries);
+        const maxRetries = Number.isFinite(configuredRetries)
+            ? Math.max(0, Math.min(5, Math.floor(configuredRetries)))
+            : settings.modelMaxRetries;
+        const maxAttempts = maxRetries + 1;
+        const baseDelay = Number.isFinite(Number(opts.retryBaseDelayMs))
+            ? Math.max(0, Number(opts.retryBaseDelayMs))
+            : settings.modelRetryBaseDelayMs;
+        let lastError = null;
 
-        if (!String(payload.endpoint_id || '').trim() && !String(payload.endpoint_url || '').trim()) {
-            throw new BlueprintModelError('Choose an active Local or API model endpoint in SimpleRAG Settings before running Blueprint.');
-        }
-
-        let response;
-        try {
-            response = await fetch(`${API_BASE}/chat/stream`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload),
-                signal: controller.signal
-            });
-        } catch (error) {
-            if (error && error.name === 'AbortError') throw new BlueprintAbort();
-            throw new BlueprintModelError(`Could not reach the SimpleRAG chat endpoint (${error && error.message ? error.message : 'network error'}).`);
-        }
-
-        if (!response.ok) {
-            let detail = `The model request failed (HTTP ${response.status}).`;
+        for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+            if (opts.signal && opts.signal.aborted) throw new BlueprintAbort();
+            const cancelId = attempt === 1 && opts.cancelId ? String(opts.cancelId) : uid('cancel');
+            const attemptInfo = {
+                attempt,
+                maxAttempts,
+                cancelId,
+                settings,
+                dispatched: false,
+                backendCancellationAcknowledged: false
+            };
+            safeNotify(opts.onAttemptStart, attemptInfo);
             try {
-                const body = await response.json();
-                const raw = body && (body.detail || body.error || body.message);
-                if (typeof raw === 'string' && raw.trim()) detail = raw.trim();
-                else if (raw && typeof raw === 'object' && typeof raw.message === 'string') detail = raw.message;
-            } catch (_) { /* keep the generic detail */ }
-            throw new BlueprintModelError(detail);
-        }
-
-        let text = '';
-        let thinking = '';
-        let finishReason = '';
-        let usage = null;
-        let completed = false;
-        let aborted = false;
-
-        const onDelta = typeof options.onDelta === 'function' ? options.onDelta : null;
-        const onThinking = typeof options.onThinking === 'function' ? options.onThinking : null;
-        const tokenLimitNotice = 'output token limit';
-
-        await streamReader()(response, event => {
-            if (options.signal && options.signal.aborted) { aborted = true; return; }
-            const type = String((event && event.type) || '');
-            if (type === 'content') {
-                const delta = String((event && event.delta) || '');
-                if (delta) {
-                    text += delta;
-                    if (onDelta) onDelta(delta, text);
+                const result = await streamModelAttempt(opts, attemptInfo);
+                attemptInfo.ledgerCleared = forgetPendingCancel(cancelId, attemptInfo.cancelLeaseId);
+                safeNotify(opts.onAttemptEnd, Object.assign({}, attemptInfo, { status: 'done' }));
+                return Object.assign({}, result, { attempt, attempts: attempt });
+            } catch (error) {
+                lastError = error;
+                const code = String((error && error.code) || '');
+                const stopped = code === 'aborted';
+                let cancelAcknowledged = attemptInfo.backendCancellationAcknowledged
+                    || (error && error.cancelAcknowledged === true)
+                    ? true : null;
+                const needsCancellation = attemptInfo.dispatched
+                    && attemptInfo.backendTerminalAcknowledged !== true
+                    && cancelAcknowledged !== true;
+                if (needsCancellation) {
+                    cancelAcknowledged = await cancelTurn(cancelId, {
+                        timeoutMs: Number.isFinite(Number(opts.cancelTimeoutMs))
+                            ? Number(opts.cancelTimeoutMs) : 5000
+                    });
+                    error.cancelAcknowledged = cancelAcknowledged;
+                    // A second generation may start only after the first one is
+                    // known stopped. A local AbortController proves only that this
+                    // page disconnected; it does not prove the backend stopped.
+                    if (!stopped && !cancelAcknowledged) {
+                        error.retryable = false;
+                        error.message += ' The backend did not acknowledge cancellation, so Blueprint did not start an overlapping retry.';
+                    }
                 }
-            } else if (type === 'thinking') {
-                const delta = String((event && event.delta) || '');
-                if (delta) {
-                    thinking += delta;
-                    if (onThinking) onThinking(delta, thinking);
+                const backendMayBeRunning = attemptInfo.dispatched
+                    && attemptInfo.backendTerminalAcknowledged !== true
+                    && cancelAcknowledged !== true;
+                attemptInfo.backendMayBeRunning = backendMayBeRunning;
+                if (!backendMayBeRunning) {
+                    attemptInfo.ledgerCleared = forgetPendingCancel(cancelId, attemptInfo.cancelLeaseId);
                 }
-            } else if (type === 'error') {
-                throw new BlueprintModelError(String((event && (event.message || event.error || event.detail)) || 'The model stream reported an error.'));
-            } else if (type === 'done') {
-                completed = true;
-                if (!text && event && event.response) text = String(event.response);
-                if (!thinking && event && event.thinking) thinking = String(event.thinking);
-                finishReason = String((event && event.finish_reason) || '');
-                usage = (event && event.usage) || null;
+                // Stop is authoritative even if it arrived while an earlier
+                // timeout/network failure was waiting on cancellation.
+                if (stopped || (opts.signal && opts.signal.aborted)) {
+                    const abortError = stopped ? error : new BlueprintAbort();
+                    abortError.cancelAcknowledged = cancelAcknowledged;
+                    safeNotify(opts.onAttemptEnd, Object.assign({}, attemptInfo, {
+                        status: 'stopped',
+                        error: abortError,
+                        cancelAcknowledged
+                    }));
+                    throw abortError;
+                }
+                safeNotify(opts.onAttemptEnd, Object.assign({}, attemptInfo, {
+                    status: 'error',
+                    error,
+                    cancelAcknowledged
+                }));
+                const hasPartial = Boolean(error && (
+                    hasMeaningfulText(error.partialText)
+                    || hasMeaningfulText(error.partialThinking)
+                ));
+                const canRetry = Boolean(error && error.retryable === true && !hasPartial && attempt < maxAttempts);
+                if (!canRetry) throw error;
+                const exponential = Math.min(30000, baseDelay * Math.pow(2, attempt - 1));
+                const delayMs = Math.min(60000, Math.max(exponential, Number(error.retryAfterMs) || 0));
+                safeNotify(opts.onRetry, {
+                    attempt,
+                    nextAttempt: attempt + 1,
+                    maxAttempts,
+                    delayMs,
+                    error
+                });
+                await abortableDelay(delayMs, opts.signal);
             }
-        });
-
-        if (aborted) throw new BlueprintAbort();
-        if (options.signal && options.signal.aborted) throw new BlueprintAbort();
-        if (!completed) {
-            throw new BlueprintModelError('The model stream ended before completion. Try the step again.');
         }
-        text = text.trim();
-        if (NO_ENDPOINT_PATTERN.test(text)) {
-            throw new BlueprintModelError(text);
-        }
-        if (finishReason === 'length' && text.toLowerCase().includes(tokenLimitNotice)) {
-            throw new BlueprintModelError(`The model hit its ${tokenLimitNotice}. Raise the token budget in Blueprint settings and retry.`);
-        }
-        return { text, thinking, finishReason, usage, cancelId };
+        throw lastError || new BlueprintModelError('The model request failed.', { code: 'model-error' });
     }
 
-    async function cancelTurn(cancelId) {
-        if (!cancelId) return false;
+    // Concurrent callers (the core attempt and the controller's Stop button)
+    // must share one cancellation request. Keep the settled promise briefly so
+    // a same-tick late caller observes the same acknowledgement instead of
+    // issuing a second POST that may misleadingly return "nothing to cancel".
+    const cancellationRequests = new Map();
+
+    function cancelTurnOutcome(cancelId, options) {
+        if (!cancelId) return Promise.resolve('unknown');
+        const key = String(cancelId);
+        if (cancellationRequests.has(key)) return cancellationRequests.get(key);
+        const request = performCancelTurn(key, options);
+        cancellationRequests.set(key, request);
+        request.finally(() => {
+            setTimeout(() => {
+                if (cancellationRequests.get(key) === request) cancellationRequests.delete(key);
+            }, 250);
+        });
+        return request;
+    }
+
+    function cancelTurn(cancelId, options) {
+        return cancelTurnOutcome(cancelId, options).then(outcome => (
+            outcome === 'cancelled' || outcome === 'already-terminal'
+        ));
+    }
+
+    async function performCancelTurn(cancelId, options) {
+        const opts = options || {};
+        const limit = Number.isFinite(Number(opts.timeoutMs))
+            ? Math.max(50, Number(opts.timeoutMs)) : 5000;
+        const controller = new AbortController();
+        let timer = null;
+        const deadline = new Promise((_, reject) => {
+            timer = setTimeout(() => {
+                try { controller.abort(); } catch (_) { /* already settled */ }
+                const error = new Error('cancel acknowledgement timed out');
+                error.name = 'AbortError';
+                reject(error);
+            }, limit);
+        });
         try {
-            const response = await fetch(`${API_BASE}/chat/cancel/${encodeURIComponent(cancelId)}`, {
-                method: 'POST',
-                keepalive: true
-            });
-            if (!response.ok) return false;
-            const body = await response.json();
-            return Boolean(body && body.cancelled);
+            const response = await Promise.race([
+                fetch(`${API_BASE}/chat/cancel/${encodeURIComponent(cancelId)}`, {
+                    method: 'POST',
+                    keepalive: true,
+                    signal: controller.signal
+                }),
+                deadline
+            ]);
+            if (!response.ok) return 'unknown';
+            const body = await Promise.race([response.json(), deadline]);
+            const status = String((body && (body.status || body.state || body.result)) || '')
+                .trim().toLowerCase().replace(/_/g, '-');
+            if ((body && body.already_terminal === true)
+                || (body && body.terminal === true)
+                || [
+                    'already-terminal', 'cancelled', 'canceled', 'stopped', 'aborted',
+                    'completed', 'complete', 'done', 'terminal'
+                ].includes(status)) {
+                if (['cancelled', 'canceled', 'stopped', 'aborted'].includes(status)) {
+                    return 'cancelled';
+                }
+                return 'already-terminal';
+            }
+
+            // SimpleRAG acknowledges cancellation asynchronously with
+            // `{ cancelled: true, status: "requested" }`. Its request handle can
+            // disappear before every worker event has settled, so neither that
+            // acknowledgement nor a later `requested/false` proves terminality.
+            // Fail closed and retain the durable recovery barrier until the
+            // backend exposes an explicit terminal state (or the stream itself
+            // supplies a terminal frame).
+            if ([
+                'requested', 'accepted', 'pending', 'cancelling', 'canceling',
+                'stopping', 'in-progress', 'processing'
+            ].includes(status)) return 'requested';
+
+            // Retain compatibility with older backends that expose only the
+            // boolean and synchronously stop before replying.
+            if (body && body.cancelled === true) return 'cancelled';
+            return 'unknown';
         } catch (_) {
-            return false;
+            // A 2xx transport response without a parseable, explicit terminal
+            // acknowledgement does not prove that generation stopped.
+            return 'unknown';
+        } finally {
+            if (timer) clearTimeout(timer);
         }
     }
 
@@ -2469,7 +6564,7 @@
      *
      * fileNameStyle controls the ordering of the date and the project slug.
      */
-    function buildOutputPath(skill, phase, meta, settings) {
+    function buildOutputPath(skill, phase, meta, settings, folderId) {
         const cfg = settings || readSettings();
         const info = meta || {};
         const date = String(info.date || todayStamp());
@@ -2486,11 +6581,11 @@
         if (perPhase) {
             const nameFn = (skill.outputFileNames || {})[phase.optional];
             const custom = typeof nameFn === 'function' ? String(nameFn(info) || '') : '';
-            if (custom) return withCollisionHandling(joinPath(folderFor(cfg, skillFolder, skill), custom), cfg);
+            if (custom) return withCollisionHandling(joinPath(folderFor(cfg, skillFolder, skill), custom), cfg, folderId);
             suffix = '-' + String(phase.optional);
         } else if (skill && typeof skill.outputFileName === 'function') {
             const custom = String(skill.outputFileName(info) || '');
-            if (custom) return withCollisionHandling(joinPath(folderFor(cfg, skillFolder, skill), custom), cfg);
+            if (custom) return withCollisionHandling(joinPath(folderFor(cfg, skillFolder, skill), custom), cfg, folderId);
         } else if (skill && skill.fileSuffix) {
             suffix = String(skill.fileSuffix);
         }
@@ -2501,7 +6596,7 @@
                 ? slug + flatTag + suffix + '-' + date
                 : date + '-' + slug + flatTag + suffix;
 
-        return withCollisionHandling(joinPath(folderFor(cfg, skillFolder), base + '.md'), cfg);
+        return withCollisionHandling(joinPath(folderFor(cfg, skillFolder), base + '.md'), cfg, folderId);
     }
 
     /**
@@ -2531,24 +6626,29 @@
      * ever lost; 'overwrite' returns the path unchanged; 'ask' is resolved by
      * the controller (it returns the path and the caller prompts).
      */
-    function withCollisionHandling(path, cfg) {
+    function withCollisionHandling(path, cfg, folderId) {
         const policy = cfg && cfg.overwriteExistingFile;
         if (policy === 'overwrite' || policy === 'ask') return path;
-        if (!store.files[path]) return path;
+        if (!fileExists(path, folderId)) return path;
 
         const dot = path.lastIndexOf('.');
         const stem = dot > 0 ? path.slice(0, dot) : path;
         const extension = dot > 0 ? path.slice(dot) : '';
         for (let index = 2; index < 1000; index += 1) {
             const candidate = stem + '-' + index + extension;
-            if (!store.files[candidate]) return candidate;
+            if (!fileExists(candidate, folderId)) return candidate;
         }
         return stem + '-' + Date.now().toString(36) + extension;
     }
 
     /** Does a path already hold a document? Used by the 'ask' policy. */
-    function fileExists(path) {
-        return Boolean(store.files[String(path || '')]);
+    function fileExists(path, folderId) {
+        const hasExplicitFolder = typeof folderId === 'string' && Boolean(folderId);
+        if (hasExplicitFolder && !store.folders[folderId]) return false;
+        const wantedFolder = hasExplicitFolder
+            ? folderId
+            : (store.folders[store.activeFolderId] ? store.activeFolderId : '');
+        return Boolean(findFileEntry(path, wantedFolder, false));
     }
 
     // ------------------------------------------------------------------
@@ -2634,21 +6734,61 @@
      * in any editor.
      */
     function exportBundle() {
-        const paths = listFiles();
+        const entries = storedFileEntries().sort((left, right) => {
+            const leftFolder = String(left.record.folder || '');
+            const rightFolder = String(right.record.folder || '');
+            return (leftFolder + '\u0000' + left.record.path).localeCompare(
+                rightFolder + '\u0000' + right.record.path, undefined, { numeric: true });
+        });
+        // Labels and slash-joined display paths are not identities. For example,
+        // root label "A/B" + "c.md" aliases root label "A" + "B/c.md". Keep a
+        // machine-readable manifest in every export (including a one-file
+        // project) so each body can always be traced to its immutable root id.
+        const manifest = {
+            format: 'codalio-blueprint-project-export',
+            schemaVersion: 1,
+            projectName: String(store.projectName || 'Untitled'),
+            folders: listFolders().map(folder => ({
+                folderId: String(folder.id || ''),
+                label: String(folder.name || ''),
+                kind: String(folder.kind || '')
+            })),
+            documents: entries.map((item, index) => {
+                const record = item.record;
+                const folder = store.folders[record.folder];
+                return {
+                    document: index + 1,
+                    folderId: String(record.folder || ''),
+                    folderLabel: String((folder && folder.name) || ''),
+                    path: String(record.path || item.key || '')
+                };
+            })
+        };
         const parts = [
             '# Blueprint project export',
             '',
             'Exported ' + new Date().toISOString(),
             '',
             'Project: ' + (store.projectName || 'Untitled'),
-            'Documents: ' + paths.length,
+            'Documents: ' + entries.length,
+            '',
+            '## Identity manifest',
+            '',
+            '```json',
+            JSON.stringify(manifest, null, 2),
+            '```',
             '',
             '---',
             ''
         ];
-        paths.forEach(path => {
-            const record = store.files[path];
-            parts.push('## ' + path, '');
+        entries.forEach((item, index) => {
+            const record = item.record;
+            const folder = store.folders[record.folder];
+            const qualifiedPath = `${folder ? folder.name : '(missing root)'}/${record.path || item.key}`;
+            parts.push(`## Document ${index + 1}: ${qualifiedPath}`, '');
+            parts.push(`- Project root ID: \`${String(record.folder || '')}\``);
+            parts.push(`- Project root label: ${String((folder && folder.name) || '')}`);
+            parts.push(`- Relative path: \`${String(record.path || item.key || '')}\``, '');
             parts.push(String(record && record.content ? record.content : ''), '');
             parts.push('---', '');
         });
@@ -2666,6 +6806,10 @@
         SETTINGS_KEY,
         REMOVED_KEY,
         WORKSPACE_KEY,
+        PROJECTS_WRITE_LOCK_PREFIX,
+        PENDING_CANCEL_PREFIX,
+        RUN_OWNER_PREFIX,
+        sessionId: storeWriterId,
         DEFAULT_SETTINGS,
         BlueprintAbort,
         BlueprintModelError,
@@ -2679,18 +6823,27 @@
         readSettings,
         readSettingsRaw,
         writeSettings,
+        withStorageWriteLease,
         listFiles,
         readFile,
+        fileRef,
+        fileRefKey,
+        fileSnapshot,
+        fileMatchesSnapshot,
         writeFile,
         isReadOnlyFile,
         canEditFile,
         deleteFile,
+        clearFiles,
         renameFile,
+        updateFile,
         setOpenPath,
         DEFAULT_FOLDER_ID,
         listFolders,
         getFolder,
         activeFolder,
+        folderSnapshot,
+        folderMatchesSnapshot,
         setActiveFolder,
         createFolder,
         renameFolder,
@@ -2706,7 +6859,10 @@
         scoreFilesForDigest,
         isVendoredPath,
         isMinifiedSource,
+        isSensitiveSourcePath,
+        sanitizeSourceForModel,
         CODE_EXTENSIONS,
+        IMPLEMENTATION_EXTENSIONS,
         IMPORTABLE_EXTENSIONS,
         IMPORT_SKIP_DIRS,
         relativePathOf,
@@ -2715,13 +6871,32 @@
         readWorkspaceRaw,
         saveWorkspace,
         clearWorkspace,
+        storageRecoveryState,
+        exportRecoverySnapshot,
+        rememberPendingCancel,
+        refreshPendingCancel,
+        forgetPendingCancel,
+        listPendingCancels,
+        listPendingCancelRecords,
+        readRunOwner,
+        claimRunOwnership,
+        bindRunOwnership,
+        runLeaseId,
+        refreshRunOwnership,
+        releaseRunOwnership,
         isDomNode,
         withoutDomNodes,
         persistenceState,
+        reloadStoreFromStorage,
         findRun,
         activeRun,
+        selectRun,
+        restoreSelection,
+        reconcileWorkspaceSelection,
         saveRun,
         deleteRun,
+        clearRuns,
+        clearAllData,
         createRun,
         estimateTokens,
         buildDeterministicCompaction,
@@ -2729,6 +6904,7 @@
         appendInline,
         streamModelTurn,
         cancelTurn,
+        cancelTurnOutcome,
         extractJsonObject,
         unwrapDocument,
         trimPreamble,

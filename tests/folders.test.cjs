@@ -5,7 +5,7 @@
  *
  * Covers the folder layer added on top of the flat v1 store:
  *
- *   1. v1 -> v2 MIGRATION. The important one: an existing user upgrading must not
+ *   1. v1/v2 -> v3 MIGRATION. The important one: an existing user upgrading must not
  *      lose documents. readStore() runs once at module load, so this test seeds a
  *      v1 payload into localStorage and loads controller-core.js in a FRESH vm
  *      context — the only honest way to exercise the migration path.
@@ -137,16 +137,8 @@ let storage = boot.storage;
 
 /** Wipe projects and folders, keeping the same module instance. */
 function reset() {
-    storage.removeItem(core.PROJECTS_KEY);
-    core.store.files = {};
-    core.store.runs = [];
-    core.store.openPath = '';
-    core.store.activeRunId = '';
-    Object.keys(core.store.folders).forEach(id => {
-        if (id !== core.DEFAULT_FOLDER_ID) delete core.store.folders[id];
-    });
-    core.store.activeFolderId = core.DEFAULT_FOLDER_ID;
-    core.store.folders[core.DEFAULT_FOLDER_ID].name = 'Blueprint project';
+    const cleared = core.clearAllData(core.DEFAULT_SETTINGS);
+    assert.equal(cleared.ok, true, `test fixture reset failed: ${cleared.error || 'unknown error'}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -161,7 +153,7 @@ assert.equal(folders[0].origin, 'default', 'the default folder must report origi
 assert.equal(core.activeFolder().id, core.DEFAULT_FOLDER_ID);
 
 // ---------------------------------------------------------------------------
-// 2. v1 -> v2 migration: existing documents and runs survive
+// 2. v1/v2 -> v3 migration: existing documents and runs survive
 // ---------------------------------------------------------------------------
 {
     const v1 = {
@@ -192,7 +184,7 @@ assert.equal(core.activeFolder().id, core.DEFAULT_FOLDER_ID);
     const migrated = loadCore({ [core.PROJECTS_KEY]: v1 });
     const mCore = migrated.core;
 
-    assert.equal(mCore.store.version, 2, 'the migrated store did not report version 2');
+    assert.equal(mCore.store.version, 3, 'the migrated store did not report version 3');
     assert.equal(mCore.listFiles().length, 2, 'migration LOST documents');
     const prd = mCore.readFile('docs/prd/2026-01-01-old-prd.md');
     assert.ok(prd, 'the migrated PRD is missing');
@@ -213,12 +205,45 @@ assert.equal(core.activeFolder().id, core.DEFAULT_FOLDER_ID);
     assert.equal(mCore.store.activeRunId, 'run-1', 'migration lost the active run');
     assert.equal(mCore.listFolders().length, 1, 'migration invented extra folders');
 
-    // The migrated store re-persists as v2 without further change.
+    // The migrated store re-persists as v3 without further change.
     mCore.writeFile('docs/prd/new.md', '# New', {});
     const roundTrip = JSON.parse(migrated.storage.getItem(mCore.PROJECTS_KEY));
-    assert.equal(roundTrip.version, 2, 'the migrated store did not re-save as v2');
+    assert.equal(roundTrip.version, 3, 'the migrated store did not re-save as v3');
     assert.equal(roundTrip.files['docs/prd/2026-01-01-old-prd.md'].folder, mCore.DEFAULT_FOLDER_ID,
         'the migrated folder assignment did not persist');
+}
+
+// Accepted legacy paths are canonicalized before the graph becomes live, so an
+// old leading slash cannot make every later v3 save fail schema validation.
+{
+    const legacy = {
+        version: 1,
+        files: {
+            '/legacy.md': { path: '/legacy.md', content: '# Legacy' }
+        },
+        runs: [{
+            id: 'legacy-run',
+            status: 'done',
+            phases: [{ reviewPath: '/legacy.md' }],
+            reviews: [{ path: '/legacy.md' }],
+            writtenFiles: [{ path: '/legacy.md' }]
+        }],
+        openPath: '/legacy.md',
+        activeRunId: 'legacy-run'
+    };
+    const migrated = loadCore({ [core.PROJECTS_KEY]: legacy });
+    assert.equal(migrated.core.store.openPath, 'legacy.md');
+    assert.ok(migrated.core.readFile('legacy.md'));
+    const legacyRun = migrated.core.findRun('legacy-run');
+    assert.equal(legacyRun.writtenPaths[0], 'legacy.md');
+    assert.equal(legacyRun.writtenFiles[0].path, 'legacy.md');
+    assert.equal(legacyRun.reviews[0].path, 'legacy.md');
+    assert.equal(legacyRun.phases[0].reviewPath, 'legacy.md');
+    assert.ok(migrated.core.writeFile('new.md', '# New', {}),
+        'canonicalized legacy graph could not be upgraded to a valid v3 write');
+    const persisted = JSON.parse(migrated.storage.getItem(migrated.core.PROJECTS_KEY));
+    assert.equal(persisted.version, 3);
+    assert.equal(persisted.files['legacy.md'].path, 'legacy.md');
 }
 
 // A v2 store with real folders must not be flattened back into the default.
@@ -248,8 +273,32 @@ assert.equal(core.activeFolder().id, core.DEFAULT_FOLDER_ID);
     );
 }
 
-// A store pointing at a folder that does not exist falls back rather than
-// rendering an empty sidebar with no way back.
+{
+    const legacyV2 = {
+        version: 2,
+        folders: {
+            'folder-default': { id: 'folder-default', name: 'Blueprint project' }
+        },
+        files: {
+            'a.md': { path: 'a.md', content: '# A', folder: 'folder-default' }
+        },
+        runs: [{
+            id: 'v2-written-ref',
+            status: 'done',
+            folderId: 'folder-default',
+            phases: [],
+            writtenFiles: [{ path: '/a.md', folderId: 'folder-default' }]
+        }],
+        activeFolderId: 'folder-default'
+    };
+    const migrated = loadCore({ [core.PROJECTS_KEY]: legacyV2 });
+    assert.equal(migrated.core.findRun('v2-written-ref').writtenFiles[0].path, 'a.md');
+    assert.ok(migrated.core.writeFile('b.md', '# B', {}),
+        'v2 written-file reference poisoned the v3 upgrade');
+}
+
+// A v2 store that lost a file owner is corrupt. Keep its original bytes for
+// explicit recovery instead of silently re-homing source into another project.
 {
     const broken = {
         version: 2,
@@ -262,8 +311,12 @@ assert.equal(core.activeFolder().id, core.DEFAULT_FOLDER_ID);
         'a dangling activeFolderId was not healed');
     assert.ok(healed.core.listFolders().some(f => f.id === healed.core.DEFAULT_FOLDER_ID),
         'the default folder was not recreated when missing');
-    assert.equal(healed.core.readFile('a.md').folder, healed.core.DEFAULT_FOLDER_ID,
-        'a file pointing at a missing folder was not refiled');
+    assert.equal(healed.core.readFile('a.md'), null,
+        'a file pointing at a missing folder was silently refiled');
+    assert.match(healed.core.storageRecoveryState().projects, /missing project root/i,
+        'the invalid owner was not exposed as recoverable corruption');
+    assert.equal(healed.storage.getItem(core.PROJECTS_KEY), JSON.stringify(broken),
+        'loading invalid owner data overwrote the original recovery bytes');
 }
 
 // ---------------------------------------------------------------------------
@@ -356,10 +409,101 @@ assert.equal(core.readFile('docs/prd/alpha.md').folder, folderA.id,
 core.writeFile('docs/prd/explicit.md', '# Explicit', { folder: folderA.id });
 assert.equal(core.readFile('docs/prd/explicit.md').folder, folderA.id);
 
-// An unknown folder id falls back rather than orphaning the document.
-core.writeFile('docs/prd/ghost.md', '# Ghost', { folder: 'folder-does-not-exist' });
-assert.equal(core.readFile('docs/prd/ghost.md').folder, folderB.id,
-    'an unknown meta.folder orphaned the document');
+// An explicit root id is an integrity boundary. A delayed async write aimed at
+// a deleted root must fail closed rather than drift into whichever root is active.
+const refusedGhost = core.writeFile('docs/prd/ghost.md', '# Ghost', {
+    folder: 'folder-does-not-exist'
+});
+assert.equal(refusedGhost, null, 'a write aimed at a missing root was accepted');
+assert.equal(core.readFile('docs/prd/ghost.md'), null,
+    'a write aimed at a missing root drifted into another project');
+
+// The same relative path is a valid, independent file in two project roots.
+// Folder identity must survive reads, tabs/history handles, persistence, export,
+// collision checks, and deletion without ever selecting by path alone.
+reset();
+const duplicateA = core.createFolder('Duplicate Alpha').folder;
+core.writeFile('src/shared.js', 'export const owner = "alpha";\n', {
+    folder: duplicateA.id,
+    origin: 'imported'
+});
+const duplicateB = core.createFolder('Duplicate Beta').folder;
+core.writeFile('src/shared.js', 'export const owner = "beta";\n', {
+    folder: duplicateB.id,
+    origin: 'imported'
+});
+assert.equal(core.listFiles(duplicateA.id)[0], 'src/shared.js');
+assert.equal(core.listFiles(duplicateB.id)[0], 'src/shared.js');
+assert.equal(core.readFile('src/shared.js', duplicateA.id).content, 'export const owner = "alpha";\n');
+assert.equal(core.readFile('src/shared.js', duplicateB.id).content, 'export const owner = "beta";\n');
+assert.notEqual(core.fileRefKey('src/shared.js', duplicateA.id), core.fileRefKey('src/shared.js', duplicateB.id));
+assert.equal(core.withCollisionHandling('src/shared.js', { overwriteExistingFile: 'version' }, duplicateA.id),
+    'src/shared-2.js');
+
+core.setOpenPath('src/shared.js', duplicateA.id);
+assert.equal(core.store.openFolderId, duplicateA.id, 'the open file lost its root identity');
+core.writeStore();
+const duplicateSeed = storage.getItem(core.PROJECTS_KEY);
+const duplicateReload = loadCore({ [core.PROJECTS_KEY]: duplicateSeed }).core;
+assert.equal(duplicateReload.readFile('src/shared.js', duplicateA.id).content,
+    'export const owner = "alpha";\n', 'root A content changed on reload');
+assert.equal(duplicateReload.readFile('src/shared.js', duplicateB.id).content,
+    'export const owner = "beta";\n', 'root B content changed on reload');
+assert.equal(duplicateReload.store.openFolderId, duplicateA.id,
+    'the open file root did not survive persistence');
+const duplicateExport = duplicateReload.exportBundle();
+assert.match(duplicateExport, /Duplicate Alpha\/src\/shared\.js/);
+assert.match(duplicateExport, /Duplicate Beta\/src\/shared\.js/);
+const duplicateManifestMatch = /```json\n([\s\S]*?)\n```/.exec(duplicateExport);
+assert.ok(duplicateManifestMatch, 'project export omitted its identity manifest');
+const duplicateManifest = JSON.parse(duplicateManifestMatch[1]);
+assert.equal(duplicateManifest.format, 'codalio-blueprint-project-export');
+assert.ok(duplicateManifest.documents.some(item =>
+    item.folderId === duplicateA.id && item.path === 'src/shared.js'));
+assert.ok(duplicateManifest.documents.some(item =>
+    item.folderId === duplicateB.id && item.path === 'src/shared.js'));
+
+// Slash-joined labels and paths can render identically; the manifest must still
+// retain two distinct root-qualified identities.
+const slashLabelRoot = duplicateReload.createFolder('A/B').folder;
+duplicateReload.writeFile('c.md', 'slash label root', { folder: slashLabelRoot.id });
+const nestedPathRoot = duplicateReload.createFolder('A').folder;
+duplicateReload.writeFile('B/c.md', 'nested path root', { folder: nestedPathRoot.id });
+const aliasExport = duplicateReload.exportBundle();
+const aliasManifest = JSON.parse(/```json\n([\s\S]*?)\n```/.exec(aliasExport)[1]);
+const aliasDocuments = aliasManifest.documents.filter(item =>
+    (item.folderId === slashLabelRoot.id && item.path === 'c.md')
+    || (item.folderId === nestedPathRoot.id && item.path === 'B/c.md'));
+assert.equal(aliasDocuments.length, 2, 'display-path aliases collapsed in export');
+assert.equal(new Set(aliasDocuments.map(item => `${item.folderId}\u0000${item.path}`)).size, 2,
+    'export manifest did not preserve root-qualified identities');
+assert.equal(duplicateReload.deleteFile('src/shared.js', duplicateA.id), true);
+assert.equal(duplicateReload.readFile('src/shared.js', duplicateA.id), null,
+    'folder-qualified delete left the requested file behind');
+assert.equal(duplicateReload.readFile('src/shared.js', duplicateB.id).content,
+    'export const owner = "beta";\n', 'folder-qualified delete removed the sibling root file');
+
+// Imported documents are immutable. Revising one must create a distinct,
+// collision-safe document in the SAME root (and must never recurse forever when
+// the protected path already lives under docs/).
+reset();
+const protectedRoot = core.createFolder('Protected docs').folder;
+core.writeFile('docs/spec.md', '# Original imported spec\n', {
+    folder: protectedRoot.id,
+    origin: 'imported'
+});
+const unrelatedRoot = core.createFolder('Unrelated active root').folder;
+core.setActiveFolder(unrelatedRoot.id);
+const firstRevision = core.writeFile('docs/spec.md', '# Revised safely\n', {});
+assert.ok(firstRevision, 'revising an imported docs file returned no record');
+assert.equal(firstRevision.path, 'docs/spec.revised.md');
+assert.equal(firstRevision.folder, protectedRoot.id,
+    'the protected-file revision leaked into the active root');
+assert.equal(core.readFile('docs/spec.md', protectedRoot.id).content, '# Original imported spec\n',
+    'the imported document was overwritten');
+const secondRevision = core.writeFile('docs/spec.md', '# Revised safely again\n', { folder: protectedRoot.id });
+assert.equal(secondRevision.path, 'docs/spec.revised-2.md',
+    'a second protected-file revision did not receive a collision-safe path');
 
 // ---------------------------------------------------------------------------
 // 5. Deleting a folder deletes its documents and protects the default
@@ -459,6 +603,26 @@ assert.notEqual(core.store.openPath, 'docs/prd/open-me.md',
     assert.equal(result.imported.length, 1);
     assert.match(result.skipped.map(s => s.reason).join(' | '), /unsupported type \.png/);
 
+    // Credential-bearing paths fail closed, while an intentionally shareable
+    // environment template remains importable.
+    reset();
+    result = await core.importFolder([
+        fakeFile('secure/.env', 'API_KEY=never-import-this'),
+        fakeFile('secure/.npmrc', '//registry/:_authToken=never-import-this'),
+        fakeFile('secure/.GIT/config.json', '{"password":"never-import-this"}'),
+        fakeFile('secure/credentials.json', '{"token":"never-import-this"}'),
+        fakeFile('secure/.env.example', 'API_KEY=replace-me'),
+        fakeFile('secure/src/config.js', 'export const mode = "dev";')
+    ], 'secure', {});
+    assert.equal(result.imported.length, 2, 'sensitive paths were imported or safe templates were lost');
+    assert.ok(core.readFile('.env.example', result.folder.id), 'the safe environment template was rejected');
+    assert.ok(core.readFile('src/config.js', result.folder.id));
+    assert.equal(core.readFile('.env', result.folder.id), null);
+    assert.equal(core.readFile('.npmrc', result.folder.id), null);
+    assert.equal(core.readFile('credentials.json', result.folder.id), null);
+    assert.equal(result.skippedByReason['sensitive credential file'], 3);
+    assert.equal(result.skippedByReason['ignored directory'], 1);
+
     // Per-file budget.
     reset();
     result = await core.importFolder([
@@ -533,6 +697,75 @@ assert.notEqual(core.store.openPath, 'docs/prd/open-me.md',
     assert.equal(result.imported.length, 1, 'a backslash path was not imported');
     assert.ok(core.readFile('src/main.py'), 'backslashes were not normalized to forward slashes');
 
+    // Distinct picker paths can collapse to one safe VFS path. The importer
+    // must never count the aliases and then silently overwrite the first file.
+    reset();
+    result = await core.importFolder([
+        fakeFile('aliases/a.txt', 'FIRST'),
+        fakeFile('aliases/ a.txt', 'SECOND'),
+        fakeFile('aliases/./a.txt', 'THIRD'),
+        fakeFile('aliases//a.txt', 'FOURTH')
+    ], 'aliases', {});
+    assert.equal(result.imported.length, 1, 'canonical aliases were reported as separate durable files');
+    assert.equal(result.skippedTotal, 3, 'canonical aliases were not reported as skips');
+    assert.equal(core.readFile('a.txt', result.folder.id).content, 'FIRST',
+        'a later canonical alias overwrote the first imported source');
+    assert.equal(core.folderFileCount(result.folder.id), 1);
+    assert.equal(result.folder.importedCount, 1);
+    assert.deepEqual(Array.from(result.imported, item => item.path), ['a.txt']);
+
+    // Cancelling after some files were read removes both the partial files and
+    // the import-created root, including from the persisted store.
+    reset();
+    const importAbort = new AbortController();
+    const cancellingFiles = [
+        fakeFile('cancelled/first.js', 'export const first = true;'),
+        {
+            name: 'second.js',
+            webkitRelativePath: 'cancelled/second.js',
+            size: 16,
+            text: async () => {
+                importAbort.abort();
+                return 'export const second = true;';
+            }
+        }
+    ];
+    let cancelError = null;
+    try {
+        await core.importFolder(cancellingFiles, 'cancelled', { signal: importAbort.signal });
+    } catch (error) {
+        cancelError = error;
+    }
+    assert.ok(cancelError, 'the cancelled import resolved successfully');
+    assert.equal(cancelError.code, 'aborted');
+    assert.equal(cancelError.rolledBack, true, 'the cancelled import did not persist its rollback');
+    assert.equal(cancelError.partialImported, 1);
+    assert.ok(!core.listFolders().some(folder => folder.name === 'cancelled'),
+        'the import-created root survived cancellation');
+    assert.equal(core.readFile('first.js'), null, 'a partial imported file survived cancellation');
+    const cancelledPersisted = JSON.parse(storage.getItem(core.PROJECTS_KEY));
+    assert.ok(!Object.values(cancelledPersisted.folders).some(folder => folder.name === 'cancelled'));
+    assert.ok(!Object.values(cancelledPersisted.files).some(file => file.path === 'first.js'));
+
+    // Stop must also interrupt a file.text() promise that never settles; this
+    // was otherwise a permanent busyImport/global-operation lock.
+    reset();
+    const blockedReadAbort = new AbortController();
+    const blockedImport = core.importFolder([{
+        name: 'blocked.js',
+        webkitRelativePath: 'blocked/blocked.js',
+        size: 10,
+        text: () => new Promise(() => {})
+    }], 'blocked', { signal: blockedReadAbort.signal, fileReadTimeoutMs: 5000 });
+    setTimeout(() => blockedReadAbort.abort(), 0);
+    const blockedError = await Promise.race([
+        blockedImport.then(() => null, error => error),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('blocked file read ignored cancellation')), 250))
+    ]);
+    assert.ok(blockedError && blockedError.code === 'aborted');
+    assert.equal(blockedError.rolledBack, true);
+    assert.ok(!core.listFolders().some(folder => folder.name === 'blocked'));
+
     // -------------------------------------------------------------------
     // 7. File System Access API directory walker
     // -------------------------------------------------------------------
@@ -591,15 +824,85 @@ assert.notEqual(core.store.openPath, 'docs/prd/open-me.md',
     // host-realm literal fails on prototypes — compare serialized instead.
     assert.equal(JSON.stringify(collected.files.map(f => f.relativePath).sort()),
         JSON.stringify(['repo/README.md', 'repo/src/main.py']));
+    const collectedRepo = collected;
+
+    // The handle walker is bounded before File objects accumulate, and a
+    // never-settling getFile() remains abortable.
+    const cappedEntries = Array.from({ length: 12 }, (_, index) =>
+        fakeFileEntry(`capped/f${index}.js`, String(index)));
+    collected = await core.collectFilesFromDirectoryHandle(
+        fakeHandle('capped', cappedEntries), { maxFiles: 3 });
+    assert.equal(collected.files.length, 3);
+    assert.equal(collected.truncated, true);
+    assert.equal(collected.maxFiles, 3);
+
+    let rejectedMetadataReads = 0;
+    collected = await core.collectFilesFromDirectoryHandle({
+        kind: 'directory',
+        name: 'hostile',
+        values: async function* () {
+            for (let index = 0; index < 10000; index += 1) {
+                yield {
+                    kind: 'file',
+                    name: `locked-${index}.js`,
+                    getFile: async () => {
+                        rejectedMetadataReads += 1;
+                        throw new Error('locked');
+                    }
+                };
+            }
+        }
+    }, { maxEntries: 100, operationTimeoutMs: 50, scanTimeoutMs: 5000 });
+    assert.equal(rejectedMetadataReads, 100,
+        'unreadable entries bypassed the total entry budget');
+    assert.equal(collected.scannedEntries, 100);
+    assert.equal(collected.entryLimitReached, true);
+    assert.equal(collected.truncated, true);
+
+    const deadlineScan = await Promise.race([
+        core.collectFilesFromDirectoryHandle(fakeHandle('deadline-scan', [{
+            kind: 'file',
+            name: 'forever.js',
+            getFile: () => new Promise(() => {})
+        }]), { operationTimeoutMs: 5000, scanTimeoutMs: 50 }),
+        new Promise((_, reject) => setTimeout(() => reject(
+            new Error('global scan deadline did not stop blocked metadata')), 500))
+    ]);
+    assert.equal(deadlineScan.deadlineReached, true);
+    assert.equal(deadlineScan.truncated, true);
+
+    const scanAbort = new AbortController();
+    const blockedScan = core.collectFilesFromDirectoryHandle(fakeHandle('blocked-scan', [{
+        kind: 'file',
+        name: 'forever.js',
+        getFile: () => new Promise(() => {})
+    }]), { signal: scanAbort.signal, operationTimeoutMs: 5000 });
+    setTimeout(() => scanAbort.abort(), 0);
+    const scanError = await Promise.race([
+        blockedScan.then(() => null, error => error),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('blocked getFile ignored cancellation')), 250))
+    ]);
+    assert.ok(scanError && scanError.code === 'aborted');
 
     // The collected files feed importFolder() unchanged: same budgets, same
     // stored paths (leading directory stripped), folder named after the pick.
-    result = await core.importFolder(collected.files, core.suggestedFolderName(collected.files), {});
+    result = await core.importFolder(collectedRepo.files, core.suggestedFolderName(collectedRepo.files), {
+        incompleteReason: `The directory scan was incomplete: ${collectedRepo.unreadable} file(s) could not be opened.`
+    });
     assert.equal(result.error, '', `handle-path import failed: ${result.error}`);
     assert.equal(result.folder.name, 'repo', 'the folder was not named after the picked directory');
     assert.equal(result.imported.length, 2);
     assert.ok(core.readFile('README.md'), 'the leading directory was not stripped for handle-path files');
     assert.ok(core.readFile('src/main.py'));
+    assert.equal(result.folder.importState, 'incomplete',
+        'a partial handle scan was persisted as a complete project import');
+    assert.match(result.folder.importError, /1 file\(s\) could not be opened/);
+    const partialFolderId = result.folder.id;
+    const partialReload = loadCore({ [core.PROJECTS_KEY]: storage.getItem(core.PROJECTS_KEY) });
+    assert.equal(partialReload.core.getFolder(partialFolderId).importState, 'incomplete',
+        'reload lost the partial directory-scan marker');
+    assert.match(partialReload.core.getFolder(partialFolderId).importError, /could not be opened/,
+        'reload lost the durable partial-scan reason');
 
     // An empty folder is a clean error, not an empty import.
     reset();
@@ -642,6 +945,11 @@ assert.notEqual(core.store.openPath, 'docs/prd/open-me.md',
     // The raw DOMException text must never reach the user.
     assert.ok(!/underlying filesystem/.test(collected.lockedSample[0].reason),
         'the raw engine error string leaked into the reported reason');
+    result = await core.importFolder(collected.files, 'GUI partial', {
+        incompleteReason: `The directory scan was incomplete: ${collected.lockedDirs} folder(s) could not be enumerated.`
+    });
+    assert.equal(result.folder.importState, 'incomplete');
+    assert.match(result.folder.importError, /1 folder\(s\) could not be enumerated/);
 
     // A root handle that cannot list at all is the ONLY hard error — and even
     // that gets a human message, not the raw string.
@@ -667,7 +975,7 @@ assert.notEqual(core.store.openPath, 'docs/prd/open-me.md',
         'the folder could not be read');
 
     console.log('folders.test.cjs: 7 groups passed');
-    console.log('  migration     : v1 -> v2 keeps documents, runs, timestamps, links');
+    console.log('  migration     : v1/v2 -> v3 keeps documents, runs, timestamps, links');
     console.log('  healing       : missing/dangling folders fall back to the default');
     console.log('  folders       : create, rename, delete, duplicate-suffix, default protected');
     console.log('  scoping       : per-folder listings, unscoped still returns everything');

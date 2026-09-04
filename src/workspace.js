@@ -55,6 +55,7 @@
             icon: 'fa-file',
             sectionId: '',
             path: '',
+            folderId: '',
             pinned: false,
             openedAt: Date.now(),
             lastActiveAt: Date.now()
@@ -80,7 +81,7 @@
             settingsSection: 'agent',
             settingsPage: 'planning',
             settingsQuery: '',
-            viewerModeByPath: {},
+            viewerModeByPath: Object.create(null),
             dividerPx: 0            // 0 = use settings.listPaneWidth
         };
     }
@@ -97,6 +98,17 @@
         return SECTION_TABS.find(item => item.id === sectionId) || null;
     }
 
+    function persistedTabTimes(candidate) {
+        const now = Date.now();
+        const maxFuture = now + 24 * 60 * 60 * 1000;
+        const opened = Number(candidate && candidate.openedAt);
+        const active = Number(candidate && candidate.lastActiveAt);
+        const openedAt = Number.isFinite(opened) && opened > 0 && opened <= maxFuture ? opened : now;
+        const lastActiveAt = Number.isFinite(active) && active > 0 && active <= maxFuture
+            ? active : openedAt;
+        return { openedAt, lastActiveAt };
+    }
+
     /**
      * Rebuild a persisted workspace: drop tabs whose file no longer exists,
      * re-pin the agent per settings, clamp the active id, cap the tab count.
@@ -105,8 +117,9 @@
         const cfg = settings || readSettingsSafe();
         const base = createWorkspace(cfg);
         if (!raw || typeof raw !== 'object') return base;
+        const schemaVersion = Number.isSafeInteger(raw.version) && raw.version > 0
+            ? raw.version : 1;
 
-        const existingPaths = new Set(safeListFiles());
         const tabs = [];
         let sawAgent = false;
 
@@ -116,7 +129,7 @@
             if (kind === 'agent') {
                 if (sawAgent) return;
                 sawAgent = true;
-                tabs.push(agentTab(cfg.pinAgentTab));
+                tabs.push(Object.assign(agentTab(cfg.pinAgentTab), persistedTabTimes(candidate)));
                 return;
             }
             if (kind === 'section') {
@@ -129,21 +142,41 @@
                     title: meta.label,
                     icon: meta.icon,
                     sectionId: meta.id,
-                    pinned: false
+                    pinned: false,
+                    ...persistedTabTimes(candidate)
                 }));
                 return;
             }
             if (kind === 'file') {
-                const path = String(candidate.path || '');
-                if (!path || !existingPaths.has(path)) return;   // file was deleted
-                if (tabs.some(tab => tab.kind === 'file' && tab.path === path)) return;
+                const requestedPath = String(candidate.path || '');
+                if (!requestedPath) return;
+                const requestedFolder = String(candidate.folderId || '');
+                let record = requestedFolder ? core.readFile(requestedPath, requestedFolder) : null;
+                // v1 tabs predate root-qualified identities. Migrate only when
+                // the path exists in exactly one root; picking the active root or
+                // the first match can display a different project's same-path
+                // file. A v2 ownerless tab is malformed and is dropped.
+                if (!requestedFolder && schemaVersion < 2) {
+                    const matches = core.listFolders()
+                        .map(folder => core.readFile(requestedPath, folder.id))
+                        .filter(Boolean);
+                    record = matches.length === 1 ? matches[0] : null;
+                }
+                if (!record) return;   // file was deleted
+                const folderId = String(record.folder || requestedFolder || '');
+                const path = String(record.path || '');
+                if (!path) return;
+                if (tabs.some(tab => tab.kind === 'file'
+                    && tab.path === path && tab.folderId === folderId)) return;
                 tabs.push(makeTab({
-                    id: `tab-file:${path}`,
+                    id: fileTabId(path, folderId),
                     kind: 'file',
                     title: path.split('/').pop(),
                     icon: 'fa-file-lines',
                     path,
-                    pinned: false
+                    folderId,
+                    pinned: false,
+                    ...persistedTabTimes(candidate)
                 }));
             }
         });
@@ -156,9 +189,27 @@
         const keep = new Set(sorted.slice(0, cap).map(tab => tab.id));
         const finalTabs = tabs.filter(tab => keep.has(tab.id) || (tab.pinned && tab.kind === 'agent'));
 
-        const activeTabId = finalTabs.some(tab => tab.id === raw.activeTabId)
+        let activeTabId = finalTabs.some(tab => tab.id === raw.activeTabId)
             ? String(raw.activeTabId)
             : AGENT_TAB_ID;
+        // Workspace v1 file tabs were keyed by path alone. Preserve the selected
+        // legacy tab while migrating it to the folder-qualified v2 identity.
+        if (activeTabId === AGENT_TAB_ID && String(raw.activeTabId || '').startsWith('tab-file:')) {
+            const rawActiveId = String(raw.activeTabId);
+            const sourceTab = (Array.isArray(raw.tabs) ? raw.tabs : []).find(tab => tab
+                && tab.kind === 'file'
+                && (String(tab.id || '') === rawActiveId
+                    || fileTabId(tab.path, tab.folderId) === rawActiveId));
+            const sourceRef = sourceTab
+                ? core.fileRef(String(sourceTab.path || ''), String(sourceTab.folderId || ''))
+                : null;
+            const legacyPath = rawActiveId.slice('tab-file:'.length);
+            const migrated = finalTabs.find(tab => tab.kind === 'file'
+                && ((sourceRef && tab.path === sourceRef.path
+                    && tab.folderId === sourceRef.folderId)
+                    || tab.path === legacyPath));
+            if (migrated) activeTabId = migrated.id;
+        }
 
         return {
             tabs: finalTabs,
@@ -199,7 +250,7 @@
     }
 
     function sanitizeViewerModes(raw) {
-        const out = {};
+        const out = Object.create(null);
         if (raw && typeof raw === 'object') {
             Object.keys(raw).forEach(path => {
                 if (raw[path] === 'source' || raw[path] === 'preview') out[path] = raw[path];
@@ -214,6 +265,19 @@
         } catch (_) {
             return [];
         }
+    }
+
+    function fileTabId(path, folderId) {
+        // A relative path is not a file identity in a multi-root workspace.
+        // Encode both components so separators or punctuation in either value
+        // cannot make two references collapse to the same DOM/persistence id.
+        const folder = encodeURIComponent(String(folderId || ''));
+        const filePath = encodeURIComponent(String(path || ''));
+        return `tab-file:${folder}::${filePath}`;
+    }
+
+    function viewerKey(path, folderId) {
+        return fileTabId(path, folderId).slice('tab-file:'.length);
     }
 
     // ------------------------------------------------------------------
@@ -237,8 +301,10 @@
         return tabs(ws).find(tab => tab.kind === 'section' && tab.sectionId === sectionId) || null;
     }
 
-    function fileTab(ws, path) {
-        return tabs(ws).find(tab => tab.kind === 'file' && tab.path === path) || null;
+    function fileTab(ws, path, folderId) {
+        const wantedFolder = String(folderId || '');
+        return tabs(ws).find(tab => tab.kind === 'file' && tab.path === path
+            && (!wantedFolder || tab.folderId === wantedFolder)) || null;
     }
 
     function isAgentActive(ws) {
@@ -266,8 +332,9 @@
      * Settings -> Workspace -> Editor -> "Open documents in" still decides for
      * Markdown, where both readings are sensible.
      */
-    function viewerModeFor(ws, path, settings) {
-        const stored = ws.viewerModeByPath && ws.viewerModeByPath[path];
+    function viewerModeFor(ws, path, settings, folderId) {
+        const stored = ws.viewerModeByPath
+            && (ws.viewerModeByPath[viewerKey(path, folderId)] || ws.viewerModeByPath[path]);
         if (stored === 'source' || stored === 'preview') return stored;
 
         const clean = String(path || '');
@@ -342,13 +409,19 @@
      * without taking focus. That is what a run uses when it writes a document, so
      * the step trace the user is watching is not replaced mid-stream.
      */
-    function openFile(ws, path, settings, activate) {
+    function openFile(ws, path, settings, activate, folderId) {
         const cfg = settings || readSettingsSafe();
-        const clean = String(path || '');
-        if (!clean) return ws;
+        const requestedPath = String(path || '');
+        if (!requestedPath) return ws;
         const shouldActivate = activate !== false;
+        const ref = core.fileRef(requestedPath, typeof folderId === 'string' ? folderId : '');
+        if (!ref || !ref.folderId) return ws;
+        const record = core.readFile(ref.path, ref.folderId);
+        if (!record) return ws;
+        const clean = String(record.path || ref.path || '');
+        const owner = String(ref.folderId);
 
-        const existing = fileTab(ws, clean);
+        const existing = fileTab(ws, clean, owner);
         if (existing) {
             existing.title = clean.split('/').pop();
             touch(existing);
@@ -356,11 +429,12 @@
         }
 
         const tab = touch(makeTab({
-            id: `tab-file:${clean}`,
+            id: fileTabId(clean, owner),
             kind: 'file',
             title: clean.split('/').pop(),
             icon: fileIcon(clean),
-            path: clean
+            path: clean,
+            folderId: owner
         }));
         ws.tabs.push(tab);
         evictIfNeeded(ws, cfg, tab.id);
@@ -442,10 +516,12 @@
     }
 
     /** Called after a file is written: open or refresh its tab per settings. */
-    function onFileWritten(ws, path, settings) {
+    function onFileWritten(ws, path, settings, folderId) {
         const cfg = settings || readSettingsSafe();
         if (!path) return ws;
-        const existing = fileTab(ws, path);
+        const record = folderId ? core.readFile(path, folderId) : core.readFile(path);
+        const owner = String((record && record.folder) || folderId || '');
+        const existing = fileTab(ws, path, owner);
         if (existing) {
             existing.title = path.split('/').pop();
             touch(existing);
@@ -454,13 +530,13 @@
         if (cfg.autoOpenWrittenDocument === false) return ws;
         // Background: the document is ready in the strip, but the run keeps the
         // Agent tab in focus so its steps stay visible while it finishes.
-        return openFile(ws, path, cfg, false);
+        return openFile(ws, path, cfg, false, owner);
     }
 
     /** Called after a file is deleted: drop its tab per settings. */
-    function onFileDeleted(ws, path, settings) {
+    function onFileDeleted(ws, path, settings, folderId) {
         const cfg = settings || readSettingsSafe();
-        const tab = fileTab(ws, path);
+        const tab = fileTab(ws, path, folderId);
         if (!tab) return ws;
         if (cfg.closeTabOnDelete === false) {
             // Keep the tab; the viewer renders its own "file is gone" state.
@@ -469,23 +545,34 @@
         return closeTab(ws, tab.id, cfg);
     }
 
-    function onFileRenamed(ws, oldPath, newPath, settings) {
-        const tab = fileTab(ws, oldPath);
-        if (ws.viewerModeByPath && ws.viewerModeByPath[oldPath]) {
-            ws.viewerModeByPath[newPath] = ws.viewerModeByPath[oldPath];
-            delete ws.viewerModeByPath[oldPath];
+    function onFileRenamed(ws, oldPath, newPath, settings, folderId) {
+        const tab = fileTab(ws, oldPath, folderId);
+        const oldKey = viewerKey(oldPath, folderId);
+        const newKey = viewerKey(newPath, folderId);
+        const legacyPathStillShared = tabs(ws).some(candidate => candidate
+            && candidate.kind === 'file'
+            && candidate.path === oldPath
+            && String(candidate.folderId || '') !== String(folderId || ''));
+        if (ws.viewerModeByPath && (ws.viewerModeByPath[oldKey] || ws.viewerModeByPath[oldPath])) {
+            ws.viewerModeByPath[newKey] = ws.viewerModeByPath[oldKey] || ws.viewerModeByPath[oldPath];
+            delete ws.viewerModeByPath[oldKey];
+            // A legacy unqualified preference can still be the fallback for a
+            // same-path tab in another root. Do not erase that root's mode while
+            // renaming only this owner-qualified tab.
+            if (!legacyPathStillShared) delete ws.viewerModeByPath[oldPath];
         }
         if (!tab) return ws;
+        const oldId = tab.id;
         tab.path = newPath;
-        tab.id = `tab-file:${newPath}`;
+        tab.id = fileTabId(newPath, folderId || tab.folderId);
         tab.title = newPath.split('/').pop();
-        if (ws.activeTabId === `tab-file:${oldPath}`) ws.activeTabId = tab.id;
+        if (ws.activeTabId === oldId) ws.activeTabId = tab.id;
         return ws;
     }
 
-    function setViewerMode(ws, path, mode) {
+    function setViewerMode(ws, path, mode, folderId) {
         if (!ws.viewerModeByPath) ws.viewerModeByPath = {};
-        ws.viewerModeByPath[path] = mode === 'source' ? 'source' : 'preview';
+        ws.viewerModeByPath[viewerKey(path, folderId)] = mode === 'source' ? 'source' : 'preview';
         return ws;
     }
 
@@ -558,7 +645,7 @@
         if (ctrl && key.toLowerCase() === 's') {
             const tab = activeTab(ws);
             if (tab.kind === 'file') {
-                actions.downloadFile(tab.path);
+                actions.downloadFile(tab.path, tab.folderId);
                 return true;
             }
             return false;
@@ -613,6 +700,13 @@
         strip.setAttribute('role', 'tablist');
         strip.setAttribute('aria-label', 'Blueprint workspace tabs');
 
+        const fileTitleCounts = new Map();
+        tabs(ws).forEach(tab => {
+            if (tab.kind !== 'file') return;
+            const key = String(tab.title || tab.path || '');
+            fileTitleCounts.set(key, (fileTitleCounts.get(key) || 0) + 1);
+        });
+
         tabs(ws).forEach((tab, index) => {
             const isActive = tab.id === ws.activeTabId;
             const button = node('button', `cb-tab${isActive ? ' active' : ''}${tab.pinned ? ' pinned' : ''}`);
@@ -630,15 +724,25 @@
             // rule, so the affordance and the behaviour cannot disagree: turning
             // "Keep the Agent tab pinned" off makes the chat tab closable here too.
             const locked = tab.kind === 'agent' && tab.pinned && (!state || state.pinAgentTab !== false);
+            const owningFolder = tab.kind === 'file' && tab.folderId && core.getFolder
+                ? core.getFolder(tab.folderId) : null;
+            const duplicateTitle = tab.kind === 'file'
+                && (fileTitleCounts.get(String(tab.title || tab.path || '')) || 0) > 1;
+            const displayTitle = duplicateTitle
+                ? `${tab.title} · ${(owningFolder && owningFolder.name) || tab.folderId || 'project'}`
+                : tab.title;
+            const fileLocation = owningFolder
+                ? `${owningFolder.name} / ${tab.path}`
+                : tab.path;
 
             button.title = locked
                 ? `${tab.title} (pinned — the chat is never closed)`
                 : tab.kind === 'file'
-                    ? `${tab.path} — middle-click or Ctrl+W to close`
+                    ? `${fileLocation} — middle-click or Ctrl+W to close`
                     : `${tab.title} — middle-click or Ctrl+W to close`;
 
             button.appendChild(icon(tab.kind === 'file' ? fileIcon(tab.path) : tab.icon));
-            const label = node('span', 'cb-tab-label', tab.title);
+            const label = node('span', 'cb-tab-label', displayTitle);
             button.appendChild(label);
 
             if (state && state.busy && tab.kind === 'agent') {
@@ -655,7 +759,7 @@
                 close.dataset.cbAction = 'close-tab';
                 close.dataset.tabId = tab.id;
                 close.setAttribute('role', 'button');
-                close.setAttribute('aria-label', `Close ${tab.title}`);
+                close.setAttribute('aria-label', `Close ${displayTitle}`);
                 close.tabIndex = -1;
                 close.appendChild(icon('fa-xmark'));
                 button.appendChild(close);
@@ -687,6 +791,8 @@
         createWorkspace,
         normalizeWorkspace,
         sectionMeta,
+        fileTabId,
+        viewerKey,
         tabs,
         findTab,
         activeTab,

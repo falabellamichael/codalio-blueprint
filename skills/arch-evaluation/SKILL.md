@@ -24,10 +24,9 @@ generic best-practices audit.
    read it for context, but the requirements driving *this* evaluation must
    come from the user directly — don't assume a PRD's original scope is
    still the bar.
-2. **Clarifying questions.** Ask one at a time. Cover: what's the actual
-   decision this evaluation feeds (a go/no-go, a refactor-vs-rewrite call,
-   a scoping estimate)? Any hard deadline? Any part of the codebase already
-   known to be a problem area?
+2. **Clarifying questions.** Ask one at a time, organized as 2 questions per section (2x per section):
+   - **Requirements & Decision:** new scale/compliance/integration needs and the decision this evaluation feeds (go/no-go, refactor-vs-rewrite, scoping).
+   - **Architecture & Constraints:** known problem or bottleneck areas in the codebase and hard deadlines or performance/infrastructure constraints.
 3. **Explore the codebase.** Read enough of the actual code and structure to
    ground every claim — directory layout, core data model/schema, main
    integration points, test coverage, how the current architecture handles
