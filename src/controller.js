@@ -1705,15 +1705,83 @@
     /**
      * Import a directory from disk.
      *
-     * Uses a real <input type="file" webkitdirectory>, which is the only way a
-     * browser will hand over a whole folder. The input is created on demand and
-     * removed afterwards: a directory input cannot be reliably re-triggered once
-     * its value is set, and leaving a hidden one in the DOM is a leak.
+     * Prefers the File System Access API (window.showDirectoryPicker) when the
+     * browser has it — Chromium does, Firefox/Safari do not. That path walks
+     * the directory lazily and PRUNES ignored directories (node_modules, .git,
+     * …) instead of enumerating every file inside them, so importing a large
+     * repo scans orders of magnitude fewer entries. Every other browser gets
+     * the <input type="file" webkitdirectory> path, which is the only way
+     * those browsers hand over a whole folder.
+     *
+     * Both paths converge on the same File[] shape and the same
+     * runFolderImport() importer — budgets, skip reporting and persistence are
+     * shared, so the two pickers cannot drift apart.
      *
      * Nothing is uploaded anywhere — the files are read in this page and stored in
      * the browser profile, exactly like the single-file attach path.
      */
     function pickFolderFromDisk() {
+        if (core.canPickDirectoryHandle && core.canPickDirectoryHandle()) {
+            void pickFolderWithDirectoryHandle();
+            return;
+        }
+        pickFolderWithInput();
+    }
+
+    async function pickFolderWithDirectoryHandle() {
+        const settings = core.readSettings();
+        let rootHandle;
+        try {
+            rootHandle = await window.showDirectoryPicker({ mode: 'read' });
+        } catch (error) {
+            // AbortError is the user cancelling the picker — a normal outcome,
+            // not a failure worth a toast.
+            if (error && error.name === 'AbortError') return;
+            // SecurityError (insecure origin, cross-origin iframe, …) or any
+            // other refusal: fall back to the input path rather than dead-end.
+            console.warn('[codalio-blueprint] showDirectoryPicker failed, falling back to <input webkitdirectory>:', error);
+            pickFolderWithInput();
+            return;
+        }
+
+        // The scan walks the directory tree before importing. It reports
+        // through the same busy/progress state the importer uses, and yields
+        // every 40 entries so the page repaints mid-scan.
+        runtime.busyImport = true;
+        setToast(`Scanning "${rootHandle.name}"…`, 'info');
+        let collected;
+        try {
+            collected = await core.collectFilesFromDirectoryHandle(rootHandle, {
+                onProgress: found => {
+                    runtime.importProgress = { done: found, total: 0, imported: 0 };
+                    setToast(`Scanning "${rootHandle.name}"… ${found.toLocaleString()} file(s) found`, 'info');
+                }
+            });
+        } catch (error) {
+            runtime.busyImport = false;
+            runtime.importProgress = null;
+            setToast(`Import failed: ${String((error && error.message) || error)}`, 'error');
+            renderPage();
+            return;
+        }
+
+        if (collected.error) {
+            runtime.busyImport = false;
+            runtime.importProgress = null;
+            setToast(collected.error, 'warn');
+            renderPage();
+            return;
+        }
+
+        // runFolderImport() owns the busy state from here on; it also clears
+        // the scan progress before the import phase sets its own.
+        void runFolderImport(collected.files, settings, {
+            prunedDirs: collected.prunedDirs,
+            unreadable: collected.unreadable
+        });
+    }
+
+    function pickFolderWithInput() {
         const settings = core.readSettings();
         const input = document.createElement('input');
         input.type = 'file';
@@ -1754,10 +1822,11 @@
         }
     }
 
-    async function runFolderImport(files, settings) {
+    async function runFolderImport(files, settings, scanInfo) {
+        const scan = scanInfo || {};
         const pickedName = core.suggestedFolderName
             ? core.suggestedFolderName(files)
-            : String((files[0] && (files[0].webkitRelativePath || files[0].name)) || 'Imported folder').split('/')[0];
+            : String((files[0] && (files[0].relativePath || files[0].webkitRelativePath || files[0].name)) || 'Imported folder').split('/')[0];
 
         setToast(`Importing ${files.length.toLocaleString()} file(s) from ${pickedName}…`, 'info');
         runtime.busyImport = true;
@@ -1819,6 +1888,15 @@
         }
         if (result.truncatedByBudget) {
             parts.push('Raise the limits in Settings -> Source files to import more.');
+        }
+        // Handle-path only: pruned ignored directories were never enumerated,
+        // so they appear in no skip list — report them separately, or the user
+        // sees fewer files than the folder contains with no explanation.
+        if (scan.prunedDirs) {
+            parts.push(`${scan.prunedDirs.toLocaleString()} ignored folder(s) (node_modules, .git, …) were not scanned.`);
+        }
+        if (scan.unreadable) {
+            parts.push(`${scan.unreadable.toLocaleString()} file(s) could not be opened and were skipped.`);
         }
         setToast(parts.join(' '), skipped ? 'info' : 'success', skipped ? 12000 : 4200);
 

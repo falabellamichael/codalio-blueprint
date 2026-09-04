@@ -1007,6 +1007,102 @@
         return candidate || 'Imported folder';
     }
 
+    /**
+     * True when this browser exposes the File System Access API directory
+     * picker. Feature-detected at call time, never at load time: the plug-in
+     * is one bundle served to whatever browser opens the page, and a Firefox
+     * or Safari user must silently get the <input webkitdirectory> path.
+     */
+    function canPickDirectoryHandle() {
+        return typeof window.showDirectoryPicker === 'function'
+            && typeof window.FileSystemDirectoryHandle === 'function';
+    }
+
+    /**
+     * Walk a FileSystemDirectoryHandle into the File[] shape importFolder()
+     * already consumes, so both picker paths share one importer (budgets,
+     * skip reasons, chunked persistence).
+     *
+     * Two real advantages over <input webkitdirectory>, which are why the
+     * controller prefers this path when it exists:
+     *   1. IMPORT_SKIP_DIRS are PRUNED — the walker never descends into
+     *      node_modules/.git/.venv, so a huge repo costs a directory listing
+     *      per pruned folder instead of enumerating (and later skipping)
+     *      hundreds of thousands of File objects the input path would build.
+     *   2. Files arrive lazily; nothing is read until importFolder() decides
+     *      a file is worth storing.
+     *
+     * Extensions are deliberately NOT filtered here: importFolder() owns that
+     * decision and reports it as a skip reason, and both picker paths must
+     * produce the same report.
+     *
+     * Returns { files, prunedDirs, unreadable, error } — `files` entries carry
+     * a `relativePath` property ("root/sub/file.js"), which relativePathOf()
+     * already understands, keeping suggestedFolderName() and
+     * stripLeadingDirectory() working unchanged.
+     */
+    async function collectFilesFromDirectoryHandle(rootHandle, options) {
+        const cfg = Object.assign({ onProgress: null }, options || {});
+        const out = { files: [], prunedDirs: 0, unreadable: 0, error: '' };
+
+        if (!rootHandle || typeof rootHandle.values !== 'function') {
+            out.error = 'The picked directory could not be read.';
+            return out;
+        }
+
+        async function walk(dirHandle, prefix) {
+            let sinceYield = 0;
+            for await (const entry of dirHandle.values()) {
+                // Same repaint trick the importer uses: a directory listing
+                // can be long, and the scan must not freeze the page.
+                sinceYield += 1;
+                if (sinceYield >= 40) {
+                    sinceYield = 0;
+                    if (typeof cfg.onProgress === 'function') {
+                        cfg.onProgress(out.files.length);
+                    }
+                    await new Promise(resolve => setTimeout(resolve, 0));
+                }
+
+                const name = String((entry && entry.name) || '');
+                if (!name) continue;
+                const relativePath = prefix + name;
+
+                if (entry.kind === 'directory') {
+                    if (IMPORT_SKIP_DIRS.indexOf(name) >= 0) {
+                        out.prunedDirs += 1;
+                        continue;
+                    }
+                    await walk(entry, relativePath + '/');
+                } else if (entry.kind === 'file') {
+                    // getFile() rejects when the OS file vanished or is
+                    // exclusively locked; one such file must not abort the
+                    // scan — importFolder() reports per-file failures the
+                    // same way for the input path.
+                    try {
+                        const file = await entry.getFile();
+                        file.relativePath = relativePath;
+                        out.files.push(file);
+                    } catch (_) {
+                        out.unreadable += 1;
+                    }
+                }
+            }
+        }
+
+        try {
+            await walk(rootHandle, String(rootHandle.name || 'Imported folder') + '/');
+        } catch (error) {
+            out.error = String((error && error.message) || error);
+            return out;
+        }
+
+        if (!out.files.length && !out.error) {
+            out.error = 'That folder has no files in it.';
+        }
+        return out;
+    }
+
     /** Read a File/Blob as UTF-8 text, promisified. */
     function readAsText(file) {
         if (file && typeof file.text === 'function') return file.text();
@@ -1970,6 +2066,8 @@
         folderFileCount,
         folderFileCounts,
         importFolder,
+        canPickDirectoryHandle,
+        collectFilesFromDirectoryHandle,
         IMPORTABLE_EXTENSIONS,
         IMPORT_SKIP_DIRS,
         relativePathOf,

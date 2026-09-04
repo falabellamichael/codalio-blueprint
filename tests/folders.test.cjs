@@ -533,12 +533,96 @@ assert.notEqual(core.store.openPath, 'docs/prd/open-me.md',
     assert.equal(result.imported.length, 1, 'a backslash path was not imported');
     assert.ok(core.readFile('src/main.py'), 'backslashes were not normalized to forward slashes');
 
-    console.log('folders.test.cjs: 6 groups passed');
+    // -------------------------------------------------------------------
+    // 7. File System Access API directory walker
+    // -------------------------------------------------------------------
+
+    // A FileSystemDirectoryHandle-shaped stub: values() yields entries whose
+    // kind is 'file' (with getFile()) or 'directory' (with nested values()).
+    function fakeHandle(name, entries) {
+        return {
+            kind: 'directory',
+            name,
+            values: async function* () {
+                for (const entry of entries) yield entry;
+            }
+        };
+    }
+    function fakeFileEntry(relativePath, content, options) {
+        const cfg = options || {};
+        return {
+            kind: 'file',
+            name: relativePath.split('/').pop(),
+            getFile: async () => {
+                if (cfg.locked) throw new Error('NotFoundError: file vanished');
+                return fakeFile(relativePath, content);
+            }
+        };
+    }
+
+    // Feature detection mirrors the controller: no showDirectoryPicker in the
+    // test sandbox means the input fallback is what a browser without the API
+    // would take.
+    assert.equal(core.canPickDirectoryHandle(), false,
+        'the test sandbox must not claim directory-handle support');
+
+    // Pruning: ignored directories are never descended into, so their files
+    // are neither collected nor reported as per-file skips.
+    reset();
+    let root = fakeHandle('repo', [
+        fakeFileEntry('repo/README.md', '# repo'),
+        { kind: 'directory', name: 'src', values: async function* () {
+            yield fakeFileEntry('repo/src/main.py', 'print(1)');
+        } },
+        { kind: 'directory', name: 'node_modules', values: async function* () {
+            yield fakeFileEntry('repo/node_modules/lib/index.js', 'dep');
+        } },
+        { kind: 'directory', name: '.git', values: async function* () {
+            yield fakeFileEntry('repo/.git/HEAD', 'ref');
+        } },
+        fakeFileEntry('repo/locked.txt', 'gone', { locked: true })
+    ]);
+    let collected = await core.collectFilesFromDirectoryHandle(root);
+    assert.equal(collected.error, '', `scan failed: ${collected.error}`);
+    assert.equal(collected.files.length, 2, 'ignored dirs were descended into, or real files were lost');
+    assert.equal(collected.prunedDirs, 2, 'pruned ignored directories were not counted');
+    assert.equal(collected.unreadable, 1, 'a locked file aborted the scan instead of being counted');
+    // The collected array is from the vm realm, so deepStrictEqual against a
+    // host-realm literal fails on prototypes — compare serialized instead.
+    assert.equal(JSON.stringify(collected.files.map(f => f.relativePath).sort()),
+        JSON.stringify(['repo/README.md', 'repo/src/main.py']));
+
+    // The collected files feed importFolder() unchanged: same budgets, same
+    // stored paths (leading directory stripped), folder named after the pick.
+    result = await core.importFolder(collected.files, core.suggestedFolderName(collected.files), {});
+    assert.equal(result.error, '', `handle-path import failed: ${result.error}`);
+    assert.equal(result.folder.name, 'repo', 'the folder was not named after the picked directory');
+    assert.equal(result.imported.length, 2);
+    assert.ok(core.readFile('README.md'), 'the leading directory was not stripped for handle-path files');
+    assert.ok(core.readFile('src/main.py'));
+
+    // An empty folder is a clean error, not an empty import.
+    reset();
+    collected = await core.collectFilesFromDirectoryHandle(fakeHandle('empty-dir', []));
+    assert.match(collected.error, /no files/);
+
+    // A handle that throws while listing reports the failure instead of
+    // hanging or producing a partial silent import.
+    reset();
+    collected = await core.collectFilesFromDirectoryHandle({
+        kind: 'directory',
+        name: 'broken',
+        values: () => { throw new Error('permission revoked mid-walk'); }
+    });
+    assert.match(collected.error, /permission revoked/);
+
+    console.log('folders.test.cjs: 7 groups passed');
     console.log('  migration     : v1 -> v2 keeps documents, runs, timestamps, links');
     console.log('  healing       : missing/dangling folders fall back to the default');
     console.log('  folders       : create, rename, delete, duplicate-suffix, default protected');
     console.log('  scoping       : per-folder listings, unscoped still returns everything');
     console.log('  importer      : count / per-file / total budgets, skips explained, one bad file tolerated');
+    console.log('  handle scan   : prunes ignored dirs, tolerates locked files, feeds the shared importer');
     process.exit(0);
 })().catch(error => {
     console.error(error);
