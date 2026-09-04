@@ -1774,10 +1774,14 @@
         }
 
         // runFolderImport() owns the busy state from here on; it also clears
-        // the scan progress before the import phase sets its own.
+        // the scan progress before the import phase sets its own. A partial
+        // scan (some folders locked) reaches here with files populated and
+        // error empty — the locked counts are reported in the final toast.
         void runFolderImport(collected.files, settings, {
             prunedDirs: collected.prunedDirs,
-            unreadable: collected.unreadable
+            unreadable: collected.unreadable,
+            lockedDirs: collected.lockedDirs,
+            lockedSample: collected.lockedSample
         });
     }
 
@@ -1898,7 +1902,17 @@
         if (scan.unreadable) {
             parts.push(`${scan.unreadable.toLocaleString()} file(s) could not be opened and were skipped.`);
         }
-        setToast(parts.join(' '), skipped ? 'info' : 'success', skipped ? 12000 : 4200);
+        // A partial scan: some folders (live DBs, in-use files) refused to
+        // list, so their contents were never seen. Say how many and why, with a
+        // human reason — never the raw DOMException string.
+        if (scan.lockedDirs) {
+            const sample = Array.isArray(scan.lockedSample) ? scan.lockedSample : [];
+            const reason = sample[0] ? sample[0].reason : 'they are in use by another program';
+            const where = sample.length ? ` (e.g. ${sample[0].path})` : '';
+            parts.push(`${scan.lockedDirs.toLocaleString()} folder(s) were skipped because ${reason}${where}.`);
+        }
+        setToast(parts.join(' '), skipped || scan.lockedDirs ? 'info' : 'success',
+            skipped || scan.lockedDirs ? 12000 : 4200);
 
         renderHostSurfaces();
         renderPage();

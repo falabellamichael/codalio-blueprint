@@ -606,15 +606,65 @@ assert.notEqual(core.store.openPath, 'docs/prd/open-me.md',
     collected = await core.collectFilesFromDirectoryHandle(fakeHandle('empty-dir', []));
     assert.match(collected.error, /no files/);
 
-    // A handle that throws while listing reports the failure instead of
-    // hanging or producing a partial silent import.
+    // RESILIENCE — the regression this fixes. A directory the running app holds
+    // open (live SQLite DBs, mmap'd model weights) makes Chromium's iterator
+    // reject with NoModificationAllowedError. The walker must skip THAT folder
+    // and keep every file it already collected from its siblings, never abort
+    // the whole scan. Before this fix, one locked subdir discarded all ~1400
+    // files and leaked the raw engine string into the toast.
+    reset();
+    function nomodError() {
+        const err = new Error('An attempt was made to write to a file or directory '
+            + 'which could not be modified due to the state of the underlying filesystem.');
+        err.name = 'NoModificationAllowedError';
+        return err;
+    }
+    collected = await core.collectFilesFromDirectoryHandle(fakeHandle('GUI', [
+        fakeFileEntry('GUI/README.md', '# GUI'),
+        { kind: 'directory', name: 'ai_agents', values: async function* () {
+            yield fakeFileEntry('GUI/ai_agents/ai_graph.js', 'x');
+            yield fakeFileEntry('GUI/ai_agents/ai_tasks.js', 'y');
+        } },
+        { kind: 'directory', name: 'data', values: () => { throw nomodError(); } },
+        { kind: 'directory', name: 'comfy', values: async function* () {
+            yield fakeFileEntry('GUI/comfy/index.html', '<html>');
+        } }
+    ]));
+    assert.equal(collected.error, '',
+        `a locked subfolder aborted the whole scan: ${collected.error}`);
+    assert.equal(collected.files.length, 4,
+        'files from sibling folders were discarded because one folder was locked');
+    assert.equal(collected.lockedDirs, 1, 'the locked directory was not counted');
+    assert.equal(collected.lockedSample.length, 1);
+    assert.equal(collected.lockedSample[0].path, 'GUI/data');
+    assert.match(collected.lockedSample[0].reason, /locked or in use/,
+        'the locked-directory reason was not human-readable');
+    // The raw DOMException text must never reach the user.
+    assert.ok(!/underlying filesystem/.test(collected.lockedSample[0].reason),
+        'the raw engine error string leaked into the reported reason');
+
+    // A root handle that cannot list at all is the ONLY hard error — and even
+    // that gets a human message, not the raw string.
     reset();
     collected = await core.collectFilesFromDirectoryHandle({
         kind: 'directory',
         name: 'broken',
-        values: () => { throw new Error('permission revoked mid-walk'); }
+        values: () => { throw nomodError(); }
     });
-    assert.match(collected.error, /permission revoked/);
+    assert.equal(collected.files.length, 0);
+    assert.equal(collected.lockedDirs, 1);
+    assert.match(collected.error, /Nothing could be imported/);
+    assert.match(collected.error, /locked or in use/);
+    assert.ok(!/underlying filesystem/.test(collected.error),
+        'the raw engine error string leaked into the hard-error message');
+
+    // describeFsError maps engine exception names to actionable sentences.
+    assert.equal(core.describeFsError({ name: 'NoModificationAllowedError' }),
+        'a folder is locked or in use by another program');
+    assert.equal(core.describeFsError({ name: 'NotAllowedError' }),
+        'permission to read the folder was not granted');
+    assert.equal(core.describeFsError({ name: 'WhateverWeirdError' }),
+        'the folder could not be read');
 
     console.log('folders.test.cjs: 7 groups passed');
     console.log('  migration     : v1 -> v2 keeps documents, runs, timestamps, links');
@@ -622,7 +672,7 @@ assert.notEqual(core.store.openPath, 'docs/prd/open-me.md',
     console.log('  folders       : create, rename, delete, duplicate-suffix, default protected');
     console.log('  scoping       : per-folder listings, unscoped still returns everything');
     console.log('  importer      : count / per-file / total budgets, skips explained, one bad file tolerated');
-    console.log('  handle scan   : prunes ignored dirs, tolerates locked files, feeds the shared importer');
+    console.log('  handle scan   : prunes ignored dirs, survives locked folders, never leaks raw errors');
     process.exit(0);
 })().catch(error => {
     console.error(error);

@@ -1019,11 +1019,37 @@
     }
 
     /**
+     * Map a File System Access DOMException to a sentence a person can act on.
+     * Raw engine strings ("An attempt was made to write to a file or directory
+     * which could not be modified due to the state of the underlying
+     * filesystem.") are meaningless to a user and must never reach a toast.
+     */
+    function describeFsError(error) {
+        const name = String((error && error.name) || '');
+        switch (name) {
+            case 'NoModificationAllowedError':
+                return 'a folder is locked or in use by another program';
+            case 'NotAllowedError':
+                return 'permission to read the folder was not granted';
+            case 'NotFoundError':
+                return 'a file or folder no longer exists';
+            case 'NotReadableError':
+                return 'a file or folder could not be read';
+            case 'SecurityError':
+                return 'this page is not allowed to access the filesystem';
+            case 'AbortError':
+                return 'the picker was cancelled';
+            default:
+                return 'the folder could not be read';
+        }
+    }
+
+    /**
      * Walk a FileSystemDirectoryHandle into the File[] shape importFolder()
      * already consumes, so both picker paths share one importer (budgets,
      * skip reasons, chunked persistence).
      *
-     * Two real advantages over <input webkitdirectory>, which are why the
+     * Two real advantages over <input webkitdirectory>, which is why the
      * controller prefers this path when it exists:
      *   1. IMPORT_SKIP_DIRS are PRUNED — the walker never descends into
      *      node_modules/.git/.venv, so a huge repo costs a directory listing
@@ -1032,73 +1058,116 @@
      *   2. Files arrive lazily; nothing is read until importFolder() decides
      *      a file is worth storing.
      *
+     * RESILIENCE (the part that must match or beat the input path): a folder
+     * the running app holds open — live SQLite DBs, mmap'd model weights — makes
+     * Chromium's directory iterator reject with NoModificationAllowedError. The
+     * <input webkitdirectory> path tolerates that per-file (readAsText fails,
+     * the file is skipped, the import continues). An earlier handle-path walker
+     * let ONE unreadable directory reject the whole recursive walk, and the
+     * controller then discarded every file already collected — strictly worse
+     * than the path it replaced. Each directory listing is now wrapped: a
+     * failure counts that directory, keeps the files already gathered, and the
+     * walk moves on to its siblings.
+     *
      * Extensions are deliberately NOT filtered here: importFolder() owns that
      * decision and reports it as a skip reason, and both picker paths must
      * produce the same report.
      *
-     * Returns { files, prunedDirs, unreadable, error } — `files` entries carry
-     * a `relativePath` property ("root/sub/file.js"), which relativePathOf()
-     * already understands, keeping suggestedFolderName() and
+     * Returns { files, prunedDirs, unreadable, lockedDirs, lockedSample,
+     * error }. `error` is set ONLY when nothing at all could be collected; a
+     * partial scan returns its files with `error` empty and the locked/unreadable
+     * counts populated so the caller can report them and still import. `files`
+     * entries carry a `relativePath` property ("root/sub/file.js"), which
+     * relativePathOf() already understands, keeping suggestedFolderName() and
      * stripLeadingDirectory() working unchanged.
      */
     async function collectFilesFromDirectoryHandle(rootHandle, options) {
         const cfg = Object.assign({ onProgress: null }, options || {});
-        const out = { files: [], prunedDirs: 0, unreadable: 0, error: '' };
+        const out = {
+            files: [],
+            prunedDirs: 0,
+            unreadable: 0,
+            lockedDirs: 0,
+            lockedSample: [],
+            error: ''
+        };
+        // Symlink/junction loops would recurse forever; cap depth well past any
+        // real project tree.
+        const MAX_DEPTH = 64;
+        const MAX_LOCKED_SAMPLE = 10;
 
         if (!rootHandle || typeof rootHandle.values !== 'function') {
             out.error = 'The picked directory could not be read.';
             return out;
         }
 
-        async function walk(dirHandle, prefix) {
+        async function walk(dirHandle, prefix, depth) {
+            if (depth > MAX_DEPTH) return;
             let sinceYield = 0;
-            for await (const entry of dirHandle.values()) {
-                // Same repaint trick the importer uses: a directory listing
-                // can be long, and the scan must not freeze the page.
-                sinceYield += 1;
-                if (sinceYield >= 40) {
-                    sinceYield = 0;
-                    if (typeof cfg.onProgress === 'function') {
-                        cfg.onProgress(out.files.length);
+            try {
+                for await (const entry of dirHandle.values()) {
+                    // Same repaint trick the importer uses: a directory listing
+                    // can be long, and the scan must not freeze the page.
+                    sinceYield += 1;
+                    if (sinceYield >= 40) {
+                        sinceYield = 0;
+                        if (typeof cfg.onProgress === 'function') {
+                            cfg.onProgress(out.files.length);
+                        }
+                        await new Promise(resolve => setTimeout(resolve, 0));
                     }
-                    await new Promise(resolve => setTimeout(resolve, 0));
+
+                    const name = String((entry && entry.name) || '');
+                    if (!name) continue;
+                    const relativePath = prefix + name;
+
+                    if (entry.kind === 'directory') {
+                        if (IMPORT_SKIP_DIRS.indexOf(name) >= 0) {
+                            out.prunedDirs += 1;
+                            continue;
+                        }
+                        await walk(entry, relativePath + '/', depth + 1);
+                    } else if (entry.kind === 'file') {
+                        // getFile() rejects when the OS file vanished or is
+                        // exclusively locked; one such file must not abort the
+                        // scan — importFolder() reports per-file failures the
+                        // same way for the input path.
+                        try {
+                            const file = await entry.getFile();
+                            file.relativePath = relativePath;
+                            out.files.push(file);
+                        } catch (_) {
+                            out.unreadable += 1;
+                        }
+                    }
                 }
-
-                const name = String((entry && entry.name) || '');
-                if (!name) continue;
-                const relativePath = prefix + name;
-
-                if (entry.kind === 'directory') {
-                    if (IMPORT_SKIP_DIRS.indexOf(name) >= 0) {
-                        out.prunedDirs += 1;
-                        continue;
-                    }
-                    await walk(entry, relativePath + '/');
-                } else if (entry.kind === 'file') {
-                    // getFile() rejects when the OS file vanished or is
-                    // exclusively locked; one such file must not abort the
-                    // scan — importFolder() reports per-file failures the
-                    // same way for the input path.
-                    try {
-                        const file = await entry.getFile();
-                        file.relativePath = relativePath;
-                        out.files.push(file);
-                    } catch (_) {
-                        out.unreadable += 1;
-                    }
+            } catch (error) {
+                // Listing THIS directory failed (locked DB dir, revoked
+                // permission, transient filesystem state). Count it, keep a
+                // short human sample, and return so the parent's loop moves on
+                // to the next sibling — never re-throw, or one bad directory
+                // discards the whole scan.
+                out.lockedDirs += 1;
+                const label = prefix.replace(/\/$/, '');
+                if (out.lockedSample.length < MAX_LOCKED_SAMPLE) {
+                    out.lockedSample.push({ path: label, reason: describeFsError(error) });
                 }
             }
         }
 
-        try {
-            await walk(rootHandle, String(rootHandle.name || 'Imported folder') + '/');
-        } catch (error) {
-            out.error = String((error && error.message) || error);
-            return out;
-        }
+        await walk(rootHandle, String(rootHandle.name || 'Imported folder') + '/', 0);
 
-        if (!out.files.length && !out.error) {
-            out.error = 'That folder has no files in it.';
+        // Only a totally empty scan is a hard error — and it gets a human
+        // message. If ANY file was collected, return the partial result with
+        // `error` empty so the caller imports what it has and reports the rest.
+        if (!out.files.length) {
+            if (out.lockedDirs && !out.unreadable) {
+                const first = out.lockedSample[0];
+                out.error = `Nothing could be imported: ${first ? first.reason : 'the folder could not be read'}.`
+                    + (out.lockedDirs > 1 ? ` (${out.lockedDirs} folders were inaccessible.)` : '');
+            } else {
+                out.error = 'That folder has no files in it.';
+            }
         }
         return out;
     }
@@ -2068,6 +2137,7 @@
         importFolder,
         canPickDirectoryHandle,
         collectFilesFromDirectoryHandle,
+        describeFsError,
         IMPORTABLE_EXTENSIONS,
         IMPORT_SKIP_DIRS,
         relativePathOf,
