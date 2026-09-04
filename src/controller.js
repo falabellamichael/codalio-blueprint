@@ -39,17 +39,34 @@
     // Runtime state (never persisted except through core's own keys)
     // ------------------------------------------------------------------
 
+    const wsModule = () => window.__codalioBlueprintWorkspace;
+    const schemaModule = () => window.__codalioBlueprintSettings;
+
     const runtime = {
         context: null,
         mounted: false,
         active: false,
         folder: 'cb-agent',
+        // The tab layout. Created on mount, persisted by workspace.js's key.
+        workspace: null,
+        settingsFocusKey: '',
+        settingsQueryDraft: '',
+        dividerDragging: false,
+        dividerElement: null,
+        dividerWidth: 0,
+        dividerBound: false,
         busy: false,
+        // True only while a directory import is reading files. Separate from
+        // `busy` (a model run) so the two cannot mask each other.
+        busyImport: false,
         draft: '',
         hint: '',
         showSettings: false,
         viewerMode: 'preview',
         expanded: new Set(['docs', 'docs/prd']),
+        // Project folder roots are OPEN unless collapsed here, so the Project Files
+        // pane shows files on arrival rather than a list of folder names.
+        collapsedRoots: new Set(),
         selectedSkillId: 'prd-builder',
         messages: [],
         runs: [],
@@ -61,6 +78,7 @@
         toast: null,
         toastTimer: null,
         pendingQuestion: null,
+        isHistoryOpen: false,
         currentRun: null,
         currentController: null,
         generation: 0,
@@ -76,8 +94,93 @@
         addSourceFile: () => openAddSourceModal(),
         newFile: () => openNewFileModal(),
         exportProject: () => exportProject(),
-        clearHistory: () => confirmClearHistory()
+        clearHistory: () => confirmClearHistory(),
+        newFolder: () => openNewFolderModal(),
+        openFolder: () => pickFolderFromDisk(),
+        selectFolder: folderId => selectFolder(folderId),
+        renameFolder: folderId => openRenameFolderModal(folderId),
+        deleteFolder: folderId => confirmDeleteFolder(folderId)
     };
+
+    // ------------------------------------------------------------------
+    // Workspace (tabs)
+    // ------------------------------------------------------------------
+
+    /**
+     * Load or create the tab layout. Restores the persisted layout only when
+     * Settings -> Workspace -> Tabs -> "Restore tabs on load" is on; otherwise
+     * every visit starts on the Agent tab alone.
+     */
+    function ensureWorkspace() {
+        const ws = wsModule();
+        if (!ws) return;
+        if (runtime.workspace) {
+            ws.syncAgentPin(runtime.workspace, core.readSettings());
+            return;
+        }
+        const settings = core.readSettings();
+        const raw = settings.restoreTabsOnLoad === false ? null : core.readWorkspaceRaw();
+        runtime.workspace = ws.normalizeWorkspace(raw, settings);
+    }
+
+    function persistWorkspace() {
+        if (!runtime.workspace) return;
+        core.saveWorkspace(runtime.workspace);
+    }
+
+    /** Keep runtime.folder (which drives nav/list/ribbon) aligned to the tab. */
+    function syncFolderFromTab() {
+        const ws = wsModule();
+        if (!ws || !runtime.workspace) return;
+        const section = ws.activeSectionId(runtime.workspace);
+        runtime.folder = section;
+        const context = runtime.context;
+        if (context && context.state) context.state.folder = section;
+    }
+
+    function activateTabById(tabId) {
+        const ws = wsModule();
+        if (!ws || !runtime.workspace) return;
+        ws.activateTab(runtime.workspace, tabId);
+        afterWorkspaceChange();
+    }
+
+    function openSectionTab(sectionId) {
+        const ws = wsModule();
+        if (!ws || !runtime.workspace) {
+            goToSection(sectionId);
+            return;
+        }
+        ws.openSection(runtime.workspace, sectionId, core.readSettings());
+        afterWorkspaceChange();
+    }
+
+    function openFileTab(path) {
+        const ws = wsModule();
+        if (!ws || !runtime.workspace) {
+            core.setOpenPath(path);
+            goToSection('cb-files');
+            return;
+        }
+        ws.openFile(runtime.workspace, path, core.readSettings());
+        core.setOpenPath(path);
+        afterWorkspaceChange();
+    }
+
+    function closeTabById(tabId) {
+        const ws = wsModule();
+        if (!ws || !runtime.workspace) return;
+        ws.closeTab(runtime.workspace, tabId, core.readSettings());
+        afterWorkspaceChange();
+    }
+
+    /** One place every tab mutation lands: sync, persist, re-render. */
+    function afterWorkspaceChange() {
+        syncFolderFromTab();
+        persistWorkspace();
+        renderHostSurfaces();
+        renderPage();
+    }
 
     // ------------------------------------------------------------------
     // Host plugin record (gates page visibility)
@@ -169,22 +272,48 @@
     // ------------------------------------------------------------------
 
     function stateSnapshot() {
+        const settings = core.readSettings();
+        const folders = core.listFolders();
+        const activeFolder = core.activeFolder();
         return {
             folder: runtime.folder,
             busy: runtime.busy,
             draft: runtime.draft,
             hint: runtime.hint,
-            viewerMode: runtime.viewerMode,
+            settings,
+            workspace: runtime.workspace,
+            settingsSection: runtime.workspace ? runtime.workspace.settingsSection : 'agent',
+            settingsPage: runtime.workspace ? runtime.workspace.settingsPage : 'planning',
+            settingsQuery: runtime.workspace ? runtime.workspace.settingsQuery : '',
+            settingsFocusKey: runtime.settingsFocusKey,
+            pinAgentTab: settings.pinAgentTab !== false,
+            treeIndentPx: settings.treeIndentPx,
+            showFileMeta: settings.showFileMeta !== false,
+            viewerMode: runtime.workspace && core.store.openPath
+                ? wsViewerMode(core.store.openPath, settings)
+                : runtime.viewerMode,
             expanded: runtime.expanded,
+            collapsedRoots: runtime.collapsedRoots,
             selectedSkillId: runtime.selectedSkillId,
             messages: runtime.messages,
             runs: runtime.runs,
             runCount: runtime.runs.length,
             activeRunId: runtime.activeRunId,
-            projectName: runtime.projectName,
+            // Project folders. `projectName` stays for the tree header and now
+            // reports the folder the user is actually looking at.
+            folders,
+            folderCount: folders.length,
+            activeFolderId: activeFolder ? activeFolder.id : core.DEFAULT_FOLDER_ID,
+            activeFolderName: activeFolder ? activeFolder.name : 'Blueprint project',
+            folderFileCounts: folders.reduce((acc, item) => {
+                acc[item.id] = core.folderFileCount(item.id);
+                return acc;
+            }, {}),
+            projectName: activeFolder ? activeFolder.name : runtime.projectName,
             sourceFiles: runtime.sourceFiles,
             openPath: core.store.openPath,
             pendingQuestion: runtime.pendingQuestion,
+            isHistoryOpen: Boolean(runtime.isHistoryOpen),
             run: runtime.currentRun,
             modal: runtime.modal,
             toast: runtime.toast,
@@ -196,6 +325,18 @@
         return (runtime.context && runtime.context.elements) || null;
     }
 
+    /** Escape a value for safe use inside a querySelector attribute string. */
+    function cssEscape(value) {
+        return String(value || '').replace(/["\\]/g, '\\$&');
+    }
+
+    /** Per-document viewer mode: the workspace remembers it per path. */
+    function wsViewerMode(path, settings) {
+        const ws = wsModule();
+        if (ws && runtime.workspace) return ws.viewerModeFor(runtime.workspace, path, settings);
+        return settings.defaultViewerMode === 'source' ? 'source' : 'preview';
+    }
+
     function renderPage() {
         const elements = hostElements();
         if (!elements || !elements.settingsContainer) return;
@@ -205,18 +346,371 @@
         const previousScroll = captureScroll();
         container.innerHTML = '';
 
-        let page;
-        if (runtime.folder === 'cb-files') page = ui.renderFilesPage(stateSnapshot());
-        else if (runtime.folder === 'cb-history') page = ui.renderHistoryPage(stateSnapshot());
-        else if (runtime.folder === 'cb-settings') page = ui.renderSettingsPage(stateSnapshot());
-        else page = ui.renderAgentPage(stateSnapshot());
+        ensureWorkspace();
+        const snapshot = stateSnapshot();
 
-        container.appendChild(page);
-        if (runtime.modal) container.appendChild(ui.renderModal(stateSnapshot()));
-        if (runtime.toast) container.appendChild(ui.renderToast(stateSnapshot()));
+        // The reading pane is the tabbed workspace: strip + active panel.
+        container.appendChild(ui.renderWorkspace(snapshot));
+
+        if (runtime.modal) container.appendChild(ui.renderModal(snapshot));
+        if (runtime.toast) container.appendChild(ui.renderToast(snapshot));
 
         restoreScroll(previousScroll);
-        if (!runtime.busy && runtime.folder === 'cb-agent' && !runtime.modal) focusComposer(true);
+        bindDividerDrag(container);
+        if (!runtime.busy && isAgentTabActive() && !runtime.modal) focusComposer(true);
+    }
+
+    /**
+     * Expand every folder leading to a path, so a newly written document is
+     * visible in the tree. Honours Settings -> Workspace -> Layout ->
+     * "Expand folders a run writes to".
+     */
+    function expandFoldersFor(path) {
+        const settings = core.readSettings();
+        if (settings.autoExpandWrittenFolders === false) return;
+        const parts = String(path || '').split('/');
+        parts.pop();
+        let walked = [];
+        parts.forEach(part => {
+            walked = walked.concat([part]);
+            runtime.expanded.add(walked.join('/'));
+        });
+    }
+
+    /** A document was written: open or refresh its tab per settings. */
+    function noteFileWritten(path) {
+        if (!path) return;
+        const ws = wsModule();
+        expandFoldersFor(path);
+        if (ws && runtime.workspace) {
+            ws.onFileWritten(runtime.workspace, path, core.readSettings());
+            persistWorkspace();
+        }
+    }
+
+    /** A document was deleted: drop its tab per settings. */
+    function noteFileDeleted(path) {
+        if (!path) return;
+        const ws = wsModule();
+        if (ws && runtime.workspace) {
+            ws.onFileDeleted(runtime.workspace, path, core.readSettings());
+            persistWorkspace();
+        }
+        if (core.store.openPath === path) core.setOpenPath('');
+    }
+
+    /** A document was renamed: move its tab and per-path viewer mode. */
+    function noteFileRenamed(oldPath, newPath) {
+        if (!oldPath || !newPath || oldPath === newPath) return;
+        const ws = wsModule();
+        if (ws && runtime.workspace) {
+            ws.onFileRenamed(runtime.workspace, oldPath, newPath, core.readSettings());
+            persistWorkspace();
+        }
+    }
+
+    /**
+     * Remove the divider and undo the inline width we set on the host list pane.
+     * Must run whenever the page is left, or the drag handle leaks into other
+     * apps (Journal, Settings, ...) and the pane keeps Blueprint's width.
+     */
+    function releaseDivider() {
+        const elements = hostElements();
+        const listPane = elements && elements.listPane
+            ? elements.listPane
+            : document.getElementById('list-pane');
+        if (runtime.dividerElement) {
+            try { runtime.dividerElement.remove(); } catch (_) { /* already gone */ }
+            runtime.dividerElement = null;
+        }
+        runtime.dividerBound = false;
+        runtime.dividerWidth = 0;
+        if (listPane) {
+            listPane.style.width = '';
+            listPane.style.flex = '';
+            delete listPane.dataset.cbWidthApplied;
+        }
+    }
+
+    /**
+     * Drag-to-resize the host list pane. The width is persisted to
+     * Settings -> Workspace -> Layout -> Sidebar width so the two stay in sync:
+     * dragging updates the setting, editing the setting moves the divider.
+     */
+    function bindDividerDrag(container) {
+        if (!container) return;
+        // Already bound and still attached to the DOM: nothing to do. The divider
+        // sits beside the host listPane (outside settingsContainer), so a page
+        // re-render does not wipe it — but leaving the page does remove it.
+        if (runtime.dividerElement && runtime.dividerElement.isConnected) return;
+        runtime.dividerBound = false;
+        const settings = core.readSettings();
+        // Use the host's own element map rather than a global lookup: the host
+        // writes inline flex/width on this pane when it collapses the list pane,
+        // so both sides must be touching the same node.
+        const elements = hostElements();
+        const listPane = elements && elements.listPane
+            ? elements.listPane
+            : document.getElementById('list-pane');
+        if (!listPane || !listPane.parentNode) return;
+
+        // Apply the stored width once, then let dragging own it.
+        if (!listPane.dataset.cbWidthApplied) {
+            listPane.style.width = `${settings.listPaneWidth}px`;
+            listPane.style.flex = `0 0 ${settings.listPaneWidth}px`;
+            listPane.dataset.cbWidthApplied = 'true';
+        }
+
+        const divider = document.createElement('div');
+        divider.className = 'cb-divider';
+        divider.dataset.cbRole = 'divider';
+        divider.setAttribute('role', 'separator');
+        divider.setAttribute('aria-orientation', 'vertical');
+        divider.setAttribute('aria-label', 'Resize the Blueprint sidebar');
+        divider.tabIndex = 0;
+        listPane.parentNode.insertBefore(divider, listPane.nextSibling);
+        runtime.dividerElement = divider;
+        runtime.dividerBound = true;
+
+        let dragging = false;
+
+        const onMove = moveEvent => {
+            if (!dragging) return;
+            const rect = listPane.getBoundingClientRect();
+            const width = Math.round(Math.min(520, Math.max(220, moveEvent.clientX - rect.left)));
+            listPane.style.width = `${width}px`;
+            listPane.style.flex = `0 0 ${width}px`;
+            runtime.dividerWidth = width;
+        };
+
+        const onUp = () => {
+            if (!dragging) return;
+            dragging = false;
+            runtime.dividerDragging = false;
+            divider.classList.remove('dragging');
+            document.body.style.cursor = '';
+            document.body.style.userSelect = '';
+            if (runtime.dividerWidth) {
+                const settings = core.readSettings();
+                settings.listPaneWidth = runtime.dividerWidth;
+                core.writeSettings(settings);
+                const ws = wsModule();
+                if (ws && runtime.workspace) {
+                    ws.setDivider(runtime.workspace, runtime.dividerWidth);
+                    persistWorkspace();
+                }
+            }
+            window.removeEventListener('pointermove', onMove);
+            window.removeEventListener('pointerup', onUp);
+        };
+
+        const onDown = downEvent => {
+            if (downEvent.button !== 0) return;
+            dragging = true;
+            runtime.dividerDragging = true;
+            divider.classList.add('dragging');
+            document.body.style.cursor = 'col-resize';
+            document.body.style.userSelect = 'none';
+            window.addEventListener('pointermove', onMove);
+            window.addEventListener('pointerup', onUp);
+            downEvent.preventDefault();
+        };
+
+        // Keyboard resizing for accessibility: arrow keys move 10px, Shift 40px.
+        const onKey = keyEvent => {
+            if (keyEvent.key !== 'ArrowLeft' && keyEvent.key !== 'ArrowRight') return;
+            keyEvent.preventDefault();
+            const step = keyEvent.shiftKey ? 40 : 10;
+            const current = listPane.getBoundingClientRect().width;
+            const next = Math.round(Math.min(520, Math.max(220,
+                current + (keyEvent.key === 'ArrowRight' ? step : -step))));
+            listPane.style.width = `${next}px`;
+            listPane.style.flex = `0 0 ${next}px`;
+            const settings = core.readSettings();
+            settings.listPaneWidth = next;
+            core.writeSettings(settings);
+        };
+
+        divider.addEventListener('pointerdown', onDown);
+        divider.addEventListener('keydown', onKey);
+        divider.addEventListener('dblclick', () => {
+            const settings = core.readSettings();
+            settings.listPaneWidth = 300;
+            core.writeSettings(settings);
+            listPane.style.width = '300px';
+            listPane.style.flex = '0 0 300px';
+        });
+        void container;
+    }
+
+    function isAgentTabActive() {
+        const ws = wsModule();
+        return !ws || !runtime.workspace || ws.isAgentActive(runtime.workspace);
+    }
+
+    /**
+     * Shared confirm dialog. Follows the exact shape the existing confirm flows
+     * use (kind 'confirm', onConfirm clears the modal and returns true to close),
+     * so it behaves identically under the confirm-modal dispatcher.
+     */
+    function openConfirmModal(options) {
+        const opts = options || {};
+        runtime.modal = {
+            kind: 'confirm',
+            title: opts.title || 'Are you sure?',
+            icon: opts.icon || 'fa-circle-question',
+            message: opts.message || '',
+            danger: opts.danger === true,
+            confirmLabel: opts.confirmLabel || 'OK',
+            confirmIcon: opts.confirmIcon || (opts.danger ? 'fa-triangle-exclamation' : 'fa-check'),
+            onConfirm: () => {
+                runtime.modal = null;
+                try {
+                    if (typeof opts.onConfirm === 'function') opts.onConfirm();
+                } catch (error) {
+                    console.warn('[codalio-blueprint] confirm action failed', error);
+                    setToast('That action failed. See the console for details.', 'error');
+                }
+                return true;
+            }
+        };
+        renderPage();
+    }
+
+    // ------------------------------------------------------------------
+    // Settings -> Data -> Maintenance actions
+    // ------------------------------------------------------------------
+
+    /**
+     * Every action here is destructive or writes a file, so each one either
+     * reuses an existing confirm dialog or reports what it did. Keys match the
+     * `actions` declared on the Maintenance group in settings.js.
+     */
+    function handleSettingsAction(key) {
+        switch (key) {
+            case 'export-project':
+                exportProject();
+                return;
+
+            case 'export-settings': {
+                const schema = schemaModule();
+                if (!schema) return;
+                const json = schema.exportSettings(core.readSettings());
+                downloadText('codalio-blueprint-settings.json', json, 'application/json;charset=utf-8');
+                setToast('Settings exported.', 'success');
+                return;
+            }
+
+            case 'import-settings':
+                openImportSettingsModal();
+                return;
+
+            case 'reset-settings': {
+                const schema = schemaModule();
+                const defaults = schema ? schema.SCHEMA_DEFAULTS : core.DEFAULT_SETTINGS;
+                openConfirmModal({
+                    title: 'Reset all Blueprint settings?',
+                    icon: 'fa-rotate-left',
+                    message: 'Every setting returns to its documented default. Your documents and run history are untouched.',
+                    confirmLabel: 'Reset settings',
+                    danger: true,
+                    onConfirm: () => {
+                        core.writeSettings(Object.assign({}, defaults));
+                        ensureWorkspace();
+                        renderHostSurfaces();
+                        renderPage();
+                        setToast('Settings reset to defaults.', 'success');
+                    }
+                });
+                return;
+            }
+
+            case 'clear-runs':
+                confirmClearHistory();
+                return;
+
+            case 'clear-files':
+                confirmClearFiles();
+                return;
+
+            case 'clear-all': {
+                openConfirmModal({
+                    title: 'Erase all Blueprint data?',
+                    icon: 'fa-trash-can',
+                    message: 'Documents, run history, settings and the tab layout are all removed. The plug-in then behaves as if freshly installed. Your SimpleRAG workspace is never touched.',
+                    confirmLabel: 'Erase everything',
+                    danger: true,
+                    onConfirm: () => {
+                        core.store.files = {};
+                        core.store.runs = [];
+                        core.store.openPath = '';
+                        core.store.activeRunId = '';
+                        core.writeStore();
+                        core.clearWorkspace();
+                        core.writeSettings(Object.assign({}, core.DEFAULT_SETTINGS));
+                        runtime.workspace = wsModule() ? wsModule().createWorkspace(core.readSettings()) : null;
+                        runtime.messages = [];
+                        runtime.currentRun = null;
+                        runtime.activeRunId = '';
+                        runtime.expanded = new Set(['docs', 'docs/prd']);
+                        loadRuns();
+                        renderHostSurfaces();
+                        renderPage();
+                        setToast('All Blueprint data erased.', 'success');
+                    }
+                });
+                return;
+            }
+
+            default:
+                setToast(`Unknown settings action: ${key}`, 'warn');
+        }
+    }
+
+    /** Import settings from a JSON file chosen on disk. */
+    function openImportSettingsModal() {
+        runtime.modal = {
+            // Reuses the 'file' modal kind so the existing upload picker, path
+            // field and content textarea all work unchanged.
+            kind: 'file',
+            title: 'Import Blueprint settings',
+            icon: 'fa-file-arrow-up',
+            description: 'Choose a settings JSON you exported earlier. Recognised values are clamped to their documented bounds; unknown keys are ignored.',
+            pathLabel: 'File (optional)',
+            path: '',
+            contentLabel: 'Settings JSON',
+            allowUpload: true,
+            accept: '.json,application/json',
+            note: 'Paste the JSON below, or use Choose a file from disk to load an export.',
+            confirmLabel: 'Import',
+            confirmIcon: 'fa-file-arrow-up',
+            onConfirm: payload => {
+                const schema = schemaModule();
+                if (!schema) return false;
+                const text = String((payload && payload.content) || '').trim();
+                if (!text) {
+                    setToast('No settings JSON to import.', 'warn');
+                    return false;
+                }
+                try {
+                    const result = schema.parseSettingsFile(text);
+                    core.writeSettings(result.settings);
+                    ensureWorkspace();
+                    renderHostSurfaces();
+                    renderPage();
+                    setToast(
+                        `Imported ${result.applied} setting${result.applied === 1 ? '' : 's'}`
+                        + (result.ignored ? `, ignored ${result.ignored} unknown.` : '.'),
+                        'success'
+                    );
+                    return true;
+                } catch (error) {
+                    setToast(String(error.message || 'That file is not valid Blueprint settings.'), 'error');
+                    return false;
+                }
+            }
+        };
+        renderPage();
     }
 
     function captureScroll() {
@@ -238,12 +732,22 @@
         transcript.scrollTop = wasAtEnd ? transcript.scrollHeight : previous.top;
     }
 
-    function scrollTranscriptToEnd() {
+    function isTranscriptNearBottom(transcript) {
+        if (!transcript) return true;
+        const threshold = 140;
+        return (transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight) <= threshold;
+    }
+
+    function scrollTranscriptToEnd(force = false) {
         const elements = hostElements();
         const transcript = elements && elements.settingsContainer
             ? elements.settingsContainer.querySelector('[data-cb-role="transcript"]')
             : null;
-        if (transcript) transcript.scrollTop = transcript.scrollHeight;
+        if (!transcript) return;
+        // Do not hijack the scroll position if user has scrolled away from the bottom to read
+        if (force || isTranscriptNearBottom(transcript)) {
+            transcript.scrollTop = transcript.scrollHeight;
+        }
     }
 
     function render() {
@@ -263,10 +767,20 @@
         }
     }
 
+    /**
+     * Open a sidebar section AS A TAB beside the pinned Agent tab, rather than
+     * replacing the reading pane. That is the whole point of the workspace: the
+     * conversation in progress stays open while you read files, runs or settings.
+     */
     function goToSection(id) {
-        runtime.folder = id;
+        const section = String(id || 'cb-agent');
+        if (wsModule() && runtime.workspace) {
+            openSectionTab(section);
+            return;
+        }
+        runtime.folder = section;
         const context = runtime.context;
-        if (context && context.state) context.state.folder = id;
+        if (context && context.state) context.state.folder = section;
         renderHostSurfaces();
         renderPage();
     }
@@ -281,14 +795,21 @@
         try { composer.focus({ preventScroll: true }); } catch (_) { composer.focus(); }
     }
 
-    function setToast(text, tone) {
+    /**
+     * Show a transient message. `durationMs` is optional; the default suits a
+     * one-line confirmation, while an import summary (counts plus a reason for
+     * skipped files) needs longer to read.
+     */
+    function setToast(text, tone, durationMs) {
         clearTimeout(runtime.toastTimer);
         runtime.toast = text ? { text, tone: tone || 'info' } : null;
         if (text) {
+            const parsed = Number(durationMs);
+            const ttl = Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, 30000) : 4200;
             runtime.toastTimer = setTimeout(() => {
                 runtime.toast = null;
                 if (runtime.mounted) renderPage();
-            }, 4200);
+            }, ttl);
         }
         if (runtime.mounted) renderPage();
     }
@@ -314,9 +835,33 @@
         return title ? title[1].replace(/\s*(?:—|-{1,2})\s*Product Requirements.*$/i, '').trim().slice(0, 60) : '';
     }
 
+    function saveCurrentRunMessages() {
+        if (!runtime.currentRun || !Array.isArray(runtime.messages) || !runtime.messages.length) return;
+        try {
+            runtime.currentRun.messages = runtime.messages.map(item => {
+                const copy = Object.assign({}, item);
+                if (Array.isArray(copy.steps)) {
+                    copy.steps = copy.steps.map(step => {
+                        const stepCopy = Object.assign({}, step);
+                        delete stepCopy.liveThinkingElement;
+                        return stepCopy;
+                    });
+                }
+                return copy;
+            });
+            core.saveRun(runtime.currentRun);
+        } catch (_) {
+            // Safe fallback
+        }
+    }
+
     function rebuildMessagesFromRun(run) {
         runtime.messages = [];
         if (!run) return;
+        if (Array.isArray(run.messages) && run.messages.length) {
+            runtime.messages = run.messages.map(item => Object.assign({}, item));
+            return;
+        }
         if (run.idea) {
             runtime.messages.push({
                 id: core.uid('msg'),
@@ -339,28 +884,43 @@
         });
     }
 
-    function startNewRun() {
+    function clearChat() {
         if (runtime.busy) {
-            setToast('Stop the current run before starting a new one.', 'warn');
+            setToast('Stop the current run before clearing the chat.', 'warn');
             return;
+        }
+        if (runtime.currentRun && runtime.messages.length) {
+            saveCurrentRunMessages();
         }
         runtime.currentRun = null;
         runtime.activeRunId = '';
         runtime.messages = [];
         runtime.pendingQuestion = null;
+        runtime.isHistoryOpen = false;
         runtime.folder = 'cb-agent';
         const context = runtime.context;
         if (context && context.state) context.state.folder = 'cb-agent';
         runtime.draft = '';
+        core.store.activeRunId = '';
+        core.writeStore();
+        setToast('Chat cleared. Ready for a new prompt.', 'info');
         renderHostSurfaces();
         renderPage();
         focusComposer();
     }
 
+    function startNewRun() {
+        clearChat();
+    }
+
     async function stopRun() {
         if (!runtime.busy) return;
-        const generation = runtime.generation;
+        // Bump first, then capture. The bump is what tells the cancelled run to
+        // stop rendering; capturing afterwards means the guard below only trips if
+        // something ELSE invalidated us (an activate or unmount landing while the
+        // cancel request was in flight), never on our own bump.
         runtime.generation += 1;
+        const generation = runtime.generation;
         const cancelId = runtime.currentController && runtime.currentController.cancelId;
         if (runtime.currentController && runtime.currentController.abort) {
             try { runtime.currentController.abort.abort(); } catch (_) { /* already settled */ }
@@ -419,6 +979,88 @@
         }
     }
 
+    function startLiveTicker() {
+        if (runtime.liveTickerTimer) clearInterval(runtime.liveTickerTimer);
+        runtime.liveTickerTimer = setInterval(() => {
+            if (!runtime.busy || !runtime.currentRun) return;
+            const activePhases = (runtime.currentRun.phases || []).filter(p => p.status === 'running');
+            if (!activePhases.length) return;
+            const now = Date.now();
+            activePhases.forEach(phase => {
+                if (phase.startedAt) phase.elapsedMs = now - phase.startedAt;
+            });
+            const elements = hostElements();
+            const container = elements && elements.settingsContainer;
+            if (container) {
+                activePhases.forEach(matchingPhase => {
+                    const stepEl = container.querySelector(`[data-step-id="${matchingPhase.id}"]`);
+                    if (stepEl) {
+                        const timeEl = stepEl.querySelector('.cb-step-time');
+                        if (timeEl) {
+                            timeEl.textContent = `${(matchingPhase.elapsedMs / 1000).toFixed(1)}s`;
+                        }
+                        const tpsEl = stepEl.querySelector('.cb-step-tps');
+                        if (tpsEl && matchingPhase.tokensPerSec) {
+                            tpsEl.textContent = `${matchingPhase.tokensPerSec} tok/s`;
+                        }
+                        const substatusEl = stepEl.querySelector('.cb-step-substatus');
+                        if (substatusEl && matchingPhase.substatus) {
+                            const span = substatusEl.querySelector('span');
+                            if (span) span.textContent = matchingPhase.substatus;
+                        }
+                        const thinkingFlag = stepEl.querySelector('.cb-step-thinking .cb-step-flag');
+                        if (thinkingFlag && matchingPhase.thinking) {
+                            thinkingFlag.textContent = `${Math.round(matchingPhase.thinking.length / 3.8)} tokens`;
+                        }
+                    }
+                });
+            }
+        }, 100);
+    }
+
+    function stopLiveTicker() {
+        if (runtime.liveTickerTimer) {
+            clearInterval(runtime.liveTickerTimer);
+            runtime.liveTickerTimer = null;
+        }
+    }
+
+    async function runGapRepair(run, path, review) {
+        if (runtime.busy) return;
+        runtime.busy = true;
+        runtime.hint = `Repairing gaps in ${path.split('/').pop()}…`;
+        startLiveTicker();
+        renderHostSurfaces();
+        renderPage();
+
+        const abortController = new AbortController();
+        runtime.currentController = { abort: abortController, signal: abortController.signal, cancelId: '' };
+
+        try {
+            await agent.reviseDocumentGaps(run, path, review, {
+                onRender: () => { bindAssistantSteps(); renderPage(); },
+                onStep: () => { bindAssistantSteps(); scrollTranscriptToEnd(); },
+                onStream: () => { scrollTranscriptToEnd(); },
+                onFileWritten: writtenPath => { noteFileWritten(writtenPath); }
+            }, { signal: abortController.signal });
+
+            setToast(`Gaps repaired in ${path.split('/').pop()}!`, 'success');
+        } catch (error) {
+            if (error && error.code !== 'aborted') {
+                setToast(`Gap repair failed: ${error.message}`, 'error');
+            }
+        } finally {
+            runtime.busy = false;
+            runtime.hint = '';
+            runtime.currentController = null;
+            stopLiveTicker();
+            loadRuns();
+            bindAssistantSteps();
+            renderHostSurfaces();
+            renderPage();
+        }
+    }
+
     async function runSelectedSkill(idea) {
         const skill = selectedSkill();
         const run = core.createRun(skill, idea);
@@ -443,6 +1085,7 @@
         runtime.currentController = controller;
         runtime.busy = true;
         runtime.hint = `Running ${skill.name}…`;
+        startLiveTicker();
 
         const generation = runtime.generation;
         const stale = () => generation !== runtime.generation;
@@ -463,17 +1106,23 @@
                     if (step.status === 'running') scrollTranscriptToEnd();
                 },
                 onStream: () => { if (!stale()) scrollTranscriptToEnd(); },
+                // Open an editor tab for each document the skill writes, per
+                // Settings -> Agent -> Planning -> "Open written documents".
+                onFileWritten: path => { if (!stale()) noteFileWritten(path); },
                 // The agent owns the question sequence; the page only surfaces it.
-                askQuestion: async step => {
+                askQuestion: async (step, question) => {
                     runtime.pendingQuestion = {
                         stepId: step.id,
                         question: step.question,
-                        id: step.label
+                        id: step.label,
+                        options: (question && question.multi) || step.options || []
                     };
                     bindAssistantSteps();
                     renderPage();
+                    focusComposer();
                     const answer = await waitForAnswer(controller.signal);
                     runtime.pendingQuestion = null;
+                    renderPage();
                     return answer;
                 }
             });
@@ -505,12 +1154,14 @@
                 setToast(message, 'error');
             }
         } finally {
+            stopLiveTicker();
             if (!stale()) {
                 assistantMessage.busy = false;
                 runtime.busy = false;
                 runtime.hint = '';
                 runtime.pendingQuestion = null;
                 runtime.currentController = null;
+                saveCurrentRunMessages();
                 loadRuns();
                 bindAssistantSteps();
                 renderHostSurfaces();
@@ -521,14 +1172,14 @@
     }
 
     async function sendMessage() {
-        if (runtime.busy) return;
+        if (runtime.busy && !runtime.pendingQuestion) return;
         const elements = hostElements();
         const composer = elements && elements.settingsContainer
             ? elements.settingsContainer.querySelector('[data-cb-role="composer"]')
             : null;
         const text = String((composer && composer.value) || runtime.draft || '').trim();
         if (!text) {
-            setToast('Describe your idea first.', 'warn');
+            setToast(runtime.pendingQuestion ? 'Please enter an answer first.' : 'Describe your idea first.', 'warn');
             focusComposer();
             return;
         }
@@ -538,20 +1189,73 @@
         if (runtime.pendingQuestion && runtime.answerResolver) {
             const resolver = runtime.answerResolver;
             runtime.pendingQuestion = null;
+            if (composer) composer.value = '';
             renderPage();
             resolver(text);
             return;
+        }
+
+        // ---- Slash command routing ----
+        const trimmed = text.trim();
+        const COMMAND_MAP = {
+            '/prd': 'prd-builder',
+            '/mvp': 'mvp-checklist',
+            '/gtm': 'gtm-plan',
+            '/arch': 'arch-eval',
+            '/docs': 'doc-gen',
+            '/code2prd': 'code-to-prd'
+        };
+        const firstToken = trimmed.split(/\s+/)[0].toLowerCase();
+        if (firstToken === '/clear') {
+            clearChat();
+            return;
+        }
+        if (firstToken === '/help') {
+            const helpText = [
+                '**Anti-gravity Slash Commands:**',
+                '- `/prd <idea>` — Build PRD with 3 concurrent lenses',
+                '- `/mvp <idea>` — Generate MVP scope, candidate matrix & cut list',
+                '- `/gtm <idea>` — Generate go-to-market plan & exit criteria',
+                '- `/arch <idea>` — Evaluate codebase architecture against requirements',
+                '- `/docs <idea>` — Generate backlog, API contract sketch, and onboarding docs',
+                '- `/code2prd` — Reverse-engineer a PRD from attached codebase',
+                '- `/clear` — Clear the transcript'
+            ].join('\n');
+            runtime.messages.push({
+                id: core.uid('msg'),
+                role: 'assistant',
+                at: new Date().toISOString(),
+                text: helpText
+            });
+            renderPage();
+            scrollTranscriptToEnd();
+            return;
+        }
+
+        let ideaText = text;
+        if (COMMAND_MAP[firstToken]) {
+            const targetSkillId = COMMAND_MAP[firstToken];
+            runtime.selectedSkillId = targetSkillId;
+            ideaText = trimmed.slice(firstToken.length).trim();
+            if (!ideaText) {
+                const targetSkill = skills.getSkill(targetSkillId);
+                setToast(`Selected ${targetSkill ? targetSkill.name : targetSkillId}. Now describe your idea.`, 'info');
+                renderHostSurfaces();
+                renderPage();
+                focusComposer();
+                return;
+            }
         }
 
         runtime.messages.push({
             id: core.uid('msg'),
             role: 'user',
             at: new Date().toISOString(),
-            text
+            text: ideaText
         });
         renderPage();
         scrollTranscriptToEnd();
-        await runSelectedSkill(text);
+        await runSelectedSkill(ideaText);
     }
 
     async function reviseDocument(messageId) {
@@ -644,6 +1348,7 @@
                 runId: reviseRun.id,
                 skill: reviseRun.skillId
             });
+            noteFileWritten(target);
             assistantMessage.paths = [target];
             assistantMessage.text = `Revised \`${target}\`. Review the changes in the project tree.`;
             setToast('Document revised.', 'success');
@@ -657,6 +1362,7 @@
                 assistantMessage.busy = false;
                 runtime.busy = false;
                 runtime.currentController = null;
+                saveCurrentRunMessages();
                 core.saveRun(reviseRun);
                 loadRuns();
                 renderHostSurfaces();
@@ -668,6 +1374,234 @@
     // ------------------------------------------------------------------
     // Files
     // ------------------------------------------------------------------
+
+    // ------------------------------------------------------------------
+    // Project folders
+    // ------------------------------------------------------------------
+
+    /**
+     * Scope the tree — and every document written from now on — to one folder.
+     * Switching folders does not move existing documents; it changes which ones
+     * are listed and where new ones land.
+     */
+    function selectFolder(folderId) {
+        const folder = core.setActiveFolder(folderId);
+        if (!folder) {
+            setToast('That folder no longer exists.', 'error');
+            return;
+        }
+        runtime.projectName = folder.name;
+        renderHostSurfaces();
+        renderPage();
+    }
+
+    function openNewFolderModal() {
+        runtime.modal = {
+            kind: 'folder',
+            title: 'New project folder',
+            icon: 'fa-folder-plus',
+            description: 'Folders keep separate plans side by side. Documents Blueprint generates from here on land in the folder you create.',
+            name: `${core.todayStamp()}-project`,
+            nameLabel: 'Folder name',
+            confirmLabel: 'Create folder',
+            confirmIcon: 'fa-folder-plus',
+            onConfirm: values => {
+                const name = String(values.name || '').trim();
+                const result = core.createFolder(name, 'created');
+                if (result.error) {
+                    setToast(result.error, 'error');
+                    return false;
+                }
+                runtime.projectName = result.folder.name;
+                runtime.modal = null;
+                setToast(`Folder "${result.folder.name}" created.`, 'success');
+                renderHostSurfaces();
+                renderPage();
+                return true;
+            }
+        };
+        renderPage();
+    }
+
+    function openRenameFolderModal(folderId) {
+        const folder = core.getFolder(folderId || core.store.activeFolderId);
+        if (!folder) {
+            setToast('That folder no longer exists.', 'error');
+            return;
+        }
+        if (folder.id === core.DEFAULT_FOLDER_ID) {
+            setToast('The default project folder cannot be renamed.', 'info');
+            return;
+        }
+        runtime.modal = {
+            kind: 'folder',
+            title: 'Rename folder',
+            icon: 'fa-pen',
+            description: `Renaming "${folder.name}" does not move or rewrite its ${core.folderFileCount(folder.id)} document(s).`,
+            name: folder.name,
+            nameLabel: 'Folder name',
+            confirmLabel: 'Rename',
+            confirmIcon: 'fa-pen',
+            onConfirm: values => {
+                const result = core.renameFolder(folder.id, String(values.name || ''));
+                if (result.error) {
+                    setToast(result.error, 'error');
+                    return false;
+                }
+                if (core.store.activeFolderId === folder.id) runtime.projectName = result.folder.name;
+                runtime.modal = null;
+                setToast(`Renamed to "${result.folder.name}".`, 'success');
+                renderHostSurfaces();
+                renderPage();
+                return true;
+            }
+        };
+        renderPage();
+    }
+
+    function confirmDeleteFolder(folderId) {
+        const folder = core.getFolder(folderId || core.store.activeFolderId);
+        if (!folder) {
+            setToast('That folder no longer exists.', 'error');
+            return;
+        }
+        if (folder.id === core.DEFAULT_FOLDER_ID) {
+            setToast('The default project folder cannot be deleted.', 'info');
+            return;
+        }
+        const count = core.folderFileCount(folder.id);
+        runtime.modal = {
+            kind: 'confirm',
+            title: `Delete "${folder.name}"?`,
+            icon: 'fa-triangle-exclamation',
+            danger: true,
+            description: count
+                ? `This deletes the folder and its ${count} document(s). Runs are kept. This cannot be undone.`
+                : 'This deletes the empty folder. This cannot be undone.',
+            confirmLabel: count ? `Delete folder and ${count} file(s)` : 'Delete folder',
+            confirmIcon: 'fa-trash',
+            onConfirm: () => {
+                // Capture the paths BEFORE deleting: their editor tabs have to be
+                // closed, and afterwards there is nothing left to enumerate.
+                const doomed = core.listFiles(folder.id);
+                const result = core.deleteFolder(folder.id);
+                runtime.modal = null;
+                if (!result.deleted) {
+                    setToast(result.error || 'The folder could not be deleted.', 'error');
+                    renderPage();
+                    return true;
+                }
+                runtime.projectName = core.activeFolder().name;
+                // Any tab showing a deleted document must go, or it renders an
+                // empty viewer for a path that no longer exists.
+                doomed.forEach(path => noteFileDeleted(path));
+                setToast(count
+                    ? `Deleted "${folder.name}" and its ${result.count} file(s).`
+                    : `Deleted "${folder.name}".`, 'info');
+                renderHostSurfaces();
+                renderPage();
+                return true;
+            }
+        };
+        renderPage();
+    }
+
+    /**
+     * Import a directory from disk.
+     *
+     * Uses a real <input type="file" webkitdirectory>, which is the only way a
+     * browser will hand over a whole folder. The input is created on demand and
+     * removed afterwards: a directory input cannot be reliably re-triggered once
+     * its value is set, and leaving a hidden one in the DOM is a leak.
+     *
+     * Nothing is uploaded anywhere — the files are read in this page and stored in
+     * the browser profile, exactly like the single-file attach path.
+     */
+    function pickFolderFromDisk() {
+        const settings = core.readSettings();
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.setAttribute('webkitdirectory', '');
+        input.setAttribute('directory', '');
+        input.multiple = true;
+        input.style.display = 'none';
+        input.setAttribute('aria-hidden', 'true');
+
+        const cleanup = () => {
+            if (input.parentNode) input.parentNode.removeChild(input);
+        };
+
+        input.addEventListener('change', () => {
+            const files = Array.prototype.slice.call(input.files || []);
+            cleanup();
+            if (!files.length) {
+                setToast('No folder was selected.', 'info');
+                return;
+            }
+            void runFolderImport(files, settings);
+        });
+
+        // If the user dismisses the picker, `change` never fires. `cancel` is
+        // supported in current Chromium and Firefox; without it the node is simply
+        // left detached, which is harmless.
+        input.addEventListener('cancel', () => { cleanup(); });
+
+        const host = hostElements();
+        const mount = (host && host.settingsContainer) || document.body;
+        if (!mount) return;
+        mount.appendChild(input);
+        try {
+            input.click();
+        } catch (_) {
+            cleanup();
+            setToast('This browser blocked the folder picker.', 'error');
+        }
+    }
+
+    async function runFolderImport(files, settings) {
+        const pickedName = core.suggestedFolderName
+            ? core.suggestedFolderName(files)
+            : String((files[0] && (files[0].webkitRelativePath || files[0].name)) || 'Imported folder').split('/')[0];
+
+        setToast(`Importing ${files.length.toLocaleString()} file(s) from ${pickedName}…`, 'info');
+        runtime.busyImport = true;
+        renderPage();
+
+        let result;
+        try {
+            result = await core.importFolder(files, pickedName, {
+                maxFileKb: settings.maxSourceFileKb,
+                maxFiles: settings.maxSourceFiles,
+                maxTotalKb: settings.maxSourceTotalKb
+            });
+        } catch (error) {
+            runtime.busyImport = false;
+            setToast(`Import failed: ${String((error && error.message) || error)}`, 'error');
+            renderPage();
+            return;
+        }
+        runtime.busyImport = false;
+
+        if (result.error) {
+            setToast(result.error, 'error');
+            renderPage();
+            return;
+        }
+
+        runtime.projectName = result.folder.name;
+        result.imported.forEach(item => noteFileWritten(item.path));
+
+        const skipped = result.skipped.length;
+        const parts = [`${result.imported.length.toLocaleString()} file(s) imported into "${result.folder.name}".`];
+        if (skipped) parts.push(`${skipped.toLocaleString()} skipped.`);
+        if (result.truncatedByBudget) {
+            parts.push('The import hit its size limit — raise it in Settings -> Source files.');
+        }
+        setToast(parts.join(' '), skipped ? 'info' : 'success', skipped ? 9000 : 4200);
+
+        renderHostSurfaces();
+        renderPage();
+    }
 
     function openAddSourceModal() {
         runtime.modal = {
@@ -717,6 +1651,7 @@
         }
         core.writeFile(path, content, { skill: 'source' });
         runtime.sourceFiles.push({ path, content });
+        noteFileWritten(path);
         runtime.modal = null;
         setToast(`Attached ${path}.`, 'success');
         renderHostSurfaces();
@@ -727,6 +1662,7 @@
     function removeSourceFile(path) {
         runtime.sourceFiles = runtime.sourceFiles.filter(file => file.path !== path);
         core.deleteFile(path);
+        noteFileDeleted(path);
         setToast(`Detached ${path}.`, 'info');
         renderHostSurfaces();
         renderPage();
@@ -755,9 +1691,10 @@
                 }
                 core.writeFile(path, String(values.content || ''), { skill: 'manual' });
                 runtime.modal = null;
-                runtime.folder = 'cb-files';
-                const context = runtime.context;
-                if (context && context.state) context.state.folder = 'cb-files';
+                // Open the new document in its own editor tab (and make sure the
+                // Project Files section exists to browse from).
+                noteFileWritten(path);
+                openFileTab(path);
                 setToast(`Created ${path}.`, 'success');
                 renderHostSurfaces();
                 renderPage();
@@ -792,6 +1729,8 @@
                 }
                 if (target !== path) core.renameFile(path, target);
                 core.writeFile(target, String(values.content || ''), {});
+                if (target !== path) noteFileRenamed(path, target);
+                noteFileWritten(target);
                 runtime.modal = null;
                 setToast(`Saved ${target}.`, 'success');
                 renderHostSurfaces();
@@ -814,6 +1753,7 @@
             onConfirm: () => {
                 runtime.sourceFiles = runtime.sourceFiles.filter(file => file.path !== path);
                 core.deleteFile(path);
+                noteFileDeleted(path);
                 runtime.modal = null;
                 setToast(`Deleted ${path}.`, 'info');
                 renderHostSurfaces();
@@ -929,6 +1869,27 @@
     // Events (scoped to the Blueprint page only)
     // ------------------------------------------------------------------
 
+    /**
+     * The host calls every page hook as handler(context, ...args), so the context
+     * object arrives FIRST and the real payload second. A direct call (tests, the
+     * command dispatcher) passes the payload first instead.
+     *
+     * SimpleRAG's bundled Calendar controller handles this the same way. Accept
+     * both shapes so neither call form can silently feed a context object into a
+     * payload slot: if the first argument is a context, adopt it and return the
+     * second; otherwise the first argument IS the payload.
+     */
+    function hookContext(first, second) {
+        const isContext = value => Boolean(value && typeof value === 'object'
+            && !Array.isArray(value)
+            && (value.state !== undefined || value.elements !== undefined || typeof value.render === 'object'));
+        if (isContext(first)) {
+            runtime.context = first;
+            return second;
+        }
+        return first;
+    }
+
     function isBlueprintPage() {
         const context = runtime.context;
         return Boolean(context && context.state && context.state.app === APP_ID);
@@ -940,16 +1901,99 @@
 
     function onClick(event) {
         if (!isBlueprintPage()) return;
+
+        // Middle-click on a tab closes it (standard IDE behaviour). Checked
+        // before findAction because the close affordance is the tab itself.
+        if (event.button === 1) {
+            const tabButton = event.target && event.target.closest
+                ? event.target.closest('[data-cb-action="activate-tab"]')
+                : null;
+            if (tabButton && tabButton.dataset.tabId) {
+                event.preventDefault();
+                closeTabById(tabButton.dataset.tabId);
+                return;
+            }
+        }
+
         const target = findAction(event.target);
-        if (!target) return;
+        if (!target) {
+            if (runtime.isHistoryOpen) {
+                const inside = event.target && event.target.closest && event.target.closest('.cb-chat-history-popover');
+                if (!inside) {
+                    runtime.isHistoryOpen = false;
+                    renderPage();
+                }
+            }
+            return;
+        }
         if (runtime.modal && !target.closest('.cb-modal') && target.dataset.cbAction !== 'close-modal') {
             return;
         }
         const action = target.dataset.cbAction;
+        if (runtime.isHistoryOpen && action !== 'toggle-chat-history' && !target.closest('.cb-chat-history-popover')) {
+            runtime.isHistoryOpen = false;
+        }
         event.preventDefault();
         event.stopPropagation();
 
+        // Settings -> Data -> Maintenance actions are dispatched by key.
+        if (action.indexOf('settings-action:') === 0) {
+            handleSettingsAction(action.slice('settings-action:'.length));
+            return;
+        }
+
         switch (action) {
+            case 'toggle-chat-history':
+                runtime.isHistoryOpen = !runtime.isHistoryOpen;
+                renderPage();
+                return;
+            case 'clear-chat':
+                clearChat();
+                return;
+            case 'open-chat-run': {
+                const runId = target.dataset.runId;
+                const run = core.findRun(runId);
+                if (!run) return;
+                if (runtime.currentRun && runtime.currentRun.id !== runId && runtime.messages.length) {
+                    saveCurrentRunMessages();
+                }
+                runtime.activeRunId = run.id;
+                core.store.activeRunId = run.id;
+                core.writeStore();
+                runtime.currentRun = run;
+                runtime.selectedSkillId = run.skillId || runtime.selectedSkillId;
+                runtime.projectName = run.projectName || runtime.projectName;
+                rebuildMessagesFromRun(run);
+                runtime.isHistoryOpen = false;
+                setToast(`Loaded chat: ${run.title || run.skillName}`, 'info');
+                goToSection('cb-agent');
+                renderHostSurfaces();
+                renderPage();
+                scrollTranscriptToEnd(true);
+                return;
+            }
+            case 'delete-history-run': {
+                const runId = target.dataset.runId;
+                core.deleteRun(runId);
+                loadRuns();
+                if (runtime.currentRun && runtime.currentRun.id === runId) {
+                    runtime.currentRun = null;
+                    runtime.activeRunId = '';
+                    runtime.messages = [];
+                }
+                setToast('Run deleted from history.', 'info');
+                renderHostSurfaces();
+                renderPage();
+                return;
+            }
+            case 'clear-all-history':
+                runtime.isHistoryOpen = false;
+                confirmClearHistory();
+                return;
+            case 'open-runs-tab':
+                runtime.isHistoryOpen = false;
+                goToSection('cb-history');
+                return;
             case 'pick-skill': {
                 runtime.selectedSkillId = target.dataset.skillId || runtime.selectedSkillId;
                 const skill = selectedSkill();
@@ -989,13 +2033,155 @@
             case 'hide-settings':
                 goToSection('cb-agent');
                 return;
+            case 'activate-tab':
+                activateTabById(target.dataset.tabId || '');
+                return;
+            case 'close-tab':
+                closeTabById(target.dataset.tabId || '');
+                return;
+            case 'close-file-tabs': {
+                const ws = wsModule();
+                if (ws && runtime.workspace) {
+                    ws.closeFileTabs(runtime.workspace, core.readSettings());
+                    afterWorkspaceChange();
+                }
+                return;
+            }
+            case 'settings-goto': {
+                const ws = wsModule();
+                const sectionId = target.dataset.sectionId || 'agent';
+                const pageId = target.dataset.pageId || '';
+                if (ws && runtime.workspace) {
+                    ws.setSettingsLocation(runtime.workspace, sectionId, pageId);
+                    persistWorkspace();
+                }
+                runtime.settingsFocusKey = '';
+                renderHostSurfaces();
+                renderPage();
+                return;
+            }
+            case 'settings-focus': {
+                const ws = wsModule();
+                if (ws && runtime.workspace) {
+                    ws.setSettingsLocation(runtime.workspace, target.dataset.sectionId || 'agent', target.dataset.pageId || '');
+                    persistWorkspace();
+                }
+                runtime.settingsFocusKey = target.dataset.settingKey || '';
+                runtime.settingsQueryDraft = '';
+                renderHostSurfaces();
+                renderPage();
+                queueMicrotask(() => {
+                    const container = hostElements()?.settingsContainer;
+                    const row = container && runtime.settingsFocusKey
+                        ? container.querySelector(`[data-cb-setting-key="${cssEscape(runtime.settingsFocusKey)}"]`)
+                        : null;
+                    if (row) {
+                        try { row.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch (_) { row.scrollIntoView(); }
+                        const control = row.querySelector('input, select, textarea, button');
+                        if (control) { try { control.focus({ preventScroll: true }); } catch (_) { control.focus(); } }
+                    }
+                    runtime.settingsFocusKey = '';
+                });
+                return;
+            }
+            case 'clear-settings-search': {
+                const ws = wsModule();
+                if (ws && runtime.workspace) {
+                    ws.setSettingsQuery(runtime.workspace, '');
+                    persistWorkspace();
+                }
+                renderHostSurfaces();
+                renderPage();
+                queueMicrotask(() => {
+                    const input = hostElements()?.settingsContainer?.querySelector('[data-cb-role="settings-search"]');
+                    if (input) { try { input.focus({ preventScroll: true }); } catch (_) { input.focus(); } }
+                });
+                return;
+            }
+            case 'settings-range-jump': {
+                const key = target.dataset.settingKey || '';
+                const value = Number(target.dataset.value);
+                if (key && Number.isFinite(value)) {
+                    const settings = core.readSettings();
+                    const field = schemaModule() ? schemaModule().getField(key) : null;
+                    settings[key] = field ? schemaModule().coerceField(field, value, settings[key]) : value;
+                    core.writeSettings(settings);
+                    renderHostSurfaces();
+                    renderPage();
+                }
+                return;
+            }
+            case 'settings-clear-text': {
+                const key = target.dataset.settingKey || '';
+                if (key) {
+                    const settings = core.readSettings();
+                    settings[key] = '';
+                    core.writeSettings(settings);
+                    renderHostSurfaces();
+                    renderPage();
+                }
+                return;
+            }
+            case 'reset-settings-page': {
+                const schema = schemaModule();
+                if (!schema) return;
+                const sectionId = target.dataset.sectionId || 'agent';
+                const pageId = target.dataset.pageId || '';
+                const page = schema.getPage(sectionId, pageId);
+                const settings = core.readSettings();
+                let changed = 0;
+                (page.groups || []).forEach(group => {
+                    (group.fields || []).forEach(field => {
+                        const fallback = schema.defaultFor(field);
+                        if (settings[field.key] !== fallback) {
+                            settings[field.key] = fallback;
+                            changed += 1;
+                        }
+                    });
+                });
+                core.writeSettings(settings);
+                setToast(changed
+                    ? `Reset ${changed} setting${changed === 1 ? '' : 's'} on ${page.label}.`
+                    : `${page.label} was already at its defaults.`, changed ? 'success' : 'info');
+                renderHostSurfaces();
+                renderPage();
+                return;
+            }
             case 'toggle-step': {
                 const step = findStep(target.dataset.stepId);
                 if (step) { step.open = !step.open; renderPage(); }
                 return;
             }
+            case 'auto-repair-gaps': {
+                const runId = target.dataset.runId;
+                const path = target.dataset.path;
+                const run = core.findRun(runId) || runtime.currentRun;
+                if (!run || !path) return;
+                const review = (run.reviews || []).find(r => r.path === path);
+                if (!review) return;
+                setToast('Agent is autonomously repairing gaps…', 'info');
+                void runGapRepair(run, path, review);
+                return;
+            }
             case 'answer-question': {
                 const answer = target.dataset.answer || '';
+                if (runtime.answerResolver) {
+                    const resolver = runtime.answerResolver;
+                    runtime.pendingQuestion = null;
+                    renderPage();
+                    resolver(answer);
+                }
+                return;
+            }
+            case 'submit-inline-answer': {
+                const container = target.closest('.cb-step-inline-answer');
+                const input = container ? container.querySelector('[data-cb-role="inline-answer-input"]') : null;
+                const answer = input ? String(input.value || '').trim() : '';
+                if (!answer) {
+                    setToast('Please enter an answer first.', 'warn');
+                    if (input) input.focus();
+                    return;
+                }
                 if (runtime.answerResolver) {
                     const resolver = runtime.answerResolver;
                     runtime.pendingQuestion = null;
@@ -1012,7 +2198,22 @@
                 renderPage();
                 return;
             }
+            // A PROJECT folder root. Roots default to open (see runtime.collapsedRoots),
+            // so this toggles membership in the collapsed set rather than the expanded one.
+            case 'toggle-folder-root': {
+                const folderId = target.dataset.folderId || '';
+                if (!folderId) return;
+                const key = ui.folderRootKey(folderId);
+                if (runtime.collapsedRoots.has(key)) runtime.collapsedRoots.delete(key);
+                else runtime.collapsedRoots.add(key);
+                renderHostSurfaces();
+                renderPage();
+                return;
+            }
+            // The tree is multi-root now, so both commands cover every project
+            // folder and every directory inside it — not just the active one.
             case 'expand-all': {
+                runtime.collapsedRoots.clear();
                 core.listFiles().forEach(path => {
                     const parts = path.split('/');
                     parts.pop();
@@ -1028,8 +2229,32 @@
             }
             case 'collapse-all':
                 runtime.expanded.clear();
+                // Roots default to OPEN, so collapsing everything means adding every
+                // root to the collapsed set — clearing it would leave them open.
+                core.listFolders().forEach(folder => {
+                    runtime.collapsedRoots.add(ui.folderRootKey(folder.id));
+                });
                 renderHostSurfaces();
                 renderPage();
+                return;
+            // ---- project folders ------------------------------------
+            case 'select-folder': {
+                const folderId = target.dataset.folderId || '';
+                if (!folderId) return;
+                selectFolder(folderId);
+                return;
+            }
+            case 'new-folder':
+                openNewFolderModal();
+                return;
+            case 'open-folder':
+                pickFolderFromDisk();
+                return;
+            case 'rename-folder':
+                openRenameFolderModal(target.dataset.folderId || '');
+                return;
+            case 'delete-folder':
+                confirmDeleteFolder(target.dataset.folderId || '');
                 return;
             case 'open-file': {
                 const path = target.dataset.path || '';
@@ -1037,17 +2262,44 @@
                     setToast(`${path} is not in the project.`, 'warn');
                     return;
                 }
-                core.setOpenPath(path);
-                runtime.viewerMode = 'preview';
-                runtime.folder = 'cb-files';
-                const context = runtime.context;
-                if (context && context.state) context.state.folder = 'cb-files';
-                renderHostSurfaces();
-                renderPage();
+                // A document opens in its OWN editor tab next to the Agent.
+                openFileTab(path);
                 return;
             }
             case 'viewer-toggle': {
-                runtime.viewerMode = runtime.viewerMode === 'source' ? 'preview' : 'source';
+                const ws = wsModule();
+                const path = target.dataset.path || core.store.openPath;
+                if (ws && runtime.workspace && path) {
+                    const current = ws.viewerModeFor(runtime.workspace, path, core.readSettings());
+                    ws.setViewerMode(runtime.workspace, path, current === 'source' ? 'preview' : 'source');
+                    persistWorkspace();
+                } else {
+                    runtime.viewerMode = runtime.viewerMode === 'source' ? 'preview' : 'source';
+                }
+                renderPage();
+                return;
+            }
+            // The previewer's own toolbar buttons. Each one flips the Settings ->
+            // Workspace -> Editor field it controls, so the toolbar and the
+            // settings page cannot disagree about what is on.
+            case 'preview-color':
+            case 'preview-wrap':
+            case 'preview-gutter': {
+                const KEYS = {
+                    'preview-color': 'syntaxHighlighting',
+                    'preview-wrap': 'wrapLongLines',
+                    'preview-gutter': 'showLineNumbers'
+                };
+                const key = KEYS[target.dataset.cbAction];
+                if (!key) return;
+                const settings = core.readSettings();
+                const schema = schemaModule();
+                const field = schema ? schema.getField(key) : null;
+                const next = !settings[key];
+                settings[key] = field && schema
+                    ? schema.coerceField(field, next, settings[key])
+                    : next;
+                core.writeSettings(settings);
                 renderPage();
                 return;
             }
@@ -1185,14 +2437,72 @@
             return;
         }
         if (target && target.dataset && target.dataset.cbSetting) {
-            const settings = core.readSettings();
-            const key = target.dataset.cbSetting;
-            if (target.type === 'checkbox') settings[key] = target.checked;
-            else if (target.type === 'number') settings[key] = Number(target.value);
-            else settings[key] = target.value;
-            core.writeSettings(settings);
+            applySettingInput(target);
+            return;
+        }
+        // Live settings search: filters the sidebar as you type.
+        if (target && target.dataset && target.dataset.cbRole === 'settings-search') {
+            const ws = wsModule();
+            if (ws && runtime.workspace) {
+                ws.setSettingsQuery(runtime.workspace, target.value);
+                persistWorkspace();
+            }
             renderHostSurfaces();
             return;
+        }
+    }
+
+    /**
+     * Write one control's value through the schema, so it is clamped to the
+     * documented bounds before it is stored — an out-of-range number typed by
+     * hand cannot leak into a prompt.
+     */
+    function applySettingInput(target) {
+        const key = target.dataset.cbSetting;
+        const schema = schemaModule();
+        const settings = core.readSettings();
+        let raw;
+
+        if (target.type === 'checkbox') raw = target.checked;
+        else if (target.type === 'radio') { if (!target.checked) return; raw = target.value; }
+        else if (target.type === 'number' || target.type === 'range') raw = Number(target.value);
+        else raw = target.value;
+
+        const field = schema ? schema.getField(key) : null;
+        settings[key] = field && schema
+            ? schema.coerceField(field, raw, settings[key])
+            : raw;
+
+        core.writeSettings(settings);
+
+        // Reflect the clamped value back into the control so the UI cannot show
+        // a number the engine will not actually use.
+        if (field && (target.type === 'number' || target.type === 'range')) {
+            const clamped = settings[key];
+            if (String(clamped) !== String(target.value)) target.value = String(clamped);
+            const readout = hostElements()?.settingsContainer
+                ?.querySelector(`[data-cb-role="range-value-${cssEscape(key)}"]`);
+            if (readout) {
+                readout.textContent = typeof field.format === 'function'
+                    ? field.format(clamped)
+                    : String(clamped);
+            }
+        }
+        if (field && (field.type === 'textarea' || field.type === 'text')) {
+            const counter = hostElements()?.settingsContainer
+                ?.querySelector(`[data-cb-role="counter-${cssEscape(key)}"]`);
+            if (counter) counter.textContent = `${String(settings[key] || '').length} / ${field.maxChars || 240}`;
+        }
+
+        // Some settings change layout immediately; refresh the host surfaces so
+        // nav counts and ribbon state stay correct.
+        renderHostSurfaces();
+        if (key === 'pinAgentTab' || key === 'maxOpenTabs' || key === 'restoreTabsOnLoad') {
+            ensureWorkspace();
+            const ws = wsModule();
+            if (ws && runtime.workspace) ws.syncAgentPin(runtime.workspace, settings);
+            persistWorkspace();
+            renderPage();
         }
     }
 
@@ -1226,6 +2536,13 @@
         if (!isBlueprintPage()) return;
         const target = event.target;
 
+        if (runtime.isHistoryOpen && event.key === 'Escape') {
+            event.preventDefault();
+            runtime.isHistoryOpen = false;
+            renderPage();
+            return;
+        }
+
         if (runtime.modal) {
             if (event.key === 'Escape') {
                 if (runtime.busy && runtime.pendingQuestion) return;
@@ -1246,6 +2563,16 @@
             return;
         }
 
+        if (target && target.dataset && target.dataset.cbRole === 'inline-answer-input') {
+            if (event.key === 'Enter') {
+                event.preventDefault();
+                const container = target.closest('.cb-step-inline-answer');
+                const btn = container ? container.querySelector('[data-cb-action="submit-inline-answer"]') : null;
+                if (btn) btn.click();
+                return;
+            }
+        }
+
         if (target && target.dataset && target.dataset.cbRole === 'composer') {
             if (event.key === 'Enter' && !event.shiftKey) {
                 event.preventDefault();
@@ -1263,6 +2590,36 @@
             && (event.key === 'Enter' || event.key === ' ')) {
             event.preventDefault();
             target.click();
+            return;
+        }
+
+        // ---- IDE workspace shortcuts (Ctrl+W, Ctrl+Tab, Ctrl+1..4, Ctrl+S,
+        // Ctrl+F, Alt+Left). Handled by workspace.js so the keymap lives in one
+        // place next to the tab model it drives.
+        const ws = wsModule();
+        if (ws && runtime.workspace) {
+            const actions = {
+                closeTab: tabId => closeTabById(tabId),
+                cycleTab: direction => {
+                    const nextId = ws.cycleIndex(runtime.workspace, direction);
+                    if (nextId) activateTabById(nextId);
+                },
+                openSection: sectionId => openSectionTab(sectionId),
+                downloadFile: path => {
+                    const record = core.readFile(path);
+                    if (record) {
+                        downloadText(record.path.split('/').pop(), record.content, 'text/markdown;charset=utf-8');
+                        setToast(`Downloaded ${record.path}.`, 'success');
+                    }
+                },
+                focusSettingsSearch: () => {
+                    const input = hostElements()?.settingsContainer?.querySelector('[data-cb-role="settings-search"]');
+                    if (input) { try { input.focus({ preventScroll: true }); } catch (_) { input.focus(); } }
+                }
+            };
+            if (ws.handleShortcut(runtime.workspace, event, actions, core.readSettings())) {
+                event.preventDefault();
+            }
         }
     }
 
@@ -1295,6 +2652,7 @@
             if (runtime.mounted) return;
             runtime.mounted = true;
             ensureHostRecord();
+            ensureWorkspace();
             loadRuns();
             if (runtime.currentRun) rebuildMessagesFromRun(runtime.currentRun);
             runtime.selectedSkillId = (runtime.currentRun && runtime.currentRun.skillId) || runtime.selectedSkillId;
@@ -1305,10 +2663,12 @@
             runtime.active = true;
             runtime.generation += 1;
             ensureHostRecord();
+            ensureWorkspace();
             loadRuns();
             if (!runtime.messages.length && runtime.currentRun) rebuildMessagesFromRun(runtime.currentRun);
-            runtime.folder = 'cb-agent';
-            if (runtime.context && runtime.context.state) runtime.context.state.folder = 'cb-agent';
+            // Do NOT force the Agent tab: restoreTabsOnLoad keeps whatever the
+            // user had open. The folder is derived from the active tab instead.
+            syncFolderFromTab();
             runtime.hint = selectedSkill().tagline;
             // setApp() sets state.folder to 'all' before the page renders, so the
             // nav/list/ribbon surfaces must be refreshed once the section is known.
@@ -1320,12 +2680,18 @@
             runtime.active = false;
             const composer = hostElements()?.settingsContainer?.querySelector('[data-cb-role="composer"]');
             if (composer) runtime.draft = composer.value;
+            persistWorkspace();
+            // The divider lives beside the host list pane, outside our container,
+            // so it must be removed explicitly when the page is left.
+            releaseDivider();
         },
 
         unmount() {
             runtime.active = false;
             runtime.mounted = false;
             runtime.generation += 1;
+            persistWorkspace();
+            releaseDivider();
             clearTimeout(runtime.toastTimer);
             runtime.toastTimer = null;
             if (!runtime.busy) {
@@ -1342,12 +2708,16 @@
                 viewerMode: runtime.viewerMode,
                 openPath: core.store.openPath,
                 expanded: [...runtime.expanded].slice(0, 60),
-                activeRunId: runtime.activeRunId
+                activeRunId: runtime.activeRunId,
+                // The host may snapshot/restore the page across app switches; the
+                // tab layout rides along so a restore lands on the same tab.
+                workspace: runtime.workspace ? JSON.parse(JSON.stringify(runtime.workspace)) : null
             };
         },
 
-        restoreState(value) {
-            if (!value || typeof value !== 'object') return;
+        restoreState(contextOrValue, maybeValue) {
+            const value = hookContext(contextOrValue, maybeValue);
+            if (!value || typeof value !== 'object' || Array.isArray(value)) return;
             if (typeof value.section === 'string' && ui.SECTIONS.some(section => section.id === value.section)) {
                 runtime.folder = value.section;
             }
@@ -1356,9 +2726,14 @@
             if (typeof value.openPath === 'string') core.setOpenPath(value.openPath);
             if (Array.isArray(value.expanded)) runtime.expanded = new Set(value.expanded.map(String));
             if (typeof value.activeRunId === 'string') runtime.activeRunId = value.activeRunId;
+            if (value.workspace && wsModule()) {
+                runtime.workspace = wsModule().normalizeWorkspace(value.workspace, core.readSettings());
+                syncFolderFromTab();
+            }
         },
 
-        onThemeChanged() {
+        onThemeChanged(contextOrDetail, maybeDetail) {
+            hookContext(contextOrDetail, maybeDetail);
             if (runtime.active) renderPage();
         },
 
@@ -1366,7 +2741,8 @@
             if (runtime.active) renderPage();
         },
 
-        onConnectivityChanged(detail) {
+        onConnectivityChanged(contextOrDetail, maybeDetail) {
+            const detail = hookContext(contextOrDetail, maybeDetail);
             if (!runtime.active) return;
             const online = !detail || detail.online !== false;
             runtime.hint = online
@@ -1375,8 +2751,25 @@
             renderPage();
         },
 
-        onFolderChanged(id) {
-            runtime.folder = String(id || 'cb-agent');
+        onFolderChanged(contextOrId, maybeId) {
+            // The host sets state.folder BEFORE dispatching this hook, and passes
+            // its context as the first argument — so when the payload is missing or
+            // is not a string, read the section the host already chose.
+            const payload = hookContext(contextOrId, maybeId);
+            const hostFolder = runtime.context && runtime.context.state
+                ? runtime.context.state.folder
+                : '';
+            const section = typeof payload === 'string' && payload
+                ? payload
+                : (typeof hostFolder === 'string' && hostFolder ? hostFolder : 'cb-agent');
+
+            // Clicking a sidebar section opens (or activates) its tab rather than
+            // just repainting, so the Agent chat stays open beside it.
+            if (wsModule() && runtime.workspace) {
+                openSectionTab(section);
+                return;
+            }
+            runtime.folder = section;
             renderPage();
         },
 

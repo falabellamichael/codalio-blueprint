@@ -207,13 +207,29 @@ const context = vm.createContext(sandbox);
 function runFile(file) {
     vm.runInContext(fs.readFileSync(file, 'utf8'), context, { filename: file });
 }
+// Load the module chain in the order the installer declares it. Loading only
+// ui.js would exercise the "settings module missing" error card instead of the
+// page that actually ships, so the test would pass while the product is broken.
 runFile(path.join(SRC, 'controller-core.js'));
 runFile(path.join(SRC, 'skills.js'));
+runFile(path.join(SRC, 'settings.js'));
+runFile(path.join(SRC, 'agent.js'));
+runFile(path.join(SRC, 'preview.js'));
 runFile(path.join(SRC, 'ui.js'));
+runFile(path.join(SRC, 'workspace.js'));
+runFile(path.join(SRC, 'settings-page.js'));
 
 const core = sandbox.window.__codalioBlueprintCore;
 const ui = sandbox.window.__codalioBlueprintUi;
 const skills = sandbox.window.__codalioBlueprintSkills;
+const schema = sandbox.window.__codalioBlueprintSettings;
+const ws = sandbox.window.__codalioBlueprintWorkspace;
+const settingsPageModule = sandbox.window.__codalioBlueprintSettingsPage;
+
+// The test must load the real modules, not fall back to an error card.
+assert.ok(schema, 'settings.js did not load');
+assert.ok(ws, 'workspace.js did not load');
+assert.ok(settingsPageModule, 'settings-page.js did not load');
 
 // ---------------------------------------------------------------------------
 // Tree walking helpers
@@ -257,7 +273,10 @@ core.writeStore();
 
 const handlers = {
     render() {}, newRun() {}, stopRun() {}, focusComposer() {}, goSection() {},
-    addSourceFile() {}, newFile() {}, exportProject() {}, clearHistory() {}
+    addSourceFile() {}, newFile() {}, exportProject() {}, clearHistory() {},
+    // The Project Files ribbon and the multi-root explorer call these. Without them
+    // renderRibbon('cb-files') throws on a missing function.
+    newFolder() {}, openFolder() {}, selectFolder() {}, renameFolder() {}, deleteFolder() {}
 };
 
 function baseState(overrides) {
@@ -463,16 +482,160 @@ assert.equal(findAll(filesPage, byAction('rename-file')).length, 1);
 assert.equal(findAll(filesPage, byAction('viewer-toggle')).length, 1);
 assert.match(textOf(filesPage), /docs\/prd\/2026-09-03-toolshare-prd\.md/, 'viewer does not show the open path');
 
-// Source mode shows the raw Markdown instead of the rendered preview.
+// Source mode renders the file through the code previewer: line-number gutter,
+// syntax colouring, and an Ln/Col status bar. It must still show the RAW text —
+// a previewer that reformatted what it displayed would be worse than a <pre>.
 const sourcePage = ui.renderFilesPage(baseState({ folder: 'cb-files', viewerMode: 'source', openPath: 'docs/prd/2026-09-03-toolshare-prd.md' }));
-const sourcePre = findAll(sourcePage, byClass('cb-viewer-source'));
-assert.equal(sourcePre.length, 1, 'source mode has no raw text view');
-assert.match(textOf(sourcePre[0]), /^# ToolShare — PRD/, 'source mode did not show the raw Markdown');
+const sourcePreview = findAll(sourcePage, byClass('cb-preview'));
+assert.equal(sourcePreview.length, 1, 'source mode did not render the code previewer');
+
+// The gutter numbers every line of the document.
+const gutterCells = findAll(sourcePage, byClass('cb-preview-ln'));
+const sourceLines = core.readFile('docs/prd/2026-09-03-toolshare-prd.md').content.split('\n').length;
+assert.equal(gutterCells.length, sourceLines, 'the gutter did not number every line');
+assert.equal(gutterCells[0].textContent, '1', 'gutter numbering does not start at 1');
+
+// The status bar reports a caret position, the language, and the encoding.
+const statusText = textOf(findAll(sourcePage, byClass('cb-preview-status'))[0]);
+assert.match(statusText, /Ln 1, Col 1/, 'the status bar reports no caret position');
+assert.match(statusText, /Markdown/, 'the status bar does not name the language');
+assert.match(statusText, /UTF-8/, 'the status bar does not report an encoding');
+
+// Every character of the source is still readable — the heading survives as raw
+// Markdown ('#'), not as a rendered <h1>. The toolbar and status bar text precede
+// the code, so this is a containment check rather than an anchored one.
+const previewText = textOf(sourcePreview[0]);
+assert.ok(previewText.includes('# ToolShare — PRD'),
+    'source mode did not show the raw Markdown heading');
+assert.ok(!previewText.includes('<h1'), 'source mode rendered HTML instead of showing raw text');
 
 // No file open -> an empty state with a way forward, not a blank pane.
 const noFilePage = ui.renderFilesPage(baseState({ folder: 'cb-files', openPath: '' }));
 assert.equal(findAll(noFilePage, byClass('cb-viewer-empty')).length, 1, 'no empty state for an unopened project');
 assert.equal(findAll(noFilePage, byAction('add-source-file')).length, 1, 'empty state offers no way to add a file');
+
+// ---------------------------------------------------------------------------
+// 5b. The Project Files sidebar is a MULTI-ROOT explorer
+//
+// Regression guard for the reported bug: selecting a project folder used to scope
+// the tree to that folder, so every other folder's documents disappeared from the
+// sidebar and it read as "the files are not showing". Now every project folder is
+// a root and every root lists all of its own files, so nothing is hidden by
+// selection.
+// ---------------------------------------------------------------------------
+
+// Start from an empty project so each folder holds exactly the files written
+// below. Section 4 left documents under docs/backlog and docs/mvp, whose
+// subfolders are not expanded here, so carrying them over would hide them and
+// fail the "lists every file" assertion for an unrelated reason.
+core.store.files = {};
+core.store.openPath = '';
+core.writeStore();
+
+const multiFolders = core.listFolders();
+const folderA = multiFolders[0];
+const folderB = core.createFolder('Second project').folder;
+const folderC = core.createFolder('Imported repo', 'imported').folder;
+
+core.setActiveFolder(folderA.id);
+core.writeFile('docs/prd/a-prd.md', '# A PRD\n', {});
+core.writeFile('src/a-main.py', 'def a(): pass\n', {});
+core.setActiveFolder(folderB.id);
+core.writeFile('docs/prd/b-prd.md', '# B PRD\n', {});
+core.setActiveFolder(folderC.id);
+core.writeFile('README.md', '# Imported\n', {});
+core.writeFile('lib/tool.js', 'export const t = 1;\n', {});
+core.setActiveFolder(folderA.id);
+
+// Every directory that contains a listed file, so the tree is fully open and the
+// "lists every file" assertion below is about the explorer, not about which
+// subfolders happen to be expanded.
+const allDirs = new Set();
+core.listFiles().forEach(path => {
+    const parts = path.split('/');
+    parts.pop();
+    let walked = [];
+    parts.forEach(part => { walked = walked.concat([part]); allDirs.add(walked.join('/')); });
+});
+
+// Deliberately leave folderA ACTIVE while asserting that B's and C's files are
+// still visible — that is the exact case the old scoped tree failed.
+const multiState = baseState({
+    folder: 'cb-files',
+    openPath: '',
+    folders: core.listFolders(),
+    activeFolderId: folderA.id,
+    activeFolderName: folderA.name,
+    folderFileCounts: core.listFolders().reduce((acc, f) => { acc[f.id] = core.folderFileCount(f.id); return acc; }, {}),
+    collapsedRoots: new Set(),
+    expanded: allDirs
+});
+const multiContent = makeElement('div');
+ui.renderList(multiState, makeElement('div'), multiContent);
+
+// Every project folder renders as a root.
+const roots = findAll(multiContent, byClass('cb-tree-root'));
+assert.equal(roots.length, core.listFolders().length,
+    'not every project folder rendered as a root');
+assert.equal(roots.filter(byAction('toggle-folder-root')).length, roots.length,
+    'a folder root is not clickable to expand or collapse');
+
+// The active folder is badged, the others are not.
+assert.equal(roots.filter(r => r.className.includes('active')).length, 1,
+    'exactly one root should be marked as the target folder');
+assert.equal(findAll(multiContent, byClass('cb-root-badge')).length, 1,
+    'the target-folder badge is missing or duplicated');
+
+// EVERY file in EVERY folder is listed, including folders that are not active.
+const listedPaths = findAll(multiContent, byAction('open-file')).map(r => r.dataset.path);
+['docs/prd/a-prd.md', 'src/a-main.py', 'docs/prd/b-prd.md', 'README.md', 'lib/tool.js'].forEach(expected => {
+    assert.ok(listedPaths.includes(expected),
+        `${expected} is missing from the sidebar (its folder is not the active one)`);
+});
+assert.equal(listedPaths.length, core.listFiles().length,
+    'the sidebar does not list every file in the project');
+
+// Each root reports its own file count, so the user can see where things are.
+const countCells = findAll(multiContent, byClass('cb-tree-meta')).map(c => c.textContent);
+assert.ok(countCells.includes('2'), 'no root reports its 2-file count');
+assert.ok(countCells.includes('1'), 'no root reports its 1-file count');
+
+// Imported folders are visually distinguishable and keep their origin in the tooltip.
+const importedRoot = roots.find(r => r.dataset.folderId === folderC.id);
+assert.ok(importedRoot, 'the imported folder did not render');
+assert.match(importedRoot.title, /imported from disk/, 'the imported folder does not say where it came from');
+
+// A collapsed root hides only its own files — the other roots keep theirs.
+const collapsedRootState = Object.assign({}, multiState, {
+    collapsedRoots: new Set([ui.folderRootKey(folderC.id)])
+});
+const collapsedRootContent = makeElement('div');
+ui.renderList(collapsedRootState, makeElement('div'), collapsedRootContent);
+const collapsedPaths = findAll(collapsedRootContent, byAction('open-file')).map(r => r.dataset.path);
+assert.ok(!collapsedPaths.includes('README.md'), 'a collapsed root still listed its files');
+assert.ok(collapsedPaths.includes('docs/prd/b-prd.md'),
+    'collapsing one root hid another root\'s files');
+assert.equal(findAll(collapsedRootContent, byClass('cb-tree-root')).length, core.listFolders().length,
+    'collapsing a root removed it from the list entirely');
+
+// Folder tools: rename/delete on non-default roots, never on the default one.
+assert.equal(findAll(multiContent, byAction('rename-folder')).length, core.listFolders().length - 1,
+    'rename should be offered on every folder except the default');
+assert.ok(!findAll(multiContent, byAction('delete-folder')).some(b => b.dataset.folderId === core.DEFAULT_FOLDER_ID),
+    'the default folder offers a delete button');
+// A non-active root offers "create files here"; the active one does not need to.
+assert.equal(findAll(multiContent, byAction('select-folder')).length, core.listFolders().length - 1,
+    'the target-folder action should be offered on every non-active folder');
+
+// Restore a single-folder state for the remaining sections.
+core.setActiveFolder(core.DEFAULT_FOLDER_ID);
+[folderB.id, folderC.id].forEach(id => core.deleteFolder(id));
+core.store.files = {};
+core.writeFile('docs/prd/2026-09-03-toolshare-prd.md', '# ToolShare — PRD\n\nBody.', {});
+core.writeFile('docs/backlog/2026-09-03-toolshare-backlog.md', '# Backlog\n', {});
+core.writeFile('docs/mvp/2026-09-03-toolshare-mvp-checklist.md', '# MVP\n', {});
+core.writeFile('src/router.py', 'def handle(): pass\n', {});
+core.writeStore();
 
 // ---------------------------------------------------------------------------
 // 6. Runs list and history page
@@ -502,26 +665,198 @@ const emptyHistory = ui.renderHistoryPage(baseState({ folder: 'cb-history', runs
 assert.equal(findAll(emptyHistory, byClass('cb-viewer-empty')).length, 1, 'no empty state for zero runs');
 
 // ---------------------------------------------------------------------------
-// 7. Settings page exposes every real setting
+// 7. Settings page is schema-driven and thorough
 // ---------------------------------------------------------------------------
 
 core.writeSettings(Object.assign({}, core.DEFAULT_SETTINGS, { concurrency: 'sequential', lensMaxOutputTokens: 6000 }));
-const settingsPage = ui.renderSettingsPage(baseState({ folder: 'cb-settings' }));
-const settingInputs = findAll(settingsPage, node => node.nodeType === 1 && node.dataset && node.dataset.cbSetting);
-const settingKeys = settingInputs.map(input => input.dataset.cbSetting).sort();
-assert.equal(
-    settingKeys.join(','),
-    ['askClarifyingQuestions', 'autoOpenWrittenDocument', 'concurrency', 'documentMaxOutputTokens', 'lensMaxOutputTokens', 'temperature'].join(','),
-    'settings page does not expose every persisted setting'
-);
-const concurrencySelect = settingInputs.find(input => input.dataset.cbSetting === 'concurrency');
-assert.equal(concurrencySelect.tagName, 'SELECT');
-assert.equal(concurrencySelect.value, 'sequential', 'the select did not reflect the stored value');
-const lensInput = settingInputs.find(input => input.dataset.cbSetting === 'lensMaxOutputTokens');
+
+// 7a. Every page of every section renders, and every field on that page appears.
+let fieldCount = 0;
+schema.sections().forEach(section => {
+    section.pages.forEach(page => {
+        const pageNode = ui.renderSettingsPage(baseState({
+            folder: 'cb-settings',
+            settingsSection: section.id,
+            settingsPage: page.id,
+            settings: core.readSettings()
+        }));
+        assert.ok(pageNode, `${section.id}/${page.id} rendered nothing`);
+
+        const expected = [];
+        page.groups.forEach(group => (group.fields || []).forEach(field => expected.push(field.key)));
+        const rendered = findAll(pageNode, node => node.nodeType === 1 && node.dataset && node.dataset.cbSetting)
+            .map(input => input.dataset.cbSetting);
+        // Segmented controls emit one input per option, so compare unique keys.
+        const unique = [...new Set(rendered)].sort();
+        assert.equal(
+            unique.join(','),
+            expected.slice().sort().join(','),
+            `${section.id}/${page.id} does not render exactly its own fields`
+        );
+        fieldCount += expected.length;
+
+        // The page header names the page and carries its live summary.
+        assert.match(textOf(pageNode), new RegExp(page.label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')),
+            `${section.id}/${page.id} header does not name the page`);
+
+        // Actions declared on a group render as buttons keyed by action name.
+        page.groups.forEach(group => {
+            (group.actions || []).forEach(action => {
+                assert.equal(
+                    findAll(pageNode, byAction(`settings-action:${action.key}`)).length,
+                    1,
+                    `${section.id}/${page.id} is missing the ${action.key} action`
+                );
+            });
+        });
+    });
+});
+assert.equal(fieldCount, schema.allFields().length,
+    'the union of rendered fields does not equal the schema — some field is unreachable from the UI');
+assert.ok(fieldCount >= 40, `expected a thorough settings surface, found ${fieldCount} fields`);
+
+// 7b. Controls match the declared type.
+const planningPage = ui.renderSettingsPage(baseState({
+    folder: 'cb-settings', settingsSection: 'agent', settingsPage: 'planning', settings: core.readSettings()
+}));
+const concurrencyInputs = findAll(planningPage, node => node.dataset && node.dataset.cbSetting === 'concurrency');
+assert.ok(concurrencyInputs.length >= 2, 'a segmented control should emit one radio per option');
+concurrencyInputs.forEach(input => assert.equal(input.type, 'radio'));
+const checkedConcurrency = concurrencyInputs.find(input => input.checked);
+assert.equal(checkedConcurrency.value, 'sequential', 'the segmented control did not reflect the stored value');
+
+const toggleInput = findAll(planningPage, node => node.dataset && node.dataset.cbSetting === 'askClarifyingQuestions')[0];
+assert.equal(toggleInput.type, 'checkbox');
+assert.equal(toggleInput.checked, true, 'a default-on toggle did not render as checked');
+
+// 7c. Numeric controls carry their documented bounds, so the UI cannot offer a
+// value the engine would clamp away.
+const modelPage = ui.renderSettingsPage(baseState({
+    folder: 'cb-settings', settingsSection: 'agent', settingsPage: 'model', settings: core.readSettings()
+}));
+const lensInput = findAll(modelPage, node => node.dataset && node.dataset.cbSetting === 'lensMaxOutputTokens')[0];
+assert.equal(lensInput.tagName, 'INPUT');
 assert.equal(lensInput.value, '6000', 'the token budget did not reflect the stored value');
-assert.equal(findAll(settingsPage, byAction('clear-history')).length, 1, 'no way to clear run history');
-assert.equal(findAll(settingsPage, byAction('clear-files')).length, 1, 'no way to clear project files');
-assert.match(textOf(settingsPage), /never read or written/i, 'settings must state that SimpleRAG data is untouched');
+assert.equal(lensInput.min, '512');
+assert.equal(lensInput.max, '32768');
+const tempField = schema.getField('temperature');
+const tempInput = findAll(modelPage, node => node.dataset && node.dataset.cbSetting === 'temperature')[0];
+assert.equal(tempInput.type, 'range', 'temperature should be a range slider');
+assert.equal(tempInput.min, String(tempField.min));
+assert.equal(tempInput.max, String(tempField.max));
+// The readout shows the formatted value, not a raw float.
+const tempReadout = findAll(modelPage, node => node.dataset && node.dataset.cbRole === 'range-value-temperature')[0];
+assert.ok(tempReadout, 'the temperature slider has no readout');
+assert.equal(tempReadout.textContent, tempField.format(core.readSettings().temperature));
+// Hint presets let the user jump to a documented value.
+const tempHints = findAll(modelPage, node => node.dataset && node.dataset.cbAction === 'settings-range-jump'
+    && node.dataset.settingKey === 'temperature');
+assert.equal(tempHints.length, tempField.hints.length, 'range hints are missing');
+
+// 7d. Every field row states its label, current value and help text.
+schema.allFields().forEach(field => {
+    const page = ui.renderSettingsPage(baseState({
+        folder: 'cb-settings',
+        settingsSection: field.sectionId,
+        settingsPage: field.pageId,
+        settings: core.readSettings()
+    }));
+    const row = findAll(page, node => node.dataset && node.dataset.cbSettingKey === field.key)[0];
+    assert.ok(row, `no row rendered for ${field.key}`);
+    assert.match(textOf(row), new RegExp(field.label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')),
+        `${field.key} row does not show its label`);
+    assert.match(textOf(row), new RegExp(field.help.split('.')[0].slice(0, 30).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')),
+        `${field.key} row does not show its help text`);
+    // The label is wired to the control.
+    const label = findAll(row, byTag('label'))[0];
+    assert.ok(label, `${field.key} row has no label element`);
+});
+
+// 7e. Sidebar navigation lists every section and page with live summaries.
+const navNode = settingsPageModule.renderSettingsNav(baseState({
+    folder: 'cb-settings', settingsSection: 'agent', settingsPage: 'planning',
+    settingsQuery: '', settings: core.readSettings()
+}));
+const navItems = findAll(navNode, byAction('settings-goto'));
+const expectedPages = schema.sections().reduce((total, section) => total + section.pages.length, 0);
+assert.equal(navItems.length, expectedPages, 'the sidebar does not list every settings page');
+navItems.forEach(item => {
+    assert.ok(item.dataset.sectionId && item.dataset.pageId, 'a nav item cannot navigate');
+});
+const activeNav = navItems.filter(item => String(item.className).includes('active'));
+assert.equal(activeNav.length, 1, 'exactly one nav item should be marked active');
+assert.equal(activeNav[0].dataset.pageId, 'planning');
+assert.equal(activeNav[0].getAttribute('aria-current'), 'page');
+// Summaries reflect real values, not static copy.
+assert.match(textOf(navNode), /Sequential lenses/, 'the planning summary does not report the stored value');
+const searchInput = findAll(navNode, node => node.dataset && node.dataset.cbRole === 'settings-search')[0];
+assert.ok(searchInput, 'the sidebar has no search field');
+assert.equal(searchInput.type, 'search');
+
+// 7f. Search finds a field by plain-language query and reports where it lives.
+const temperatureHits = schema.searchFields('temperature');
+assert.ok(temperatureHits.length, 'searching "temperature" found nothing');
+assert.equal(temperatureHits[0].key, 'temperature');
+assert.equal(temperatureHits[0].sectionId, 'agent');
+assert.equal(temperatureHits[0].pageId, 'model');
+
+const tabHits = schema.searchFields('tabs');
+assert.ok(tabHits.some(hit => hit.key === 'maxOpenTabs'), 'searching "tabs" did not find the tab limit');
+
+const tokenHits = schema.searchFields('token budget');
+assert.ok(
+    tokenHits.some(hit => hit.key === 'lensMaxOutputTokens') && tokenHits.some(hit => hit.key === 'documentMaxOutputTokens'),
+    'searching "token budget" did not find both token budgets'
+);
+assert.equal(schema.searchFields('zzzqqq-not-a-setting').length, 0, 'a nonsense query returned matches');
+
+// Searching renders results in the sidebar instead of the tree.
+const searchedNav = settingsPageModule.renderSettingsNav(baseState({
+    folder: 'cb-settings', settingsSection: 'agent', settingsPage: 'planning',
+    settingsQuery: 'temperature', settings: core.readSettings()
+}));
+const results = findAll(searchedNav, byAction('settings-focus'));
+assert.ok(results.length, 'an active search rendered no results');
+assert.equal(results[0].dataset.settingKey, 'temperature');
+assert.equal(findAll(searchedNav, byAction('settings-goto')).length, 0, 'the nav tree should be replaced while searching');
+assert.equal(findAll(searchedNav, byAction('clear-settings-search')).length, 1, 'no way to clear the search');
+
+// A query with no match says so instead of showing an empty pane.
+const emptyNav = settingsPageModule.renderSettingsNav(baseState({
+    folder: 'cb-settings', settingsSection: 'agent', settingsPage: 'planning',
+    settingsQuery: 'zzzqqq', settings: core.readSettings()
+}));
+assert.equal(findAll(emptyNav, byClass('cb-settings-results-empty')).length, 1, 'no empty state for a failed search');
+
+// 7g. Sub-page tabs appear only when a section has more than one page.
+const dataPage = ui.renderSettingsPage(baseState({
+    folder: 'cb-settings', settingsSection: 'data', settingsPage: 'storage', settings: core.readSettings()
+}));
+const dataSubTabs = findAll(dataPage, byAction('settings-goto'));
+assert.equal(dataSubTabs.length, 2, 'the Data section has two pages so both sub-tabs should render');
+const sourceLimitsPage = ui.renderSettingsPage(baseState({
+    folder: 'cb-settings', settingsSection: 'source', settingsPage: 'limits', settings: core.readSettings()
+}));
+assert.equal(findAll(sourceLimitsPage, byAction('settings-goto')).length, 0,
+    'a single-page section should not render sub-page tabs');
+
+// 7h. Read-only panels land on their own pages.
+assert.equal(findAll(dataPage, byClass('cb-metrics')).length, 1, 'the storage metrics strip is missing');
+assert.match(textOf(dataPage), /Documents/, 'the metrics strip does not report document counts');
+const tabsPage = ui.renderSettingsPage(baseState({
+    folder: 'cb-settings', settingsSection: 'workspace', settingsPage: 'tabs', settings: core.readSettings()
+}));
+assert.equal(findAll(tabsPage, byClass('cb-shortcuts')).length, 1, 'the shortcut reference is missing');
+const kbdCount = findAll(tabsPage, byTag('kbd')).length;
+assert.equal(kbdCount, ws.SHORTCUTS.length, 'not every shortcut is documented on the Tabs page');
+
+// 7i. Per-page reset restores just that page's fields.
+const resetButtons = findAll(modelPage, byAction('reset-settings-page'));
+assert.equal(resetButtons.length, 1, 'no per-page reset button');
+assert.equal(resetButtons[0].dataset.pageId, 'model');
+
+// 7j. Privacy claim: the settings surface states the workspace is untouched.
+assert.match(textOf(dataPage), /never read or written/i, 'settings must state that SimpleRAG data is untouched');
 
 // ---------------------------------------------------------------------------
 // 8. Nav + ribbon host surfaces
@@ -600,7 +935,12 @@ assert.match(textOf(toast), /Saved\./);
 // 10. No innerHTML carries model text anywhere in the rendered trees
 // ---------------------------------------------------------------------------
 
-[emptyAgent, busyAgent, msgAgent, filesPage, sourcePage, historyPage, settingsPage, listContent, modal, toast].forEach(root => {
+[
+    emptyAgent, busyAgent, msgAgent, filesPage, sourcePage, historyPage,
+    planningPage, modelPage, dataPage, tabsPage, sourceLimitsPage,
+    navNode, searchedNav, emptyNav,
+    listContent, modal, toast
+].forEach(root => {
     walk(root, node => {
         if (node.nodeType !== 1) return;
         const assigned = String(node.innerHTML || '');
@@ -619,9 +959,10 @@ walk(hostilePage, node => { if (node.nodeType === 1) hostileTags.push(node.tagNa
 });
 assert.match(textOf(hostilePage), /<img src=x onerror=alert\(1\)>/, 'hostile markup was dropped rather than shown as text');
 
-console.log('ui-render.test.cjs: 10 render groups passed');
+console.log('ui-render.test.cjs: 11 render groups passed');
 console.log(`  skill cards    : ${welcomeCards.length}`);
 console.log(`  step rows      : ${renderedSteps.length} (done/running/error/question/lens/document)`);
 console.log(`  tree rows      : ${treeRows.length} across nested docs/ and src/`);
+console.log(`  folder roots   : ${roots.length} roots, ${listedPaths.length} files listed across all of them`);
 console.log(`  nav sections   : ${navFolders.length}`);
 console.log('  innerHTML      : never assigned with content in any rendered tree');

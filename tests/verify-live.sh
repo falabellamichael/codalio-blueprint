@@ -31,7 +31,31 @@ PY
 echo
 echo "=== per-asset fetch + sha256 verification ==="
 fail=0
-for a in codalio-blueprint.css manifest.js controller-core.js skills.js agent.js ui.js controller.js; do
+# Derive the asset list from what the SERVED page actually injects, not from a
+# hardcoded list. A hardcoded list silently skips newly added modules, which is
+# exactly how a broken script would ship unverified.
+ASSETS=$(python - <<'PY'
+import re, pathlib
+html = pathlib.Path('gui.html').read_text(encoding='utf-8')
+names = re.findall(r'local-extensions/codalio-blueprint/([A-Za-z0-9._-]+)\?v=', html)
+# Preserve injection order, drop duplicates (each asset appears once per tag).
+seen, ordered = set(), []
+for name in names:
+    if name not in seen:
+        seen.add(name)
+        ordered.append(name)
+print(' '.join(ordered))
+PY
+)
+EXPECTED_COUNT=$(echo "$ASSETS" | wc -w)
+echo "injected assets   : $EXPECTED_COUNT"
+echo "$ASSETS" | tr ' ' '\n' | sed 's/^/    /'
+# 1 stylesheet + every declared script must all be present.
+if [ "$EXPECTED_COUNT" -lt 10 ]; then
+  echo "FAIL: expected at least 10 injected assets (1 css + 9 scripts), found $EXPECTED_COUNT"
+  fail=1
+fi
+for a in $ASSETS; do
   sha=$(grep -o "codalio-blueprint/$a?v=1.0.0&amp;sha256=[a-f0-9]\{64\}" gui.html | sed 's/.*sha256=//')
   if [ -z "$sha" ]; then echo "$a: NOT INJECTED"; fail=1; continue; fi
   code=$(curl -s -o "out.$a" -w "%{http_code}" "$BASE/local-extensions/codalio-blueprint/$a?v=1.0.0&sha256=$sha")
@@ -39,7 +63,16 @@ for a in codalio-blueprint.css manifest.js controller-core.js skills.js agent.js
   actual=$(sha256sum "out.$a" | cut -d' ' -f1)
   size=$(wc -c < "out.$a")
   if [ "$actual" = "$sha" ]; then match="HASH-OK"; else match="HASH-MISMATCH"; fail=1; fi
-  printf "%-24s http=%s %-28s %8s bytes %s\n" "$a" "$code" "$ctype" "$size" "$match"
+  # A wrong Content-Type makes the browser refuse to execute the script, so the
+  # page would silently do nothing. Assert the type matches the extension.
+  case "$a" in
+    *.css) want="text/css" ;;
+    *.js)  want="application/javascript" ;;
+    *)     want="" ;;
+  esac
+  if [ -n "$want" ] && [ "$ctype" != "$want" ]; then match="$match WRONG-MIME(want $want)"; fail=1; fi
+  if [ "$code" != "200" ]; then match="$match HTTP-$code"; fail=1; fi
+  printf "%-24s http=%s %-24s %8s bytes %s\n" "$a" "$code" "$ctype" "$size" "$match"
 done
 echo
 echo "=== fail-closed checks ==="

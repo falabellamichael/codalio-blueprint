@@ -36,6 +36,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import sys
 import zipfile
 from pathlib import Path
@@ -55,8 +56,12 @@ SCRIPT_SOURCES = [
     "manifest.js",
     "controller-core.js",
     "skills.js",
+    "settings.js",
     "agent.js",
+    "preview.js",
     "ui.js",
+    "workspace.js",
+    "settings-page.js",
     "controller.js",
 ]
 STYLE_SOURCES = ["codalio-blueprint.css"]
@@ -402,6 +407,107 @@ def command_package(out: Path) -> int:
     return 0
 
 
+def command_test(only: str | None, quick: bool) -> int:
+    """Run the full verification battery.
+
+    Node suites are DISCOVERED from tests/*.test.cjs rather than hardcoded, so a
+    suite added later cannot be silently skipped — the failure mode that let the
+    previewer ship untested. Static checks (string-literal corruption, CSS class
+    coverage, install freshness) run afterwards unless --quick.
+
+    --only NAME runs a single suite substring match, for iterating on one.
+    """
+    tests_dir = REPO_ROOT / "tests"
+    suites = sorted(tests_dir.glob("*.test.cjs"))
+    if not suites:
+        print("error: no tests/*.test.cjs suites found")
+        return 2
+
+    if only:
+        suites = [s for s in suites if only in s.name]
+        if not suites:
+            print(f"error: --only {only!r} matched no suite")
+            return 2
+
+    node = shutil.which("node") or "node"
+    print(f"=== node suites ({len(suites)}) ===")
+    failed: list[str] = []
+    for suite in suites:
+        result = subprocess.run(
+            [node, str(suite)],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=240,
+        )
+        status = "PASS" if result.returncode == 0 else "FAIL"
+        print(f"  {suite.name:<38} {status}")
+        if result.returncode != 0:
+            failed.append(suite.name)
+            # Show the tail so a failure is diagnosable without a re-run.
+            tail = "\n".join((result.stderr or result.stdout).strip().splitlines()[-12:])
+            if tail:
+                print("    " + tail.replace("\n", "\n    "))
+
+    if quick:
+        print()
+        return 1 if failed else 0
+
+    # ---- static checks --------------------------------------------------
+    # Each is a standalone script under tools/; run them the same way and treat a
+    # non-zero exit as a failure. These catch classes of bug the suites cannot:
+    # corrupted string literals, unstyled CSS, and a stale installed package.
+    static = [
+        ("string-literal integrity", "check_source.py"),
+        ("CSS class coverage", "check_css.py"),
+    ]
+    print()
+    print("=== static checks ===")
+    python = sys.executable or "python"
+    for label, script in static:
+        path = REPO_ROOT / "tools" / script
+        if not path.is_file():
+            print(f"  {label:<38} SKIP (no tools/{script})")
+            continue
+        env = dict(os.environ, PYTHONPATH="")
+        result = subprocess.run(
+            [python, str(path)], cwd=str(REPO_ROOT),
+            capture_output=True, text=True, timeout=120, env=env,
+        )
+        status = "PASS" if result.returncode == 0 else "FAIL"
+        print(f"  {label:<38} {status}")
+        if result.returncode != 0:
+            failed.append(label)
+            tail = "\n".join((result.stdout + result.stderr).strip().splitlines()[-12:])
+            if tail:
+                print("    " + tail.replace("\n", "\n    "))
+
+    # The install-freshness check only applies once the plug-in is installed; if
+    # the package dir is absent, report it as not-installed rather than a failure.
+    installcheck = REPO_ROOT / "tools" / "check_install.py"
+    if installcheck.is_file():
+        env = dict(os.environ, PYTHONPATH="")
+        result = subprocess.run(
+            [python, str(installcheck)], cwd=str(REPO_ROOT),
+            capture_output=True, text=True, timeout=120, env=env,
+        )
+        if "could not locate" in (result.stdout + result.stderr).lower():
+            print("  install freshness                     SKIP (not installed)")
+        else:
+            status = "PASS" if result.returncode == 0 else "FAIL"
+            print(f"  {'install freshness':<38} {status}")
+            if result.returncode != 0:
+                failed.append("install freshness")
+                print("    -> run: python tools/blueprint.py install")
+
+    print()
+    if failed:
+        print(f"FAILURES ({len(failed)}): {', '.join(failed)}")
+        return 1
+    print("all checks passed")
+    return 0
+
+
 def command_verify(simplerag: str | None) -> int:
     """Validate the manifest with SimpleRAG's own schema-v1 contract validator.
 
@@ -494,12 +600,20 @@ def main(argv: list[str]) -> int:
     )
     verify.add_argument("--simplerag", help="path to the SimpleRAG checkout")
 
+    test = sub.add_parser(
+        "test", help="run every test suite plus the static integrity checks"
+    )
+    test.add_argument("--only", help="run only suites whose name contains this string")
+    test.add_argument("--quick", action="store_true", help="node suites only; skip static checks")
+
     args = parser.parse_args(argv)
     if args.command == "package":
         out = Path(args.out) if args.out else REPO_ROOT / "dist" / f"{PLUGIN_ID}-{load_plugin_manifest()['version']}.zip"
         return command_package(out)
     if args.command == "verify":
         return command_verify(args.simplerag)
+    if args.command == "test":
+        return command_test(args.only, args.quick)
 
     home = extension_home(getattr(args, "extension_home", None))
     if args.command == "install":

@@ -14,13 +14,18 @@
     const core = window.__codalioBlueprintCore;
     const skills = window.__codalioBlueprintSkills;
 
+    // Fallbacks for headless runs; the live values come from settings
+    // (Agent -> Model -> Prompt preview length).
     const MAX_PROMPT_PREVIEW = 4000;
     const MAX_STEP_TEXT = 60000;
 
-    function promptPreview(prompt) {
+    function promptPreview(prompt, limit) {
         const text = String(prompt || '');
-        return text.length > MAX_PROMPT_PREVIEW
-            ? `${text.slice(0, MAX_PROMPT_PREVIEW)}\n\n… (${(text.length - MAX_PROMPT_PREVIEW).toLocaleString()} more characters)`
+        const max = Number.isFinite(Number(limit)) && Number(limit) > 0
+            ? Number(limit)
+            : MAX_PROMPT_PREVIEW;
+        return text.length > max
+            ? `${text.slice(0, max)}\n\n… (${(text.length - max).toLocaleString()} more characters)`
             : text;
     }
 
@@ -35,23 +40,39 @@
             kind: 'notice',
             label: '',
             summary: '',
+            substatus: '',
             status: 'pending',
             text: '',
+            thinking: '',
             promptPreview: '',
             error: '',
             open: false,
             startedAt: 0,
             elapsedMs: 0,
-            cancelId: ''
+            cancelId: '',
+            tokenCount: 0,
+            tokensPerSec: 0
         }, overrides || {});
     }
 
     function finishStep(step, status) {
         step.status = status;
         if (step.startedAt) step.elapsedMs = Date.now() - step.startedAt;
+        step.substatus = '';
         step.streaming = false;
         step.liveElement = null;
         return step;
+    }
+
+    /**
+     * Append the user's standing guidance to a system prompt. Guidance is set in
+     * Settings -> Documents -> Standing guidance and applies to every turn, so
+     * house style and hard constraints hold across the whole run.
+     */
+    function systemPromptWith(base, settings) {
+        const guidance = String((settings && settings.extraGuidance) || '').trim();
+        if (!guidance) return base;
+        return `${base}\n\n## Additional standing instructions from the user\n${guidance}`;
     }
 
     /**
@@ -59,10 +80,16 @@
      * DOM node so the user watches tokens arrive, exactly like an agent trace.
      */
     async function runModelStep(step, options, hooks) {
+        const settings = options.settings || core.readSettings();
         step.startedAt = Date.now();
+        step.elapsedMs = 0;
         step.status = 'running';
-        step.promptPreview = promptPreview(options.prompt);
+        step.substatus = options.substatus || 'Connecting to model endpoint…';
+        step.promptPreview = promptPreview(options.prompt, settings.maxPromptChars);
         step.streaming = true;
+        if (settings.expandRunningSteps !== false) {
+            step.open = true;
+        }
 
         const live = document.createElement('div');
         live.className = 'cb-markdown cb-streaming';
@@ -73,11 +100,31 @@
         live.appendChild(pre);
         step.liveElement = live;
 
+        const liveThinking = document.createElement('pre');
+        liveThinking.className = 'cb-pre cb-thinking-pre';
+        const thinkingCode = document.createElement('code');
+        liveThinking.appendChild(thinkingCode);
+        step.liveThinkingElement = liveThinking;
+
         let rendered = '';
+        let thinking = '';
         let lastRender = 0;
-        const scheduleRender = text => {
+        const scheduleRender = (text, isThinking) => {
             const now = Date.now();
-            if (now - lastRender < 90) return;
+            step.elapsedMs = now - step.startedAt;
+            const elapsedSec = step.elapsedMs / 1000;
+            const totalChars = (rendered ? rendered.length : 0) + (thinking ? thinking.length : 0);
+            if (elapsedSec > 0 && totalChars) {
+                step.tokenCount = Math.round(totalChars / 3.8);
+                step.tokensPerSec = Math.round(step.tokenCount / elapsedSec);
+            }
+            if (isThinking && step.liveThinkingElement) {
+                thinkingCode.textContent = thinking;
+                if (liveThinking.scrollHeight - liveThinking.scrollTop - liveThinking.clientHeight < 60) {
+                    liveThinking.scrollTop = liveThinking.scrollHeight;
+                }
+            }
+            if (now - lastRender < 80) return;
             lastRender = now;
             code.textContent = text;
             if (hooks && typeof hooks.onStream === 'function') hooks.onStream(step, text);
@@ -95,11 +142,19 @@
                 cancelId: options.cancelId,
                 onDelta: (_delta, fullText) => {
                     rendered = fullText;
-                    scheduleRender(fullText);
+                    step.substatus = 'Streaming response…';
+                    scheduleRender(fullText, false);
+                },
+                onThinking: (_delta, fullThinking) => {
+                    thinking = fullThinking;
+                    step.thinking = bounded(fullThinking);
+                    step.substatus = 'Reasoning & planning…';
+                    scheduleRender(rendered, true);
                 }
             });
             step.cancelId = result.cancelId || '';
             step.text = bounded(result.text || rendered);
+            step.thinking = bounded(result.thinking || thinking);
             step.finishReason = result.finishReason || '';
             if (result.usage) step.usage = result.usage;
             finishStep(step, 'done');
@@ -108,6 +163,7 @@
         } catch (error) {
             if (error && error.code === 'aborted') {
                 step.text = bounded(rendered);
+                step.thinking = bounded(thinking);
                 finishStep(step, 'error');
                 step.error = 'Stopped by the user.';
                 throw error;
@@ -115,6 +171,7 @@
             finishStep(step, 'error');
             step.error = String((error && error.message) || 'The model step failed.');
             step.text = bounded(rendered);
+            step.thinking = bounded(thinking);
             throw error;
         }
     }
@@ -146,14 +203,43 @@
         return found;
     }
 
-    function sourceFilesForModel(projectState) {
+    /**
+     * Select the attached source files that go into a prompt, honouring the
+     * limits from Settings -> Source files.
+     *
+     * Previously this compared against core.MAX_SOURCE_TOTAL_BYTES, which core
+     * never exported — so `total + bytes > undefined` was always false and the
+     * limit never applied. The caps are now read from settings, and a per-file
+     * cap is enforced too so one huge file cannot crowd out the rest.
+     */
+    function sourceFilesForModel(projectState, settings) {
+        const cfg = settings || core.readSettings();
+        if (cfg.includeSourceInPrompts === false) return [];
+
         const attached = Array.isArray(projectState.sourceFiles) ? projectState.sourceFiles : [];
+        const maxFiles = Number(cfg.maxSourceFiles) || 12;
+        const maxFileBytes = (Number(cfg.maxSourceFileKb) || 120) * 1024;
+        const maxTotalBytes = (Number(cfg.maxSourceTotalKb) || 420) * 1024;
+
         let total = 0;
         const selected = [];
+        const rejected = [];
+
         for (const file of attached) {
             if (!file || typeof file.content !== 'string') continue;
+            if (selected.length >= maxFiles) {
+                rejected.push({ path: file.path, reason: 'over the maximum file count' });
+                continue;
+            }
             const bytes = file.content.length;
-            if (total + bytes > core.MAX_SOURCE_TOTAL_BYTES) break;
+            if (bytes > maxFileBytes) {
+                rejected.push({ path: file.path, reason: `larger than ${Math.round(maxFileBytes / 1024)} KB` });
+                continue;
+            }
+            if (total + bytes > maxTotalBytes) {
+                rejected.push({ path: file.path, reason: 'would exceed the total size budget' });
+                continue;
+            }
             total += bytes;
             selected.push({
                 path: file.path,
@@ -161,6 +247,9 @@
                 lines: file.content.split('\n').length
             });
         }
+
+        selected.rejected = rejected;
+        selected.totalBytes = total;
         return selected;
     }
 
@@ -173,30 +262,104 @@
         return words ? words.replace(/[^\w\s-]/g, '').trim() || 'Untitled project' : 'Untitled project';
     }
 
-    function outputPathFor(skill, phase, meta) {
-        if (skill.perPhaseOutput && phase && phase.optional) {
-            const folder = (skill.outputFolders || {})[phase.optional] || skill.outputFolder || 'docs';
-            const nameFn = (skill.outputFileNames || {})[phase.optional];
-            const fileName = typeof nameFn === 'function' ? nameFn(meta) : `${meta.date}-${meta.slug}.md`;
-            return `${folder}/${fileName}`;
+    /**
+     * Resolve the output path, honouring Settings -> Documents -> Naming &
+     * folders. A skill's own outputFileName wins when it declares one, since the
+     * upstream naming is part of the skill contract; otherwise the configured
+     * date/slug style and folder layout apply.
+     */
+    function outputPathFor(skill, phase, meta, settings) {
+        const cfg = settings || core.readSettings();
+        const declaresOwnName = (phase && phase.optional && skill.outputFileNames && skill.outputFileNames[phase.optional])
+            || (!phase && typeof skill.outputFileName === 'function');
+
+        if (declaresOwnName) {
+            const folder = phase && phase.optional && skill.perPhaseOutput
+                ? ((skill.outputFolders || {})[phase.optional] || skill.outputFolder || 'docs')
+                : (skill.outputFolder || 'docs');
+            const nameFn = phase && phase.optional
+                ? (skill.outputFileNames || {})[phase.optional]
+                : skill.outputFileName;
+            const fileName = typeof nameFn === 'function' ? String(nameFn(meta) || '') : '';
+            const path = fileName ? core.joinPath(folder, fileName) : core.buildOutputPath(skill, phase, meta, cfg);
+            return core.withCollisionHandling(path, cfg);
         }
-        const folder = skill.outputFolder || 'docs';
-        const fileName = typeof skill.outputFileName === 'function'
-            ? skill.outputFileName(meta)
-            : `${meta.date}-${meta.slug}.md`;
-        return `${folder}/${fileName}`;
+        return core.buildOutputPath(skill, phase, meta, cfg);
     }
 
-    function applyDocumentHeader(document, meta, sourcePrdPath) {
-        let text = core.unwrapDocument(document);
-        text = text
-            .replace(/<Project Name>/g, meta.projectName)
-            .replace(/<date>/g, meta.date);
-        if (sourcePrdPath) {
-            text = text.replace(/`docs\/prd\/<source-prd-filename>`/g, `\`${sourcePrdPath}\``);
-            text = text.replace(/<source-prd-filename>/g, sourcePrdPath.split('/').pop());
+    /**
+     * Apply the deterministic cleanup pipeline before writing. Delegates to
+     * core.prepareDocument so the switches in Settings -> Documents -> Content
+     * handling (unwrap fences, trim preamble, substitute placeholders, add a
+     * provenance header) are the single source of truth.
+     */
+    function applyDocumentHeader(document, meta, sourcePrdPath, settings, skillName) {
+        return core.prepareDocument(document, {
+            date: meta && meta.date,
+            projectName: meta && meta.projectName,
+            sourcePrdPath: sourcePrdPath || '',
+            skillName: skillName || ''
+        }, settings);
+    }
+
+    /**
+     * The self-review pass: a REAL structural check over the document that was
+     * just written, against the sections the skill's own template demanded.
+     *
+     * Reports missing sections, leftover template placeholders, and sections
+     * that are present but too thin to be useful. Costs no model turn.
+     */
+    function reviewDocument(content, requiredSections) {
+        const body = String(content || '');
+        const wanted = Array.isArray(requiredSections) ? requiredSections : [];
+        const headings = [];
+        const headingPattern = /^#{1,6}\s+(.+?)\s*$/gm;
+        let match = null;
+        while ((match = headingPattern.exec(body)) !== null) {
+            headings.push(match[1].replace(/^[\d.]+\s*/, '').trim().toLowerCase());
         }
-        return text.trim();
+
+        const missing = [];
+        const present = [];
+        wanted.forEach(section => {
+            const needle = String(section).toLowerCase();
+            const found = headings.some(heading => heading === needle || heading.includes(needle));
+            if (found) present.push(section);
+            else missing.push(section);
+        });
+
+        // Leftover template placeholders mean the model echoed the contract
+        // instead of filling it in.
+        const placeholders = [];
+        const placeholderPattern = /<[^>\n]{2,60}>/g;
+        let token = null;
+        while ((token = placeholderPattern.exec(body)) !== null) {
+            const value = token[0];
+            if (value.includes('\n')) continue;
+            if (!placeholders.includes(value)) placeholders.push(value);
+            if (placeholders.length >= 12) break;
+        }
+
+        // A section with almost no content under it is thin.
+        const thin = [];
+        const blocks = body.split(/^#{1,6}\s+/m).slice(1);
+        blocks.forEach(block => {
+            const newline = block.indexOf('\n');
+            const title = (newline > 0 ? block.slice(0, newline) : block).replace(/^[\d.]+\s*/, '').trim();
+            const content = newline > 0 ? block.slice(newline + 1) : '';
+            const words = content.split(/\s+/).filter(Boolean).length;
+            if (words > 0 && words < 12) thin.push(`${title} (${words} words)`);
+        });
+
+        return {
+            headings: headings.length,
+            words: body.split(/\s+/).filter(Boolean).length,
+            present,
+            missing,
+            placeholders,
+            thin,
+            ok: missing.length === 0 && placeholders.length === 0
+        };
     }
 
     /**
@@ -271,6 +434,21 @@
      */
     async function runSkill(run, skill, input, hooks) {
         const settings = core.readSettings();
+        run.pipeline = [
+            { id: 'plan', label: 'Plan & Scope', status: 'running' },
+            { id: 'lenses', label: skill.multiLens ? 'Analytical Lenses' : 'Analysis', status: 'pending' },
+            { id: 'synthesis', label: 'Synthesis', status: 'pending' },
+            { id: 'review', label: 'Quality Check', status: 'pending' },
+            { id: 'artifacts', label: 'Artifacts', status: 'pending' }
+        ];
+        const updatePipeline = (id, status) => {
+            if (Array.isArray(run.pipeline)) {
+                const item = run.pipeline.find(p => p.id === id);
+                if (item) item.status = status;
+                core.saveRun(run);
+            }
+        };
+
         const emit = step => {
             run.phases.push(step);
             if (hooks && typeof hooks.onStep === 'function') hooks.onStep(step);
@@ -279,16 +457,19 @@
         const render = () => { if (hooks && typeof hooks.onRender === 'function') hooks.onRender(); };
 
         // ---- Announce ------------------------------------------------
-        const announce = makeStep({
-            kind: 'notice',
-            label: skill.announce,
-            summary: skill.tagline,
-            status: 'done',
-            text: skill.description,
-            open: false
-        });
-        emit(announce);
-        render();
+        // Settings -> Agent -> Planning -> "Announce the chosen skill".
+        if (settings.announceSkill !== false) {
+            const announce = makeStep({
+                kind: 'notice',
+                label: skill.announce,
+                summary: skill.tagline,
+                status: 'done',
+                text: skill.description,
+                open: false
+            });
+            emit(announce);
+            render();
+        }
 
         // ---- Project identity ---------------------------------------
         run.projectName = resolveProjectName(skill, input, run);
@@ -318,7 +499,7 @@
 
         // ---- Source requirement gate --------------------------------
         if (skill.requiresSource) {
-            const attached = sourceFilesForModel(input);
+            const attached = sourceFilesForModel(input, settings);
             if (!attached.length) {
                 const blocked = makeStep({
                     kind: 'notice',
@@ -385,6 +566,8 @@
         // ---- Lenses (multi-lens skills) -----------------------------
         const lensOutputs = {};
         if (skill.multiLens && Array.isArray(skill.lenses) && skill.lenses.length) {
+            updatePipeline('plan', 'done');
+            updatePipeline('lenses', 'running');
             const planNote = makeStep({
                 kind: 'notice',
                 label: settings.concurrency === 'parallel'
@@ -417,8 +600,13 @@
                 });
                 await runModelStep(step, {
                     prompt,
-                    systemPrompt: 'You are a product planning analyst. Follow the output contract exactly and return only the requested Markdown sections.',
+                    substatus: `Analyzing ${lens.label}…`,
+                    systemPrompt: systemPromptWith(
+                        'You are a product planning analyst. Follow the output contract exactly and return only the requested Markdown sections.',
+                        settings
+                    ),
                     maxOutputTokens: settings.lensMaxOutputTokens,
+                    temperature: settings.temperature,
                     signal: input.signal
                 }, { onRender: render, onStream: () => render() });
                 lensOutputs[lens.id] = step.text;
@@ -434,12 +622,19 @@
                 }
             }
             input.lensOutputs = lensOutputs;
+            updatePipeline('lenses', 'done');
             render();
+        } else {
+            updatePipeline('plan', 'done');
         }
 
         // ---- Phases --------------------------------------------------
+        updatePipeline('synthesis', 'running');
         const phaseOutputs = {};
         const writtenPaths = [];
+        // path + the phase that produced it, so the self-review can look up the
+        // phase's requiredSections even when collision handling bumped the path.
+        const writtenDocs = [];
         const phases = Array.isArray(skill.phases) ? skill.phases : [];
         const selectedOptions = Array.isArray(input.selectedOptions) ? input.selectedOptions : null;
 
@@ -457,8 +652,9 @@
                 continue;
             }
 
+            const isDoc = phase.kind === 'document';
             const step = makeStep({
-                kind: phase.kind === 'document' ? 'document' : 'phase',
+                kind: isDoc ? 'document' : 'phase',
                 label: phase.label,
                 summary: phase.summary,
                 icon: phase.icon
@@ -478,18 +674,30 @@
 
             await runModelStep(step, {
                 prompt,
-                systemPrompt: 'You are a product planning analyst. Follow the output contract exactly. Return only the requested Markdown, with no preamble.',
-                maxOutputTokens: phase.kind === 'document' ? settings.documentMaxOutputTokens : settings.lensMaxOutputTokens,
+                substatus: isDoc ? 'Synthesizing unified document…' : `Executing ${phase.label}…`,
+                systemPrompt: systemPromptWith(
+                    'You are a product planning analyst. Follow the output contract exactly. Return only the requested Markdown, with no preamble.',
+                    settings
+                ),
+                maxOutputTokens: isDoc ? settings.documentMaxOutputTokens : settings.lensMaxOutputTokens,
+                temperature: settings.temperature,
                 signal: input.signal
             }, { onRender: render, onStream: () => render() });
 
             phaseOutputs[phase.id] = step.text;
 
             if (phase.kind === 'document') {
-                const path = outputPathFor(skill, phase, meta);
-                const content = applyDocumentHeader(step.text, meta, input.sourcePrdPath);
+                const path = outputPathFor(skill, phase, meta, settings);
+                const content = applyDocumentHeader(
+                    step.text,
+                    meta,
+                    input.sourcePrdPath,
+                    settings,
+                    skill.name
+                );
                 const record = core.writeFile(path, content, { runId: run.id, skill: skill.id });
                 writtenPaths.push(path);
+                writtenDocs.push({ path, phase });
                 run.writtenPaths = writtenPaths.slice();
 
                 const writeStep = makeStep({
@@ -501,37 +709,190 @@
                     open: false
                 });
                 emit(writeStep);
+
+                // Let the page open (or refresh) an editor tab for this file.
+                if (hooks && typeof hooks.onFileWritten === 'function') {
+                    try { hooks.onFileWritten(path); } catch (_) { /* UI hook failed; the run continues */ }
+                }
                 if (settings.autoOpenWrittenDocument) core.setOpenPath(path);
                 render();
             }
             core.saveRun(run);
         }
 
-        // ---- Self-review + user review gate --------------------------
-        if (writtenPaths.length) {
+        // ---- Self-review ---------------------------------------------
+        updatePipeline('synthesis', 'done');
+        updatePipeline('review', 'running');
+        // A genuine structural check over what was actually written, against the
+        // sections this skill's own template demanded. No model turn is spent on
+        // it. Controlled by Settings -> Agent -> Planning -> Self-review pass.
+        const reviews = [];
+        if (writtenPaths.length && settings.selfReviewPass !== false) {
+            writtenDocs.forEach(doc => {
+                const record = core.readFile(doc.path);
+                if (!record) return;
+                // Use the phase recorded at write time: collision handling may
+                // have bumped the final path, so re-deriving it can fail to match.
+                const phase = doc.phase || null;
+                const required = (phase && Array.isArray(phase.requiredSections))
+                    ? phase.requiredSections
+                    : (Array.isArray(skill.requiredSections) ? skill.requiredSections : []);
+                const result = reviewDocument(record.content, required);
+                reviews.push({ path: doc.path, required, result });
+            });
+
+            reviews.forEach(review => {
+                const lines = [];
+                lines.push(`Checked \`${review.path}\` against the ${review.required.length} section${review.required.length === 1 ? '' : 's'} this skill's template requires.`);
+                lines.push('');
+                lines.push(`- Headings found: **${review.result.headings}**`);
+                lines.push(`- Words: **${review.result.words.toLocaleString()}**`);
+                lines.push(`- Required sections present: **${review.result.present.length}/${review.required.length}**`);
+
+                if (review.result.missing.length) {
+                    lines.push('');
+                    lines.push('**Missing sections:**');
+                    review.result.missing.forEach(section => { lines.push(`- ${section}`); });
+                }
+                if (review.result.placeholders.length) {
+                    lines.push('');
+                    lines.push('**Leftover template placeholders** (the contract was echoed instead of filled in):');
+                    review.result.placeholders.forEach(placeholder => { lines.push(`- \`${placeholder}\``); });
+                }
+                if (review.result.thin.length) {
+                    lines.push('');
+                    lines.push('**Sections thinner than 12 words** (likely need real content):');
+                    review.result.thin.forEach(entry => { lines.push(`- ${entry}`); });
+                }
+                if (review.result.ok && !review.result.thin.length) {
+                    lines.push('');
+                    lines.push('No missing sections and no leftover placeholders.');
+                }
+
+                const step = makeStep({
+                    kind: 'notice',
+                    label: review.result.ok
+                        ? `Self-review passed — ${review.path.split('/').pop()}`
+                        : `Self-review found gaps — ${review.path.split('/').pop()}`,
+                    summary: review.result.ok
+                        ? `${review.result.present.length}/${review.required.length} required sections present`
+                        : `${review.result.missing.length} missing · ${review.result.placeholders.length} placeholder${review.result.placeholders.length === 1 ? '' : 's'} left`,
+                    status: review.result.ok ? 'done' : 'error',
+                    text: lines.join('\n'),
+                    open: !review.result.ok,
+                    error: review.result.ok ? '' : 'The document is incomplete against its own template. Ask for a revision, or raise the document token budget if the run hit its output limit.'
+                });
+                emit(step);
+                render();
+            });
+        }
+        updatePipeline('review', 'done');
+        updatePipeline('artifacts', 'done');
+
+        // ---- User review gate ------------------------------------------
+        // Settings -> Agent -> Planning -> "End on a review gate".
+        if (writtenPaths.length && settings.requireReviewGate !== false) {
+            const failed = reviews.filter(review => !review.result.ok);
             const review = makeStep({
                 kind: 'notice',
-                label: 'Self-review complete — your review gate',
-                summary: `${writtenPaths.length} document${writtenPaths.length === 1 ? '' : 's'} written`,
+                label: 'Your review gate',
+                summary: `${writtenPaths.length} document${writtenPaths.length === 1 ? '' : 's'} written`
+                    + (failed.length ? ` · ${failed.length} with gaps` : ''),
                 status: 'done',
                 text: [
-                    'The skill re-read its own output once with fresh eyes: placeholder text, contradictions between sections, and user stories with no matching MVP line.',
-                    '',
                     `**Where the file${writtenPaths.length === 1 ? ' is' : 's are'}:**`,
                     ...writtenPaths.map(path => `- \`${path}\``),
                     '',
-                    'Please review before treating this as final. Tell me what to change and I will revise the document in place.'
+                    failed.length
+                        ? 'The self-review above flagged gaps. Read those before treating this as final.'
+                        : 'Blueprint wrote these to its own project store — nothing was added to your SimpleRAG workspace.',
+                    '',
+                    'Tell me what to change and I will revise the document in place.'
                 ].join('\n'),
                 open: true
             });
             emit(review);
         }
 
-        run.status = 'done';
+        const reviewFailed = reviews.some(review => !review.result.ok);
+        run.status = reviewFailed ? 'gaps' : 'done';
         run.writtenPaths = writtenPaths.slice();
+        run.reviews = reviews.map(review => ({
+            path: review.path,
+            ok: review.result.ok,
+            missing: review.result.missing,
+            placeholders: review.result.placeholders,
+            thin: review.result.thin
+        }));
         core.saveRun(run);
         render();
-        return { writtenPaths, meta };
+        return { writtenPaths, meta, reviews };
+    }
+
+    /**
+     * Autonomous gap repair pass: directly addresses missing sections flagged in review.
+     */
+    async function reviseDocumentGaps(run, targetPath, gaps, hooks, options) {
+        const settings = (options && options.settings) || core.readSettings();
+        const existing = core.readFile(targetPath);
+        if (!existing) throw new Error(`Target document ${targetPath} not found`);
+
+        const step = makeStep({
+            kind: 'document',
+            label: `Autonomous Gap Repair — ${targetPath.split('/').pop()}`,
+            summary: `Addressing ${((gaps && gaps.missing) || []).length} missing sections and placeholders`,
+            status: 'running',
+            open: true,
+            substatus: 'Drafting missing sections…'
+        });
+        run.phases.push(step);
+        if (hooks && typeof hooks.onStep === 'function') hooks.onStep(step);
+        core.saveRun(run);
+        if (hooks && typeof hooks.onRender === 'function') hooks.onRender();
+
+        const missingText = (gaps && gaps.missing && gaps.missing.length)
+            ? `- Missing sections: ${gaps.missing.join(', ')}`
+            : '';
+        const placeholderText = (gaps && gaps.placeholders && gaps.placeholders.length)
+            ? `- Placeholders to replace: ${gaps.placeholders.join(', ')}`
+            : '';
+
+        const prompt = [
+            'You are a senior product analyst and technical architect revising a document that had incomplete sections.',
+            '',
+            `Document: ${targetPath}`,
+            '',
+            '## Identified Gaps to Repair',
+            missingText,
+            placeholderText,
+            '',
+            '## Existing Content',
+            existing.content,
+            '',
+            'Task: Return the COMPLETE revised Markdown document with all missing sections fully written and placeholders completed.',
+            'Output contract: Return only the full revised Markdown document. No preamble.'
+        ].filter(Boolean).join('\n');
+
+        await runModelStep(step, {
+            prompt,
+            substatus: 'Writing revised sections…',
+            systemPrompt: systemPromptWith(
+                'You are a product planning analyst repairing document gaps. Follow instructions strictly.',
+                settings
+            ),
+            maxOutputTokens: settings.documentMaxOutputTokens || 8192,
+            temperature: settings.temperature,
+            signal: options && options.signal
+        }, hooks);
+
+        core.writeFile(targetPath, step.text, { runId: run.id, revised: true });
+        if (hooks && typeof hooks.onFileWritten === 'function') hooks.onFileWritten(targetPath);
+
+        const review = reviewDocument(step.text, (gaps && gaps.requiredSections) || []);
+        step.summary = review.ok ? 'All gaps repaired successfully' : `${review.missing.length} sections still missing`;
+        core.saveRun(run);
+        if (hooks && typeof hooks.onRender === 'function') hooks.onRender();
+        return { path: targetPath, review };
     }
 
     window.__codalioBlueprintAgent = Object.freeze({
@@ -541,10 +902,13 @@
         finishStep,
         runModelStep,
         runSkill,
+        reviseDocumentGaps,
         collectExistingDocs,
         sourceFilesForModel,
         outputPathFor,
         applyDocumentHeader,
+        reviewDocument,
+        systemPromptWith,
         promptPreview,
         bounded
     });

@@ -191,6 +191,17 @@
             outputFileName(meta) {
                 return `${meta.date}-${meta.slug}-prd.md`;
             },
+            // Checked by the self-review pass against the written document.
+            requiredSections: [
+                'Summary',
+                'Target User',
+                'User Stories',
+                'MVP Scope',
+                'Data & Architecture Overview',
+                'Go-to-Market',
+                'Open Questions',
+                'Appendix'
+            ],
             projectNameFrom(input) {
                 return deriveProjectName(input.idea, input.answers);
             }
@@ -260,6 +271,15 @@
             outputFileName(meta) {
                 return `${meta.date}-${meta.slug}-mvp-checklist.md`;
             },
+            requiredSections: [
+                'Context',
+                'Now (v1 scope)',
+                'Next',
+                'Later',
+                'Explicit Cut List',
+                'V1 Done-Criteria',
+                'Open Questions'
+            ],
             projectNameFrom(input) {
                 return deriveProjectName(input.idea, input.answers);
             }
@@ -372,6 +392,15 @@
             outputFileName(meta) {
                 return `${meta.date}-${meta.slug}-gtm-plan.md`;
             },
+            requiredSections: [
+                'Positioning',
+                'Target Market & Early Adopter',
+                'Channels (ranked)',
+                'Pricing',
+                'Launch Sequence',
+                'Success Metrics',
+                'Open Questions'
+            ],
             projectNameFrom(input) {
                 return deriveProjectName(input.idea, input.answers);
             }
@@ -497,6 +526,14 @@
             outputFileName(meta) {
                 return `${meta.date}-${meta.slug}-arch-evaluation.md`;
             },
+            requiredSections: [
+                'Requirements Being Evaluated Against',
+                'Current Architecture Summary',
+                'Gap Analysis',
+                'Tech Debt & Risks',
+                'Recommendation',
+                'Open Questions'
+            ],
             projectNameFrom(input) {
                 return deriveProjectName(input.idea, input.answers);
             }
@@ -522,6 +559,7 @@
                     summary: 'One backlog item per PRD user story, grouped by the PRD\u2019s Now/Next/Later scope.',
                     kind: 'document',
                     optional: 'backlog',
+                    requiredSections: ['Now', 'Next', 'Later'],
                     buildPrompt(input) {
                         return docPrompt(input, {
                             title: 'Backlog',
@@ -549,6 +587,7 @@
                     summary: 'One resource per core PRD entity, endpoints inferred from the user stories that act on it.',
                     kind: 'document',
                     optional: 'api-contract',
+                    requiredSections: ['API Contract Sketch'],
                     buildPrompt(input) {
                         return docPrompt(input, {
                             title: 'API Contract Sketch',
@@ -577,6 +616,13 @@
                     summary: 'Summary and target user from the PRD, MVP scope as "what exists today", open questions as "still evolving".',
                     kind: 'document',
                     optional: 'onboarding',
+                    requiredSections: [
+                        'What this is',
+                        'Who it\u2019s for',
+                        'What exists today',
+                        'What\u2019s still evolving',
+                        'Where to go deeper'
+                    ],
                     buildPrompt(input) {
                         return docPrompt(input, {
                             title: 'Onboarding Doc',
@@ -705,6 +751,15 @@
             outputFileName(meta) {
                 return `${meta.date}-${meta.slug}-prd-reconstructed.md`;
             },
+            requiredSections: [
+                'Summary',
+                'Target User',
+                'Capabilities As Built',
+                'Core Entities & Relationships',
+                'Main Flows',
+                'Constraints & Assumptions',
+                'Open Questions'
+            ],
             projectNameFrom(input) {
                 return deriveProjectName(input.idea, input.answers);
             }
