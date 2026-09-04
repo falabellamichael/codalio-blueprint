@@ -414,7 +414,7 @@
             description: 'Assess whether an existing codebase\u2019s architecture can support a specific set of stated requirements, and name the tech debt and risks standing in the way.',
             multiLens: false,
             requiresSource: true,
-            sourceHint: 'Attach the source you want evaluated (Add file in the project tree, or paste key modules). The skill must read the actual code — directory layout, data model, integration points, and how the current architecture handles the load closest to the new requirement — and must not evaluate from a README or file names alone.',
+            sourceHint: 'Import the project folder (Import Folder in the project tree) or attach the key modules. With Settings -> Source files -> Whole-codebase reading set to "Whole codebase", Blueprint maps every file in the project and sends the highest-value modules in full. The skill must read the actual code — directory layout, data model, integration points, and how the current architecture handles the load closest to the new requirement — and must not evaluate from a README or file names alone.',
             clarifying: [
                 { id: 'requirements', question: 'What must the codebase now support — new scale, a compliance need, a must-integrate-with system, or a business/contract requirement?' },
                 { id: 'decision', question: 'What decision does this evaluation feed: go/no-go, refactor-vs-rewrite, or a scoping estimate?' },
@@ -675,10 +675,10 @@
             description: 'Reconstruct a PRD-style document from an existing codebase instead of a described idea — for a project that shipped without one, or needs its requirements documented after the fact.',
             multiLens: false,
             requiresSource: true,
-            sourceHint: 'Attach the codebase you want documented (Add file in the project tree, or paste the key modules). Everything in the output must be inferred from what the code actually does.',
+            sourceHint: 'Import the project folder (Import Folder in the project tree) or attach the key modules. With Settings -> Source files -> Whole-codebase reading set to "Whole codebase", Blueprint maps every file in the project and sends the highest-value modules in full. Everything in the output must be inferred from what the code actually does.',
             clarifying: [
                 { id: 'audience', question: 'Who is this reconstructed PRD for — new team members, an acquirer, or a compliance/audit reader?' },
-                { id: 'scope', question: 'Should it cover the whole codebase, or one subsystem?' }
+                { id: 'scope', question: 'Should it cover the whole codebase, or one subsystem? (Name the folder or module — in "Whole codebase" reading mode that limits which files are mapped, e.g. "just the comfy subsystem".)' }
             ],
             phases: [
                 {
@@ -798,12 +798,56 @@
         ].join('\n');
     }
 
+    /**
+     * Render the source a skill sends to the model.
+     *
+     * In digest mode the array carries `.digestText` — the structural map of the
+     * WHOLE project — and `.digestStats`. The map is rendered FIRST, because it
+     * is the part that gives the model the system's shape; the verbatim files
+     * that follow are the deep-dive into the highest-value modules.
+     *
+     * The map is labelled with its own coverage numbers so the model can tell
+     * what it has not seen and say so, rather than inventing structure.
+     */
     function sourceBlock(sourceFiles) {
         const files = Array.isArray(sourceFiles) ? sourceFiles.filter(Boolean) : [];
-        if (!files.length) {
+        const digestText = sourceFiles && sourceFiles.digestText;
+        const stats = sourceFiles && sourceFiles.digestStats;
+
+        if (!files.length && !digestText) {
             return '\n\n## Attached source\n\n(no source attached)';
         }
-        const parts = ['\n\n## Attached source'];
+
+        const parts = [];
+
+        if (digestText) {
+            const coverage = stats && Number.isFinite(stats.coverage)
+                ? Math.round(stats.coverage * 100) : 100;
+            parts.push('\n\n## Codebase map (structural digest of the whole project)');
+            parts.push('');
+            parts.push(`This is a digest of every file in the project, not a selection: `
+                + `${stats ? stats.filesDigested.toLocaleString() : ''} files mapped `
+                + `(${coverage}% in full structural detail).`
+                + (stats && stats.excluded
+                    ? ` ${stats.excluded.toLocaleString()} vendored/minified bundle(s) were excluded.`
+                    : '')
+                + (stats && stats.trimmed
+                    ? ` ${stats.trimmed.toLocaleString()} file(s) were reduced to a one-line entry to fit the budget.`
+                    : ''));
+            parts.push('');
+            parts.push('Each entry lists the file\'s imports, classes, function signatures, '
+                + 'HTTP routes, host-extension registrations and command tables. '
+                + 'Full text follows for the highest-value modules only. '
+                + 'Where you need a file\'s body and it is not included below, say so '
+                + 'explicitly in the gaps/unknowns section instead of inferring its contents.');
+            parts.push('');
+            parts.push(digestText);
+            parts.push('');
+            parts.push('## Full source of the highest-value modules');
+        } else {
+            parts.push('\n\n## Attached source');
+        }
+
         files.forEach(file => {
             parts.push('', `### ${file.path} (${file.lines} lines)`, '', '```', file.content, '```');
         });

@@ -312,6 +312,178 @@
     }
 
     /**
+     * Turn a clarifying "scope" answer into a path filter.
+     *
+     * This is the fix for a real contradiction: code-to-prd asks "Should it
+     * cover the whole codebase, or one subsystem?" and the answer used to become
+     * PROSE ONLY — the model was told "one subsystem" while the pipeline
+     * attached whatever it attached. The answer now decides which files the
+     * digest covers.
+     *
+     * Returns { active, fragments, matched, note }:
+     *   active    false when the answer means "everything" (the default)
+     *   fragments path substrings extracted from the answer
+     *   matched   count of project files the filter selected (filled by caller)
+     *   note      human explanation for the run trace when the filter matched
+     *             nothing, so a silent no-op can never look like a whole-project
+     *             digest
+     */
+    function deriveScopeFilter(answers) {
+        const answer = (Array.isArray(answers) ? answers : [])
+            .find(item => item && item.id === 'scope');
+        const text = String((answer && answer.answer) || '').trim();
+        if (!text) return { active: false, fragments: [], note: '' };
+
+        if (/^(whole|entire|all|everything|full|complete|both)\b/i.test(text)
+            || /\b(whole|entire|everything|all of it|full codebase|entire codebase|complete codebase)\b/i.test(text)) {
+            return { active: false, fragments: [], note: '' };
+        }
+
+        // Quoted names win: a user writing `the "comfy" subsystem` means comfy.
+        const quoted = Array.prototype.map.call(
+            text.match(/["“'`]([^"“”'`]{2,60})["”'`]/g) || [],
+            item => item.slice(1, -1).trim()
+        ).filter(Boolean);
+
+        const words = text
+            .replace(/["“”'`]/g, ' ')
+            .split(/[^\w./-]+/)
+            .map(item => item.trim().replace(/^[./-]+|[./-]+$/g, ''))
+            .filter(item => item.length >= 3)
+            .filter(item => !/^(subsystem|sub-system|system|module|part|section|area|cover|scope|only|just|one|the|and|for|specific|folder|directory|piece|component)$/i.test(item));
+
+        const fragments = [];
+        quoted.concat(words).forEach(item => {
+            const lower = String(item).toLowerCase();
+            if (lower && fragments.indexOf(lower) < 0) fragments.push(lower);
+        });
+
+        if (!fragments.length) return { active: false, fragments: [], note: '' };
+        return {
+            active: true,
+            fragments,
+            note: `Scope answer "${text}" limited the digest to paths matching: `
+                + fragments.join(', ') + '.'
+        };
+    }
+
+    /**
+     * Whole-codebase digest mode.
+     *
+     * Reads EVERY file in the active project folder from the plug-in's own
+     * store and digests it to structure, then spends the remaining budget on
+     * verbatim text for the highest-value code files. Returns the same array
+     * shape sourceFilesForModel() always has, so every downstream consumer
+     * (the requiresSource gate, the "Reading N files" step, sourceBlock) works
+     * unchanged, with two extra properties for the digest:
+     *
+     *   .digestText  — the structural map of the whole project, rendered by
+     *                  skills.sourceBlock() BEFORE the verbatim source
+     *   .digestStats — counts for the run trace and the toast
+     *
+     * Manually attached files are ALWAYS included verbatim, ahead of the
+     * scored picks: an explicit user choice outranks the heuristic.
+     */
+    function sourceFilesFromDigest(projectState, cfg) {
+        const activeFolderId = projectState.activeFolderId
+            || (core.store && core.store.activeFolderId);
+
+        // Blueprint's own generated documents are its output, not the codebase
+        // under analysis — prefer everything else, but fall back to all files
+        // when a project contains only documents. Same preference the attached
+        // path has always used, so the two modes cannot disagree about scope.
+        const allPaths = core.listFiles(activeFolderId).length
+            ? core.listFiles(activeFolderId)
+            : core.listFiles();
+        const sourcePaths = allPaths.filter(item => !String(item).startsWith('docs/'));
+        let targetPaths = sourcePaths.length ? sourcePaths : allPaths;
+
+        // The clarifying "scope" answer narrows the digest to a subsystem.
+        // A filter that matches NOTHING is ignored rather than allowed to
+        // produce an empty digest: the user still gets a whole-project map, and
+        // the run trace says the filter did not apply.
+        const scopeFilter = deriveScopeFilter(projectState.answers);
+        let scopeApplied = false;
+        let scopeMatched = 0;
+        if (scopeFilter.active) {
+            const narrowed = targetPaths.filter(item => {
+                const lower = String(item).toLowerCase();
+                return scopeFilter.fragments.some(fragment => lower.indexOf(fragment) >= 0);
+            });
+            scopeMatched = narrowed.length;
+            if (narrowed.length) {
+                targetPaths = narrowed;
+                scopeApplied = true;
+            }
+        }
+
+        const records = targetPaths.map(item => {
+            const record = core.readFile(item);
+            return record ? { path: record.path, content: record.content } : null;
+        }).filter(Boolean);
+
+        if (!records.length) return [];
+
+        const digest = core.buildCodebaseDigest(records, {
+            budgetTokens: Number(cfg.digestBudgetTokens) || 16000,
+            minFullTextLines: Number(cfg.digestMinFullTextLines) || 40
+        });
+
+        // Files the user attached by hand, which the digest may not have picked.
+        const manual = (Array.isArray(projectState.sourceFiles) ? projectState.sourceFiles : [])
+            .filter(Boolean)
+            .map(item => ({
+                path: String(item.path || ''),
+                content: typeof item.content === 'string' ? item.content : ''
+            }))
+            .filter(item => item.path && item.content && digest.fullTextFiles.indexOf(item.path) < 0);
+
+        const selected = [];
+        manual.forEach(item => {
+            selected.push({
+                path: item.path,
+                content: item.content,
+                lines: item.content.split('\n').length
+            });
+        });
+        digest.fullTextFiles.forEach(item => {
+            const record = core.readFile(item);
+            if (!record || typeof record.content !== 'string') return;
+            selected.push({
+                path: record.path,
+                content: record.content,
+                lines: record.content.split('\n').length
+            });
+        });
+
+        selected.rejected = [];
+        selected.totalBytes = selected.reduce((total, item) => total + item.content.length, 0);
+        selected.digestText = digest.digestText;
+        selected.digestStats = {
+            filesScanned: records.length,
+            filesDigested: digest.fileCount,
+            coverage: digest.coverage,
+            trimmed: digest.trimmed,
+            deepened: digest.deepened,
+            excluded: digest.excluded,
+            tier1Tokens: digest.tier1Tokens,
+            tier2Tokens: digest.tier2Tokens,
+            tokens: digest.tokens,
+            budget: digest.budget,
+            fullTextFiles: selected.length,
+            manualAttachments: manual.length,
+            // Whether the clarifying "scope" answer actually narrowed the
+            // digest, and how many files it selected. Surfaced so a no-match
+            // is visible instead of silently producing a whole-project map.
+            scopeApplied,
+            scopeMatched,
+            scopeFragments: scopeFilter.fragments,
+            scopeNote: scopeFilter.note
+        };
+        return selected;
+    }
+
+    /**
      * Select the attached source files that go into a prompt, honouring the
      * limits from Settings -> Source files.
      *
@@ -319,10 +491,23 @@
      * never exported — so `total + bytes > undefined` was always false and the
      * limit never applied. The caps are now read from settings, and a per-file
      * cap is enforced too so one huge file cannot crowd out the rest.
+     *
+     * In digest mode (Settings -> Source files -> Whole-codebase reading) the
+     * selection is delegated to sourceFilesFromDigest(), which replaces the
+     * file-count/byte caps with a token budget covering the whole project.
      */
     function sourceFilesForModel(projectState, settings) {
         const cfg = settings || core.readSettings();
         if (cfg.includeSourceInPrompts === false) return [];
+
+        // Whole-codebase digest mode: the structural digest decides BOTH what
+        // is described and which files get their full text attached, so the
+        // attach limits below (maxSourceFiles/maxSourceTotalKb) do not apply.
+        // Those limits describe how much manually attached source may crowd a
+        // prompt; the digest has its own token budget for exactly that purpose.
+        if (cfg.sourceContextMode === 'digest') {
+            return sourceFilesFromDigest(projectState, cfg);
+        }
 
         let attached = Array.isArray(projectState.sourceFiles) ? projectState.sourceFiles.filter(Boolean) : [];
 
@@ -624,12 +809,35 @@
             const stopped = new core.BlueprintAbort('Stopped during the clarifying questions.');
             throw stopped;
         }
-        input.answers = answers;
+        // MERGE rather than replace. Assigning `answers` outright discarded any
+        // answers the caller had already supplied, which mattered most when
+        // clarifying questions are turned OFF: askClarifyingQuestions() then
+        // returns [], so a pre-supplied answer (a resumed run, or a caller
+        // narrowing scope to one subsystem) was silently wiped and the run
+        // proceeded as if the user had said nothing.
+        //
+        // Precedence: an answer gathered in THIS run wins over a pre-supplied one
+        // for the same question id, because the user just typed it. Answers for
+        // questions that were not asked survive.
+        const supplied = Array.isArray(input.answers) ? input.answers.filter(Boolean) : [];
+        const merged = supplied.slice();
+        answers.forEach(fresh => {
+            if (!fresh || !fresh.id) return;
+            const existing = merged.findIndex(item => item && item.id === fresh.id);
+            if (existing >= 0) merged[existing] = fresh;
+            else merged.push(fresh);
+        });
+        input.answers = merged;
 
         // ---- Source requirement gate --------------------------------
         if (skill.requiresSource) {
             const attached = sourceFilesForModel(input, settings);
-            if (!attached.length) {
+            const stats = attached.digestStats;
+            // In digest mode a structural map alone IS source: a project made
+            // only of stylesheets and documents yields no verbatim picks, and
+            // refusing to run would hide the map that does describe it.
+            const hasSource = attached.length > 0 || Boolean(attached.digestText);
+            if (!hasSource) {
                 const blocked = makeStep({
                     kind: 'notice',
                     label: 'Waiting for source',
@@ -646,18 +854,68 @@
                 throw failure;
             }
             input.sourceFiles = attached;
-            const summaryPaths = attached.map(file => file.path);
-            const summaryText = summaryPaths.slice(0, 6).join(', ') + (summaryPaths.length > 6 ? ` (+${summaryPaths.length - 6} more)` : '');
-            const listed = makeStep({
-                kind: 'notice',
-                label: `Reading ${attached.length} project source file${attached.length === 1 ? '' : 's'}`,
-                summary: summaryText,
-                status: 'done',
-                text: attached.map(file => `- \`${file.path}\` — ${file.lines} lines (read-only)`).join('\n'),
-                open: false
-            });
-            emit(listed);
-            render();
+
+            // The run trace must show the DIFFERENCE between the two modes.
+            // In digest mode the honest description is "mapped every file, read
+            // N in full" — reporting only N would imply the model saw N files of
+            // a larger project, which is exactly the misunderstanding that made
+            // the old cap confusing.
+            if (stats) {
+                const coveragePct = Number.isFinite(stats.coverage) ? Math.round(stats.coverage * 100) : 100;
+                const traceLines = [];
+                // Say what the scope answer did FIRST, because that is the thing
+                // the user was told would matter and previously did not.
+                if (stats.scopeApplied) {
+                    traceLines.push(`Scope: ${stats.scopeMatched.toLocaleString()} file(s) matched "`
+                        + stats.scopeFragments.join(', ') + '" from your answer.');
+                } else if (stats.scopeFragments && stats.scopeFragments.length) {
+                    traceLines.push(`Scope: your answer named "${stats.scopeFragments.join(', ')}" `
+                        + 'but no project path matched it, so the whole project was mapped instead.');
+                }
+                traceLines.push(
+                    `Whole-codebase digest: ${stats.filesScanned.toLocaleString()} project file(s) scanned, `
+                        + `${stats.filesDigested.toLocaleString()} mapped (${coveragePct}% in full structural detail).`,
+                    `${attached.length.toLocaleString()} file(s) sent verbatim within a `
+                        + `${stats.budget.toLocaleString()}-token budget `
+                        + `(structure ${stats.tier1Tokens.toLocaleString()} + full text ${stats.tier2Tokens.toLocaleString()}).`
+                );
+                if (stats.excluded) {
+                    traceLines.push(`${stats.excluded.toLocaleString()} vendored/minified bundle(s) excluded.`);
+                }
+                if (stats.trimmed) {
+                    traceLines.push(`${stats.trimmed.toLocaleString()} file(s) reduced to a one-line entry to fit the budget.`);
+                }
+                if (stats.manualAttachments) {
+                    traceLines.push(`${stats.manualAttachments.toLocaleString()} manually attached file(s) always included.`);
+                }
+                traceLines.push('');
+                traceLines.push('Sent in full:');
+                attached.forEach(file => {
+                    traceLines.push(`- \`${file.path}\` — ${file.lines.toLocaleString()} lines`);
+                });
+                emit(makeStep({
+                    kind: 'notice',
+                    label: `Mapped ${stats.filesDigested.toLocaleString()} project files, reading ${attached.length.toLocaleString()} in full`,
+                    summary: `${coveragePct}% of the codebase mapped · ${stats.tokens.toLocaleString()} tokens`,
+                    status: 'done',
+                    text: traceLines.join('\n'),
+                    open: false
+                }));
+                render();
+            } else {
+                const summaryPaths = attached.map(file => file.path);
+                const summaryText = summaryPaths.slice(0, 6).join(', ') + (summaryPaths.length > 6 ? ` (+${summaryPaths.length - 6} more)` : '');
+                const listed = makeStep({
+                    kind: 'notice',
+                    label: `Reading ${attached.length} project source file${attached.length === 1 ? '' : 's'}`,
+                    summary: summaryText,
+                    status: 'done',
+                    text: attached.map(file => `- \`${file.path}\` — ${file.lines} lines (read-only)`).join('\n'),
+                    open: false
+                });
+                emit(listed);
+                render();
+            }
         }
 
         // ---- Existing docs the skill reads --------------------------
@@ -1038,6 +1296,8 @@
         reviseDocumentGaps,
         collectExistingDocs,
         sourceFilesForModel,
+        sourceFilesFromDigest,
+        deriveScopeFilter,
         outputPathFor,
         applyDocumentHeader,
         reviewDocument,

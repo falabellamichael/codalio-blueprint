@@ -647,6 +647,72 @@
                             ]
                         }
                     ]
+                },
+                {
+                    id: 'digest',
+                    label: 'Whole-codebase reading',
+                    icon: 'fa-sitemap',
+                    summary: settings => settings.sourceContextMode === 'digest'
+                        ? `Whole project · ${settings.digestBudgetTokens.toLocaleString()} token budget`
+                        : 'Attached files only',
+                    groups: [
+                        {
+                            id: 'mode',
+                            label: 'What the code-reading skills see',
+                            icon: 'fa-layer-group',
+                            note: 'A whole codebase cannot be attached verbatim — a real 6 MB project is roughly 1.6 million tokens, far past any context window. Digest mode solves that by sending STRUCTURE for every file (imports, classes, function signatures, HTTP routes, host-extension registrations, command tables) plus the full text of the highest-value files. That covers 100% of your own source within a budget that actually fits, so answering "whole codebase" means something.',
+                            fields: [
+                                {
+                                    key: 'sourceContextMode',
+                                    label: 'Source context mode',
+                                    type: 'segmented',
+                                    options: [
+                                        {
+                                            value: 'attached',
+                                            label: 'Attached only',
+                                            icon: 'fa-paperclip',
+                                            hint: 'Send just the files you attached, capped by the attach limits. The original behaviour.'
+                                        },
+                                        {
+                                            value: 'digest',
+                                            label: 'Whole codebase',
+                                            icon: 'fa-sitemap',
+                                            hint: 'Digest every file in the active project folder, plus full text of the highest-value code files. Vendored and minified bundles are excluded.'
+                                        }
+                                    ],
+                                    help: 'Applies to the code-reading skills (Architecture Evaluation, Code to PRD). Digest mode reads the whole project instead of only the attached files.'
+                                }
+                            ]
+                        },
+                        {
+                            id: 'budget',
+                            label: 'Digest budget',
+                            icon: 'fa-gauge-high',
+                            note: 'Prompt evaluation is the real cost, not the context window. Measured on an RX 6750 XT with a 4B model, long prompts evaluate at roughly 95 tokens per second: 16,000 tokens is about 2.7 minutes, 32,000 about 5, and 65,000 about 11. Raising this buys coverage at the price of wall-clock time on every code-reading step.',
+                            fields: [
+                                {
+                                    key: 'digestBudgetTokens',
+                                    label: 'Token budget',
+                                    type: 'number',
+                                    min: 2048,
+                                    max: 65536,
+                                    step: 1024,
+                                    unit: 'tokens',
+                                    help: 'Total source tokens the digest may occupy. About 62% goes to structure (all files) and the rest to full file text. ~16,000 balances coverage against a ~2.7 minute prompt evaluation.'
+                                },
+                                {
+                                    key: 'digestMinFullTextLines',
+                                    label: 'Minimum lines for full text',
+                                    type: 'number',
+                                    min: 1,
+                                    max: 2000,
+                                    step: 1,
+                                    unit: 'lines',
+                                    help: 'A file must be at least this long to spend budget on full text rather than only its digest. Keeps tiny stubs from crowding out the modules that explain the system.'
+                                }
+                            ]
+                        }
+                    ]
                 }
             ]
         },

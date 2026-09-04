@@ -159,6 +159,18 @@
         maxSourceTotalKb: 2048,
         includeSourceInPrompts: true,
 
+        // Source files -> Whole-codebase digest
+        // 'attached' = only the manually attached files, capped by the limits
+        //   above (the v1 behaviour).
+        // 'digest'   = the whole project folder, as a structural digest plus
+        //   verbatim text for the highest-value code files.
+        sourceContextMode: 'attached',
+        // 16,000 tokens measured at ~2.7 min of prompt evaluation on the
+        // target GPU (95 tok/s at long prompts). 32K was ~5 min, which is where
+        // a planning step stops feeling responsive.
+        digestBudgetTokens: 16000,
+        digestMinFullTextLines: 40,
+
         // Data -> Storage & privacy
         showStorageUsage: true
     };
@@ -206,13 +218,20 @@
         settings.maxSourceFileKb = boundedInt(settings.maxSourceFileKb, 8, 2048, DEFAULT_SETTINGS.maxSourceFileKb);
         settings.maxSourceTotalKb = boundedInt(settings.maxSourceTotalKb, 32, 16384, DEFAULT_SETTINGS.maxSourceTotalKb);
         settings.autoCompactThreshold = boundedInt(settings.autoCompactThreshold, 2, 20, DEFAULT_SETTINGS.autoCompactThreshold);
+        // Upper bound 65536: at the measured 95 tok/s for long prompts, ~16K is
+        // ~2.7 min of prompt evaluation and 65K is ~11 min. Allowing more would
+        // let a user configure a step that looks hung. The lower bound 2048
+        // keeps room for a usable digest of a small project.
+        settings.digestBudgetTokens = boundedInt(settings.digestBudgetTokens, 2048, 65536, DEFAULT_SETTINGS.digestBudgetTokens);
+        settings.digestMinFullTextLines = boundedInt(settings.digestMinFullTextLines, 1, 2000, DEFAULT_SETTINGS.digestMinFullTextLines);
 
         const enums = {
             fileNameStyle: ['date-slug', 'slug-date', 'slug'],
             overwriteExistingFile: ['ask', 'version', 'overwrite'],
             folderLayout: ['skill-folders', 'flat'],
             defaultViewerMode: ['preview', 'source'],
-            readingWidth: ['narrow', 'wide', 'full']
+            readingWidth: ['narrow', 'wide', 'full'],
+            sourceContextMode: ['attached', 'digest']
         };
         Object.keys(enums).forEach(key => {
             if (!enums[key].includes(settings[key])) settings[key] = DEFAULT_SETTINGS[key];
@@ -1188,6 +1207,550 @@
     }
 
     // ------------------------------------------------------------------
+    // Codebase digest (whole-project structural map)
+    //
+    // WHY THIS EXISTS
+    // The code-reading skills (Architecture Evaluation, Code to PRD) ask the
+    // user "whole codebase, or one subsystem?" — but the answer only became
+    // prose in the prompt while the attachment path physically capped at
+    // maxSourceFiles. Answering "whole codebase" therefore changed nothing.
+    //
+    // A whole codebase cannot be attached verbatim: measured on a real 6 MB /
+    // 118-file project that is ~1.6M tokens, against a practical prompt budget
+    // of ~16K tokens (prompt eval measured at 95-192 tok/s on the target GPU,
+    // so 16K is ~2-3 min and 113K would be ~20 min).
+    //
+    // What DOES fit is structure. Digesting every file to its imports, classes,
+    // function signatures, HTTP routes, host-extension registrations and
+    // slash-command tables compresses ~19.5x with no model and no GPU cost, and
+    // covers 100% of first-party files. Tier 2 then spends what is left on the
+    // FULL TEXT of the highest-value files, so the model reads real code, not
+    // only names — the skills explicitly forbid inferring architecture from
+    // file names alone.
+    // ------------------------------------------------------------------
+
+    /** Extensions whose content is code worth full-text attachment in Tier 2. */
+    const CODE_EXTENSIONS = [
+        'js', 'mjs', 'cjs', 'jsx', 'ts', 'tsx', 'py', 'rb', 'go', 'rs', 'java',
+        'kt', 'c', 'h', 'cpp', 'cc', 'hpp', 'cs', 'php', 'swift', 'sh', 'sql',
+        'vue', 'svelte'
+    ];
+
+    /** Symbol caps tried, cheapest first, when deepening Tier 1. */
+    const DEPTH_LADDER = [25, 60, 120];
+
+    /** Directory names that mark third-party code, at any depth. */
+    const VENDOR_DIR_PATTERN = /^(vendor|vendors|third[-_]?party|bower_components|external)$/i;
+
+    /** File names that read like an entry point and deserve priority. */
+    const ENTRY_FILE_NAMES = [
+        'main.py', 'app.py', 'router.py', 'settings.py', 'config.py', '__init__.py',
+        'app.js', 'main.js', 'index.js', 'index.ts', 'package.json', 'README.md'
+    ];
+
+    function uniqueInOrder(list) {
+        const seen = [];
+        list.forEach(item => { if (seen.indexOf(item) < 0) seen.push(item); });
+        return seen;
+    }
+
+    function isVendoredPath(relativePath) {
+        return String(relativePath).split('/').some(part => VENDOR_DIR_PATTERN.test(part));
+    }
+
+    /**
+     * Minified bundles are generated artifacts: thousands of tokens of
+     * unreadable noise that crowd real source out of the budget. Detected by a
+     * `.min.` name or by absurd average line length.
+     */
+    function isMinifiedSource(relativePath, content) {
+        if (/\.min\.[a-z0-9]+$/i.test(String(relativePath))) return true;
+        const text = String(content || '');
+        if (!text) return false;
+        const lines = Math.max(1, text.split('\n').length);
+        return text.length / lines > 600;
+    }
+
+    function extractPythonStructure(content) {
+        const text = String(content || '');
+        const out = { classes: [], functions: [], routes: [], imports: [] };
+        const re = /^class\s+(\w+)\s*(?:\(([^)]*)\))?:|^(?:async\s+)?def\s+(\w+)\s*\(([^)]*)\)|^(\s+)(?:async\s+)?def\s+(\w+)\s*\(([^)]*)\)/gm;
+        let match;
+        while ((match = re.exec(text)) !== null) {
+            if (match[1]) {
+                out.classes.push(match[1] + (match[2] ? '(' + String(match[2]).trim().slice(0, 40) + ')' : ''));
+            } else if (match[3]) {
+                out.functions.push(match[3] + '(' + String(match[4] || '').trim().slice(0, 50) + ')');
+            } else if (match[6]) {
+                // An indented def: a method. Keep the leading dot so a reader
+                // can tell methods from module-level functions.
+                out.functions.push('.' + match[6] + '(' + String(match[7] || '').trim().slice(0, 50) + ')');
+            }
+        }
+        out.routes = extractRoutes(text);
+        out.imports = Array.prototype.map.call(
+            text.match(/^(?:from\s+[\w.]+\s+import|import\s+[\w.]+)/gm) || [],
+            line => line.replace(/^from\s+/, '').replace(/^import\s+/, '').split(/\s+/)[0]
+        ).slice(0, 14);
+        return out;
+    }
+
+    /**
+     * HTTP routes, as "GET /path". The METHOD is uppercased but the path is
+     * preserved exactly — an earlier chained-replace version uppercased the
+     * whole match and produced "ROUTER.GET /TASKS", which cannot be matched
+     * against a real endpoint.
+     *
+     * Handles both decorator style (Python: `@router.get("/tasks")`) and call
+     * style (JS/Express: `router.get('/tasks', handler)`), so the leading `@`
+     * is optional.
+     */
+    function extractRoutes(text) {
+        const routes = [];
+        const re = /@?\s*\b(?:app|router|api|\w*[rR]outer)\s*\.\s*(get|post|put|delete|patch|head|options)\s*\(\s*['"`](\/[^'"`]*)['"`]/g;
+        let match;
+        while ((match = re.exec(String(text || ''))) !== null) {
+            routes.push(match[1].toUpperCase() + ' ' + match[2]);
+        }
+        return routes;
+    }
+
+    function extractJsStructure(content) {
+        const text = String(content || '');
+        const out = { classes: [], functions: [], routes: [], imports: [], registers: [], commands: [] };
+        const re = /^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(([^)]*)\)|^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\(([^)]*)\)|([A-Za-z_$][\w$]*))\s*=>|^\s*(?:export\s+)?(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)(?:\s+extends\s+([\w$.]+))?/gm;
+        let match;
+        while ((match = re.exec(text)) !== null) {
+            if (match[1]) out.functions.push(match[1] + '(' + String(match[2] || '').trim().slice(0, 50) + ')');
+            else if (match[3]) out.functions.push(match[3] + '(' + String(match[4] || match[5] || '').trim().slice(0, 50) + ')');
+            else if (match[6]) out.classes.push(match[6] + (match[7] ? ' extends ' + match[7] : ''));
+        }
+        // Declarative slash-command tables carry real product behaviour and are
+        // invisible to a function/class-only scan. NOT line-anchored: the real
+        // shape is `{ command: "/help", title: … }`, so a `{` precedes the key.
+        const slash = Array.prototype.map.call(
+            text.match(/(?:^|[{,\s])command:\s*['"`][^'"`]+['"`]/g) || [],
+            item => {
+                const m = /command:\s*['"`]([^'"`]+)['"`]/.exec(item);
+                return m ? m[1] : '';
+            }
+        ).filter(Boolean);
+        if (slash.length) {
+            const uniq = uniqueInOrder(slash);
+            out.commands.push(uniq.length + ' slash commands: ' + uniq.slice(0, 8).join(', ')
+                + (uniq.length > 8 ? ', …' : ''));
+        }
+        // Host extension registrations describe capabilities and handlers.
+        const registerStarts = [];
+        const regRe = /register(?:Controller|Manifest)\s*\(\s*\{/g;
+        let rm;
+        while ((rm = regRe.exec(text)) !== null) registerStarts.push(rm.index);
+        registerStarts.forEach(start => {
+            const slice = text.slice(start, start + 2000);
+            const pluginId = /pluginId:\s*['"`]([^'"`]+)['"`]/.exec(slice);
+            const caps = /capabilities:\s*\[([^\]]*)\]/.exec(slice);
+            const handlers = uniqueInOrder(Array.prototype.map.call(
+                slice.match(/^\s*['"][\w.]+['"]\s*:\s*(?:context|ctx|\()/gm) || [],
+                line => line.replace(/^\s*['"]/, '').replace(/['"]\s*:.*$/, '')
+            ));
+            out.registers.push({
+                pluginId: pluginId ? pluginId[1] : '',
+                capabilities: caps
+                    ? caps[1].split(',').map(item => item.trim().replace(/['"]/g, '')).filter(Boolean)
+                    : [],
+                handlers
+            });
+        });
+        out.routes = extractRoutes(text);
+        out.imports = Array.prototype.map.call(
+            text.match(/(?:^|\n)\s*(?:import\s+[^'"]*from\s+|const\s+\w+\s*=\s*require\(\s*)['"][^'"]+['"]/g) || [],
+            line => {
+                const m = /['"]([^'"]+)['"]\s*$/.exec(line);
+                return m ? m[1] : '';
+            }
+        ).filter(Boolean).slice(0, 14);
+        return out;
+    }
+
+    function extractCssStructure(content) {
+        const text = String(content || '');
+        const selectors = Array.prototype.map.call(
+            text.match(/(^|\})\s*[^{}@][^{}]*\{/g) || [],
+            chunk => chunk.replace(/^\}/, '').replace(/\{$/, '').trim().replace(/\s+/g, ' ')
+        ).filter(item => item && item.length < 200);
+        const vars = Array.prototype.map.call(
+            text.match(/(--[\w-]+)\s*:/g) || [], m => m.replace(/\s*:$/, '')
+        );
+        const atRules = Array.prototype.map.call(
+            text.match(/@(?:media|supports|keyframes|font-face|import)/g) || [], m => m
+        );
+        return { selectors, vars, atRules: uniqueInOrder(atRules) };
+    }
+
+    function extractHtmlStructure(content) {
+        const text = String(content || '');
+        const grab = pattern => Array.prototype.map.call(text.match(pattern) || [], m => {
+            const inner = /["']([^"']+)["']/.exec(m);
+            return inner ? inner[1] : '';
+        }).filter(Boolean);
+        return {
+            scripts: grab(/<script[^>]*src=["'][^"']+["']/g),
+            styles: grab(/<link[^>]*href=["'][^"']+["']/g),
+            ids: uniqueInOrder(grab(/\sid=["'][\w-]+["']/g).map(item => '#' + item)).slice(0, 20),
+            actions: uniqueInOrder(grab(/data-(?:cb-action|action)=["'][\w-]+["']/g)).slice(0, 20)
+        };
+    }
+
+    function extractMarkdownStructure(content) {
+        const text = String(content || '');
+        return Array.prototype.map.call(
+            text.match(/^#{1,4}\s+.+$/gm) || [], line => line.trim()
+        );
+    }
+
+    function extractJsonStructure(content) {
+        try {
+            const parsed = JSON.parse(String(content || ''));
+            if (Array.isArray(parsed)) return ['array of ' + parsed.length];
+            if (parsed && typeof parsed === 'object') return Object.keys(parsed);
+            return [];
+        } catch (_) {
+            return [];
+        }
+    }
+
+    /**
+     * Digest one file to a structural summary.
+     *
+     * `depth` is the symbol cap: adaptive depth lets high-value files (entry
+     * points, heavily referenced, large) list more symbols than a leaf file,
+     * which is how 100% coverage fits a fixed budget without flattening the
+     * files that actually explain the architecture.
+     */
+    function digestFileStructure(relativePath, content, depth) {
+        const text = String(content || '');
+        const lines = text.split('\n').length;
+        const extension = String(relativePath).split('.').pop().toLowerCase();
+        const head = `### ${relativePath} (${lines.toLocaleString()} lines)`;
+        const cap = Math.max(6, Math.round(Number(depth) || 8));
+
+        if (isVendoredPath(relativePath)) {
+            return { text: head + '\n[vendored third-party library — excluded from analysis]', value: 0, excluded: true };
+        }
+        if (isMinifiedSource(relativePath, text)) {
+            return { text: head + '\n[generated or minified bundle — excluded from analysis]', value: 0, excluded: true };
+        }
+        if (/^(css|scss|sass|less)$/.test(extension)) {
+            const css = extractCssStructure(text);
+            const parts = [head];
+            parts.push('[stylesheet] ' + css.selectors.length + ' selectors'
+                + (css.vars.length ? ', ' + css.vars.length + ' vars (' + css.vars.slice(0, 6).join(', ') + ')' : '')
+                + (css.atRules.length ? ', ' + css.atRules.join(', ') : ''));
+            if (css.selectors.length) {
+                parts.push('key selectors: ' + uniqueInOrder(css.selectors).slice(0, Math.round(cap / 2)).join(', '));
+            }
+            return { text: parts.join('\n'), value: 1, excluded: false };
+        }
+
+        const parts = [head];
+        let value = 0;
+
+        /** Append a deduped, capped symbol list. Symbols repeat in real files
+         *  (router.py declared the same request models twice) — deduping keeps
+         *  the digest honest and shorter. */
+        const addList = (label, symbols, weight) => {
+            const uniq = uniqueInOrder(Array.isArray(symbols) ? symbols : []);
+            if (!uniq.length) return;
+            value += weight;
+            parts.push(label + ' (' + uniq.length + '): '
+                + uniq.slice(0, cap).join('; ') + (uniq.length > cap ? '; …' : ''));
+        };
+
+        if (extension === 'py') {
+            const py = extractPythonStructure(text);
+            if (py.imports.length) { parts.push('imports: ' + uniqueInOrder(py.imports).join(', ')); value += 1; }
+            addList('ROUTES', py.routes, 3);
+            addList('classes', py.classes, 2);
+            addList('functions', py.functions, 2);
+        } else if (CODE_EXTENSIONS.indexOf(extension) >= 0
+            || ['jsx', 'tsx', 'vue', 'svelte', 'html', 'htm'].indexOf(extension) >= 0
+            || /^(js|mjs|cjs)$/.test(extension)) {
+            if (/^(html|htm)$/.test(extension)) {
+                const html = extractHtmlStructure(text);
+                if (html.scripts.length) { parts.push('scripts: ' + uniqueInOrder(html.scripts).join(', ')); value += 2; }
+                if (html.styles.length) { parts.push('stylesheets: ' + uniqueInOrder(html.styles).join(', ')); value += 1; }
+                if (html.ids.length) { parts.push('ids: ' + html.ids.join(', ')); value += 1; }
+                if (html.actions.length) { parts.push('UI actions: ' + html.actions.join(', ')); value += 2; }
+            } else {
+                const js = extractJsStructure(text);
+                if (js.imports.length) { parts.push('imports: ' + uniqueInOrder(js.imports).join(', ')); value += 1; }
+                js.registers.forEach(register => {
+                    value += 3;
+                    const bits = [];
+                    if (register.pluginId) bits.push('pluginId=' + register.pluginId);
+                    if (register.capabilities.length) bits.push('capabilities=' + register.capabilities.join('+'));
+                    if (register.handlers.length) bits.push('handlers=' + register.handlers.slice(0, 10).join(','));
+                    parts.push('HOST EXTENSION: ' + bits.join(' '));
+                });
+                if (js.commands.length) { parts.push('COMMANDS: ' + js.commands.join(' | ')); value += 2; }
+                addList('ROUTES', js.routes, 3);
+                addList('classes', js.classes, 2);
+                addList('functions', js.functions, 2);
+            }
+        } else if (extension === 'json') {
+            addList('keys', extractJsonStructure(text), 1);
+        } else if (/^(md|txt)$/.test(extension)) {
+            const headings = extractMarkdownStructure(text);
+            if (headings.length) {
+                value += 1;
+                parts.push(headings.slice(0, cap).join('\n') + (headings.length > cap ? '\n…' : ''));
+            } else {
+                value += 1;
+                parts.push('[prose document, no headings]');
+            }
+        } else {
+            value += 1;
+            parts.push('[' + (extension || 'unknown') + ' file — no structural extractor]');
+        }
+
+        if (!value) {
+            value = 1;
+            parts.push('[no extractable structure — data or config]');
+        }
+        return { text: parts.join('\n'), value, excluded: false };
+    }
+
+    /**
+     * Score files so the budget goes where the architecture is explained.
+     *
+     * Signals, each chosen because it was observed to matter on a real project:
+     *   - entry-point file names and module roots (router.py, app.js, main.py)
+     *   - how many OTHER files in the project import this one — the strongest
+     *     signal available without running anything, and the one that surfaces a
+     *     hub like router.py above 60 leaf controllers
+     *   - file size, weakly, since bigger modules carry more behaviour
+     *   - stylesheets and vendor/minified are pushed DOWN, not merely excluded:
+     *     223K tokens of CSS was the single biggest waste measured
+     */
+    function scoreFilesForDigest(records) {
+        const byBase = {};
+        records.forEach(record => {
+            const path = String(record.path || '');
+            const noExt = path.replace(/\.(?:js|mjs|cjs|jsx|ts|tsx|py|vue|svelte)$/, '');
+            if (!(noExt in byBase)) byBase[noExt] = path;
+            const base = noExt.split('/').pop();
+            if (!(base in byBase)) byBase[base] = path;
+            const leaf = path.split('/').pop();
+            if (!(leaf in byBase)) byBase[leaf] = path;
+        });
+
+        const references = {};
+        records.forEach(record => {
+            const path = String(record.path || '');
+            const extension = path.split('.').pop().toLowerCase();
+            const structure = extension === 'py'
+                ? extractPythonStructure(record.content)
+                : extractJsStructure(record.content);
+            (structure.imports || []).forEach(specifier => {
+                const normalized = String(specifier)
+                    .replace(/^\.\.?\//, '')
+                    .replace(/\.(?:js|py|ts|mjs|cjs)$/, '');
+                const hit = byBase[normalized] || byBase[normalized.split('/').pop()];
+                if (hit && hit !== path) references[hit] = (references[hit] || 0) + 1;
+            });
+        });
+
+        return records.map(record => {
+            const path = String(record.path || '');
+            const leaf = path.split('/').pop();
+            const extension = leaf.split('.').pop().toLowerCase();
+            const lines = String(record.content || '').split('\n').length;
+            let score = 0;
+            if (isVendoredPath(path) || isMinifiedSource(path, record.content)) score -= 100;
+            if (ENTRY_FILE_NAMES.indexOf(leaf) >= 0) score += 6;
+            if (/^(router|main|app|index|controller|core|server|agent)\b/i.test(leaf)) score += 4;
+            score += Math.min(8, (references[path] || 0) * 2);
+            score += Math.min(2, lines / 1500);
+            if (/^(css|scss|sass|less)$/.test(extension)) score -= 2;
+            return {
+                path,
+                content: String(record.content || ''),
+                lines,
+                extension,
+                references: references[path] || 0,
+                score
+            };
+        }).sort((left, right) => right.score - left.score);
+    }
+
+    /**
+     * Build a whole-codebase digest that fits a token budget.
+     *
+     * Tier 1 (structural, ~62% of budget): every first-party file is digested,
+     * so coverage is 100% and the model can name any file it wants to read.
+     * Adaptive depth spends the remaining Tier-1 room on the highest-scoring
+     * files; if Tier 1 overflows, the LOWEST-scoring files degrade to a
+     * one-line stub rather than being dropped, keeping coverage total.
+     *
+     * Tier 2 (verbatim, the rest): full text of the highest-scoring CODE files
+     * that fit. Restricted to code and to files >= 40 lines, because in
+     * calibration an unrestricted Tier 2 spent 32% of the whole budget on two
+     * HTML files while the file that actually explained the system (router.py)
+     * could never fit.
+     *
+     * Returns { digestText, fullTextFiles, tokens, coverage, trimmed, deepened,
+     * excluded, files } — `files` carries per-file digests for the UI to show
+     * what the model was given.
+     */
+    function buildCodebaseDigest(records, options) {
+        const cfg = Object.assign({ budgetTokens: 16000, minFullTextLines: 40 }, options || {});
+        const budget = Math.max(512, Number(cfg.budgetTokens) || 16000);
+        const tier1Budget = Math.round(budget * 0.62);
+        const tier2Budget = Math.max(0, budget - tier1Budget - 200);
+        const minLines = Math.max(1, Number(cfg.minFullTextLines) || 40);
+
+        const input = (Array.isArray(records) ? records : [])
+            .filter(record => record && typeof record.content === 'string' && record.path);
+        const scored = scoreFilesForDigest(input);
+        const real = scored.filter(file => file.score > -50);
+
+        const digests = real.map(file => Object.assign({}, file, {
+            digest: digestFileStructure(file.path, file.content, 8),
+            trimmed: false
+        }));
+
+        let tier1Tokens = digests.reduce((total, item) => total + estimateTokens(item.digest.text), 0);
+
+        // Files dropped from the map entirely because even one-line stubs did
+        // not fit. Named in the digest so the model (and the user) knows the map
+        // is incomplete rather than trusting it as whole.
+        const omitted = [];
+
+        // Adaptive depth: deepen the highest-scoring files while room remains.
+        let deepened = 0;
+        if (tier1Tokens < tier1Budget) {
+            for (let i = 0; i < digests.length && tier1Tokens < tier1Budget; i += 1) {
+                const item = digests[i];
+                for (let d = 0; d < DEPTH_LADDER.length; d += 1) {
+                    const candidate = digestFileStructure(item.path, item.content, DEPTH_LADDER[d]);
+                    const added = estimateTokens(candidate.text) - estimateTokens(item.digest.text);
+                    if (added <= 0 || tier1Tokens + added > tier1Budget) break;
+                    tier1Tokens += added;
+                    item.digest = candidate;
+                    deepened += 1;
+                }
+            }
+        } else {
+            // Over budget: degrade the LOWEST-scoring files to a stub, from the
+            // bottom up, so nothing disappears from the map entirely.
+            for (let i = digests.length - 1; i >= 0 && tier1Tokens > tier1Budget; i -= 1) {
+                const item = digests[i];
+                const stub = `### ${item.path} (${item.lines.toLocaleString()} lines) [digest trimmed to fit budget]`;
+                tier1Tokens += estimateTokens(stub) - estimateTokens(item.digest.text);
+                item.digest = { text: stub, value: item.digest.value, excluded: item.digest.excluded };
+                item.trimmed = true;
+            }
+            // A large project can exceed the budget even after EVERY file is a
+            // one-line stub (400 files x ~20 tokens is already ~8,000). The
+            // budget is a hard guarantee — it exists because prompt evaluation
+            // is the real wall-clock cost — so the remaining overflow drops the
+            // lowest-scoring entries outright and the digest says how many.
+            // Silently overrunning would turn a 2-minute step into a 20-minute
+            // one, which is exactly the failure the budget was added to prevent.
+            while (tier1Tokens > tier1Budget && digests.length > 1) {
+                const dropped = digests.pop();
+                tier1Tokens -= estimateTokens(dropped.digest.text);
+                omitted.push(dropped.path);
+            }
+        }
+
+        // Tier 2: verbatim text for substantial code files, highest score first.
+        const fullTextFiles = [];
+        let tier2Tokens = 0;
+        for (let i = 0; i < digests.length; i += 1) {
+            const item = digests[i];
+            if (CODE_EXTENSIONS.indexOf(item.extension) < 0) continue;
+            if (item.lines < minLines) continue;
+            const tokens = estimateTokens(item.content);
+            // A single file may not eat more than 75% of Tier 2, or one giant
+            // module crowds out every other file the model might need.
+            if (tokens > tier2Budget * 0.75) continue;
+            if (tier2Tokens + tokens > tier2Budget) break;
+            tier2Tokens += tokens;
+            fullTextFiles.push(item.path);
+        }
+
+        const excluded = scored.length - real.length;
+
+        // Tell the reader the map is incomplete, and name what is missing.
+        // Bounded to a handful of paths so the note itself cannot blow the
+        // budget on a project that omitted hundreds of files; its token cost is
+        // charged against Tier 1, dropping more entries if that overflows.
+        let omissionNote = '';
+        if (omitted.length) {
+            const named = omitted.slice(0, 8).map(item => '`' + item + '`').join(', ');
+            omissionNote = `[${omitted.length.toLocaleString()} further file(s) were left out of this map `
+                + `to stay within the ${budget.toLocaleString()}-token budget: ${named}`
+                + (omitted.length > 8 ? `, and ${(omitted.length - 8).toLocaleString()} more` : '')
+                + '. They exist in the project but were not examined — do not assume their contents.]';
+            let noteTokens = estimateTokens(omissionNote);
+            while (tier1Tokens + noteTokens > tier1Budget && digests.length > 1) {
+                const dropped = digests.pop();
+                tier1Tokens -= estimateTokens(dropped.digest.text);
+                omitted.unshift(dropped.path);
+                const renamed = omitted.slice(0, 8).map(item => '`' + item + '`').join(', ');
+                omissionNote = `[${omitted.length.toLocaleString()} further file(s) were left out of this map `
+                    + `to stay within the ${budget.toLocaleString()}-token budget: ${renamed}`
+                    + (omitted.length > 8 ? `, and ${(omitted.length - 8).toLocaleString()} more` : '')
+                    + '. They exist in the project but were not examined — do not assume their contents.]';
+                noteTokens = estimateTokens(omissionNote);
+            }
+            tier1Tokens += noteTokens;
+        }
+
+        const digestText = (omissionNote
+            ? digests.map(item => item.digest.text).concat([omissionNote])
+            : digests.map(item => item.digest.text)
+        ).join('\n\n');
+        // Coverage counts only files present in the map with full structural
+        // detail. Trimmed stubs and omitted files both reduce it, so a digest
+        // that had to give up on a large project cannot claim to be complete.
+        const coverage = real.length
+            ? digests.filter(item => !item.trimmed).length / real.length
+            : 0;
+
+        return {
+            digestText,
+            fullTextFiles,
+            tokens: tier1Tokens + tier2Tokens,
+            tier1Tokens,
+            tier2Tokens,
+            budget,
+            coverage,
+            trimmed: digests.filter(item => item.trimmed).length,
+            deepened,
+            excluded,
+            // Files that made it into the map at all (full or stubbed).
+            fileCount: digests.length,
+            // Files dropped entirely because the budget could not hold even a
+            // one-line entry for them.
+            omitted: omitted.slice(),
+            omittedCount: omitted.length,
+            // Everything scanned before exclusions and budget cuts.
+            scannedCount: scored.length,
+            files: digests.map(item => ({
+                path: item.path,
+                lines: item.lines,
+                references: item.references,
+                score: item.score,
+                tokens: estimateTokens(item.digest.text),
+                trimmed: item.trimmed,
+                includedInFull: fullTextFiles.indexOf(item.path) >= 0
+            }))
+        };
+    }
+
+    // ------------------------------------------------------------------
     // Runs
     // ------------------------------------------------------------------
 
@@ -2138,6 +2701,12 @@
         canPickDirectoryHandle,
         collectFilesFromDirectoryHandle,
         describeFsError,
+        buildCodebaseDigest,
+        digestFileStructure,
+        scoreFilesForDigest,
+        isVendoredPath,
+        isMinifiedSource,
+        CODE_EXTENSIONS,
         IMPORTABLE_EXTENSIONS,
         IMPORT_SKIP_DIRS,
         relativePathOf,

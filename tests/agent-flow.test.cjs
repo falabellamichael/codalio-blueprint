@@ -611,6 +611,59 @@ async function main() {
     assert.equal(requests.length, 0, 'a stopped question run must not call the model');
     core.writeSettings(Object.assign({}, core.DEFAULT_SETTINGS, { concurrency: 'sequential', askClarifyingQuestions: false }));
 
+    // ---- 3b. Caller-supplied answers survive when questions are off ------
+    //
+    // Regression: runSkill() used to do `input.answers = answers` outright. With
+    // clarifying questions OFF, askClarifyingQuestions() returns [], so a
+    // caller-supplied answer (a resumed run, or a scope narrowing) was wiped and
+    // the run proceeded as if the user had said nothing. Answers must MERGE, and
+    // a fresh answer to the SAME question id must still win over a stale one.
+    requests.length = 0;
+    core.store.files = {};
+    core.writeStore();
+    let seenPrompt = '';
+    const mergeRun = core.createRun(skill, 'A tool for tracking garden tools.');
+    await agent.runSkill(mergeRun, skill, {
+        idea: 'A tool for tracking garden tools.',
+        // Supplied up front, with questions OFF, so nothing re-asks them.
+        answers: [
+            { id: 'user', question: 'Who is this for?', answer: 'community gardeners' },
+            { id: 'problem', question: 'What problem?', answer: 'tools go missing' }
+        ],
+        signal: new AbortController().signal
+    }, { onRender() {}, onStep() {}, onStream() {} });
+    seenPrompt = requests[0].message;
+    assert.ok(seenPrompt.indexOf('community gardeners') >= 0,
+        'a caller-supplied clarifying answer was discarded before reaching the prompt');
+    assert.ok(seenPrompt.indexOf('tools go missing') >= 0,
+        'a second caller-supplied answer was discarded');
+
+    // With questions ON, a freshly gathered answer to the same id must WIN over
+    // a stale pre-supplied one — the user just typed the newer value.
+    requests.length = 0;
+    core.store.files = {};
+    core.writeStore();
+    core.writeSettings(Object.assign({}, core.DEFAULT_SETTINGS, {
+        concurrency: 'sequential', askClarifyingQuestions: true
+    }));
+    const freshRun = core.createRun(skill, 'A tool for tracking garden tools.');
+    await agent.runSkill(freshRun, skill, {
+        idea: 'A tool for tracking garden tools.',
+        answers: [{ id: 'user', question: 'Who is this for?', answer: 'STALE answer' }],
+        signal: new AbortController().signal
+    }, {
+        onRender() {}, onStep() {}, onStream() {},
+        askQuestion: async (step, question) => question.id === 'user'
+            ? 'FRESH answer from the user'
+            : 'some other answer'
+    });
+    const freshPrompt = requests[0].message;
+    assert.ok(freshPrompt.indexOf('FRESH answer from the user') >= 0,
+        'a freshly gathered answer did not reach the prompt');
+    assert.ok(freshPrompt.indexOf('STALE answer') < 0,
+        'a stale pre-supplied answer overrode the one the user just gave');
+    core.writeSettings(Object.assign({}, core.DEFAULT_SETTINGS, { concurrency: 'sequential', askClarifyingQuestions: false }));
+
     // ---- 4. Stop/cancel aborts the run ---------------------------------
     requests.length = 0;
     core.store.files = {};
@@ -776,10 +829,217 @@ async function main() {
         'the user was not told which PRD was used'
     );
 
-    console.log('agent-flow.test.cjs: 10 run-flow groups passed');
+    // ---- 11. Whole-codebase digest reaches the model, and scope narrows it --
+    //
+    // Groups 7-8 prove the ATTACHED path works. These prove the digest path
+    // does, end to end: that the structural map lands in the real prompt, that
+    // answering "one subsystem" actually narrows it (it used to be prose only),
+    // and that a project with no verbatim picks still runs instead of being
+    // refused as "no source".
+    core.store.files = {};
+    core.writeStore();
+    core.writeSettings(Object.assign({}, core.DEFAULT_SETTINGS, {
+        concurrency: 'sequential',
+        askClarifyingQuestions: false,
+        sourceContextMode: 'digest',
+        digestBudgetTokens: 4000
+    }));
+
+    // A small stand-in for the real project shape: two subsystems plus a hub,
+    // a stylesheet, a vendored bundle and a generated doc.
+    const makeLine = (n, body) => Array.from({ length: n }, (_, i) => `${body}_${i}`).join('\n');
+    core.writeFile('router.py', [
+        'import sqlite3',
+        'from comfy_worker import run_workflow',
+        '',
+        '@app.get("/health")',
+        'def health():',
+        '    return {"ok": True}',
+        ''
+    ].join('\n'), { skill: 'source', origin: 'imported' });
+    core.writeFile('comfy/worker.py', makeLine(60, 'def comfy_step'), { skill: 'source', origin: 'imported' });
+    core.writeFile('comfy/runtime-config.js', makeLine(60, 'const comfyOption'), { skill: 'source', origin: 'imported' });
+    core.writeFile('journal/service.py', makeLine(60, 'def journal_step'), { skill: 'source', origin: 'imported' });
+    core.writeFile('theme.css', makeLine(80, '.selector'), { skill: 'source', origin: 'imported' });
+    core.writeFile('vendor/bundle.min.js', 'x'.repeat(4000), { skill: 'source', origin: 'imported' });
+    core.writeFile('docs/prd/older.md', '# Older PRD\n', { skill: 'prd-builder' });
+
+    requests.length = 0;
+    const digestRun = core.createRun(archSkill, 'Evaluate this codebase.');
+    await agent.runSkill(digestRun, archSkill, {
+        idea: 'Evaluate this codebase.',
+        answers: [],
+        requirementsText: 'Must support 10x current load.',
+        signal: new AbortController().signal
+    }, { onRender() {}, onStep() {}, onStream() {} });
+
+    assert.ok(requests.length >= 3, `digest mode ran ${requests.length} turns, expected >= 3`);
+    const digestPrompt = requests[0].message;
+
+    // The structural map is in the prompt, labelled as a whole-project map.
+    assert.match(digestPrompt, /Codebase map/, 'the digest map never reached the model prompt');
+    assert.match(digestPrompt, /digest of every file in the project/,
+        'the prompt did not tell the model the map covers the whole project');
+
+    // Every first-party file is MAPPED, including the ones never attached
+    // verbatim — this is the whole point of the feature.
+    ['router.py', 'comfy/worker.py', 'journal/service.py', 'theme.css'].forEach(item => {
+        assert.ok(digestPrompt.indexOf(item) >= 0,
+            `digest mode omitted "${item}" from the map`);
+    });
+
+    // Real structure was extracted, not just file names. The skills forbid
+    // evaluating architecture from file names alone, so the map must carry
+    // signatures and routes.
+    assert.match(digestPrompt, /GET \/health/, 'the extracted HTTP route did not reach the model');
+    assert.match(digestPrompt, /comfy_step/, 'an extracted function signature did not reach the model');
+    assert.match(digestPrompt, /imports: sqlite3/, 'extracted imports did not reach the model');
+
+    // Vendored bundles are excluded from analysis but the model is TOLD they
+    // exist, so it cannot assume the project has no dependencies.
+    assert.ok(digestPrompt.indexOf('vendor/bundle.min.js') < 0,
+        'a vendored minified bundle was mapped instead of excluded');
+    assert.match(digestPrompt, /vendored\/minified bundle/,
+        'the prompt did not disclose that bundles were excluded');
+
+    // Blueprint's own generated documents are output, not codebase under test.
+    assert.ok(digestPrompt.indexOf('docs/prd/older.md') < 0,
+        'a generated Blueprint document was mapped as project source');
+
+    // The run trace says what happened, in whole-codebase terms.
+    const digestStep = digestRun.phases.find(step => /Mapped \d+ project files/.test(step.label));
+    assert.ok(digestStep, 'no digest step was added to the run trace');
+    assert.match(digestStep.text, /Whole-codebase digest/, 'the trace did not explain the digest');
+    assert.match(digestStep.text, /token budget/, 'the trace did not report the budget used');
+    assert.ok(Number(digestStep.summary.match(/([\d,]+) tokens/)[1].replace(/,/g, '')) <= 4000,
+        'the digest exceeded the configured budget');
+
+    // ---- 12. The clarifying "scope" answer now NARROWS the digest --------
+    //
+    // This is the user-visible bug: code-to-prd asks "whole codebase, or one
+    // subsystem?" and the answer used to become prose only — the model was told
+    // "one subsystem" while receiving whatever the cap allowed.
+    const scopeFilter = agent.deriveScopeFilter([
+        { id: 'scope', question: 'Which subsystem?', answer: 'just the comfy subsystem' }
+    ]);
+    assert.equal(scopeFilter.active, true, 'a subsystem answer did not activate the filter');
+    assert.ok(scopeFilter.fragments.indexOf('comfy') >= 0,
+        'the subsystem name was not extracted from the answer');
+    assert.match(scopeFilter.note, /comfy/, 'the filter produced no human-readable note');
+
+    // A "whole codebase" answer must NOT filter — that would silently hide files.
+    ['whole codebase', 'the entire codebase', 'everything', 'all of it'].forEach(answer => {
+        assert.equal(agent.deriveScopeFilter([{ id: 'scope', answer }]).active, false,
+            `the answer "${answer}" was treated as a subsystem filter`);
+    });
+    // No scope question at all means no filtering.
+    assert.equal(agent.deriveScopeFilter([]).active, false);
+    assert.equal(agent.deriveScopeFilter(undefined).active, false);
+
+    requests.length = 0;
+    const narrowRun = core.createRun(archSkill, 'Evaluate the comfy subsystem.');
+    await agent.runSkill(narrowRun, archSkill, {
+        idea: 'Evaluate the comfy subsystem.',
+        answers: [{ id: 'scope', question: 'Which subsystem?', answer: 'just the comfy subsystem' }],
+        requirementsText: 'Must support 10x current load.',
+        signal: new AbortController().signal
+    }, { onRender() {}, onStep() {}, onStream() {} });
+
+    const narrowPrompt = requests[0].message;
+    assert.ok(narrowPrompt.indexOf('comfy/worker.py') >= 0,
+        'the scoped run dropped the very subsystem it was asked about');
+    assert.ok(narrowPrompt.indexOf('journal/service.py') < 0,
+        'the scope answer did not exclude the other subsystem — it is still decorative');
+    const narrowStep = narrowRun.phases.find(step => /Mapped \d+ project files/.test(step.label));
+    assert.match(narrowStep.text, /Scope: \d+ file\(s\) matched/,
+        'the run trace did not report that the scope answer narrowed the digest');
+
+    // A scope answer that matches nothing must fall back to the whole project
+    // and SAY SO, rather than producing an empty digest that looks like a
+    // complete map of an empty codebase.
+    requests.length = 0;
+    const missRun = core.createRun(archSkill, 'Evaluate the billing subsystem.');
+    await agent.runSkill(missRun, archSkill, {
+        idea: 'Evaluate the billing subsystem.',
+        answers: [{ id: 'scope', question: 'Which subsystem?', answer: 'only the billing module' }],
+        requirementsText: 'Must support 10x current load.',
+        signal: new AbortController().signal
+    }, { onRender() {}, onStep() {}, onStream() {} });
+    assert.ok(requests[0].message.indexOf('comfy/worker.py') >= 0,
+        'a non-matching scope answer produced an empty digest instead of the whole project');
+    const missStep = missRun.phases.find(step => /Mapped \d+ project files/.test(step.label));
+    assert.match(missStep.text, /no project path matched it/,
+        'the trace did not disclose that the scope filter matched nothing');
+
+    // ---- 13. A structure-only project still runs -------------------------
+    //
+    // A project of only stylesheets and documents yields no verbatim picks.
+    // Refusing it as "no source" would hide the map that does describe it.
+    core.store.files = {};
+    core.writeStore();
+    core.writeFile('theme.css', makeLine(80, '.selector'), { skill: 'source', origin: 'imported' });
+    core.writeFile('README.md', '# Project\n\n## Overview\n\nA thing.\n', { skill: 'source', origin: 'imported' });
+    requests.length = 0;
+    const styleOnlyRun = core.createRun(archSkill, 'Evaluate this project.');
+    let styleOnlyDone = false;
+    try {
+        await agent.runSkill(styleOnlyRun, archSkill, {
+            idea: 'Evaluate this project.',
+            answers: [],
+            requirementsText: 'Must support 10x current load.',
+            signal: new AbortController().signal
+        }, { onRender() {}, onStep() {}, onStream() {} });
+        styleOnlyDone = true;
+    } catch (error) {
+        if (error.code !== 'aborted') throw error;
+    }
+    assert.ok(styleOnlyDone, 'a project with no verbatim picks was refused as having no source');
+    assert.ok(requests.length > 0, 'the structure-only digest never reached the model');
+    assert.match(requests[0].message, /theme\.css/, 'the stylesheet was not mapped');
+    assert.match(requests[0].message, /# Project/, 'the README headings were not mapped');
+
+    // ---- 14. Attached mode is unchanged (back-compat) --------------------
+    //
+    // The default must remain the old behaviour, so upgrading cannot silently
+    // change what an existing user's runs send.
+    core.store.files = {};
+    core.writeStore();
+    core.writeSettings(Object.assign({}, core.DEFAULT_SETTINGS, {
+        concurrency: 'sequential',
+        askClarifyingQuestions: false
+    }));
+    assert.equal(core.readSettings().sourceContextMode, 'attached',
+        'the default source context mode is not "attached"');
+    core.writeFile('src/only.py', 'def handle(request):\n    return request\n', { skill: 'source', origin: 'imported' });
+    core.writeFile('src/never_attached.py', makeLine(200, 'def ignored'), { skill: 'source', origin: 'imported' });
+    requests.length = 0;
+    const attachedRun = core.createRun(archSkill, 'Evaluate this codebase.');
+    const attachedFiles = agent.sourceFilesForModel({
+        sourceFiles: [{ path: 'src/only.py', content: 'def handle(request):\n    return request\n' }]
+    });
+    assert.ok(!attachedFiles.digestText, 'attached mode produced a digest map');
+    assert.ok(!attachedFiles.digestStats, 'attached mode produced digest stats');
+    await agent.runSkill(attachedRun, archSkill, {
+        idea: 'Evaluate this codebase.',
+        answers: [],
+        requirementsText: 'Must support 10x current load.',
+        sourceFiles: attachedFiles,
+        signal: new AbortController().signal
+    }, { onRender() {}, onStep() {}, onStream() {} });
+    const attachedPrompt = requests[0].message;
+    assert.match(attachedPrompt, /## Attached source/, 'attached mode lost its original heading');
+    assert.ok(attachedPrompt.indexOf('Codebase map') < 0, 'attached mode injected a digest map');
+    assert.ok(attachedPrompt.indexOf('def handle(request):') >= 0, 'attached mode lost the attached file');
+    assert.ok(attachedPrompt.indexOf('never_attached') < 0,
+        'attached mode pulled in a project file the user never attached');
+    assert.ok(attachedRun.phases.some(step => /^Reading 1 project source file$/.test(step.label)),
+        'attached mode lost its original run-trace step');
+
+    console.log('agent-flow.test.cjs: 14 run-flow groups passed');
     console.log(`  model turns exercised : ${requests.length + 20}+`);
     console.log('  paths verified        : docs/prd/, docs/backlog/, docs/onboarding/');
     console.log('  failure paths         : abort, no-endpoint, HTTP 500, missing source, missing PRD');
+    console.log('  whole-codebase digest : map reaches the prompt, scope narrows it, attached mode intact');
 
     // The pending clarifying-question run from step 3 is still awaiting an
     // answer; exit explicitly so it cannot hold the loop open.

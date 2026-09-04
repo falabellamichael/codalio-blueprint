@@ -829,16 +829,78 @@ const emptyNav = settingsPageModule.renderSettingsNav(baseState({
 assert.equal(findAll(emptyNav, byClass('cb-settings-results-empty')).length, 1, 'no empty state for a failed search');
 
 // 7g. Sub-page tabs appear only when a section has more than one page.
+//
+// Asserted as a CONTRACT against the live schema rather than as hardcoded
+// counts: "the source section renders 0 tabs" froze a snapshot that became
+// wrong the moment a second page was added to that section. The invariant
+// under test is the relationship — tabs render iff section.pages.length > 1,
+// and exactly one per page — which holds however the schema grows.
 const dataPage = ui.renderSettingsPage(baseState({
     folder: 'cb-settings', settingsSection: 'data', settingsPage: 'storage', settings: core.readSettings()
 }));
-const dataSubTabs = findAll(dataPage, byAction('settings-goto'));
-assert.equal(dataSubTabs.length, 2, 'the Data section has two pages so both sub-tabs should render');
+assert.equal(findAll(dataPage, byAction('settings-goto')).length, 2,
+    'the Data section has two pages so both sub-tabs should render');
+
+// Both source pages are rendered and kept, because the innerHTML sweep in
+// section 10 walks them for unsafe model text.
 const sourceLimitsPage = ui.renderSettingsPage(baseState({
     folder: 'cb-settings', settingsSection: 'source', settingsPage: 'limits', settings: core.readSettings()
 }));
-assert.equal(findAll(sourceLimitsPage, byAction('settings-goto')).length, 0,
-    'a single-page section should not render sub-page tabs');
+const sourceDigestPage = ui.renderSettingsPage(baseState({
+    folder: 'cb-settings', settingsSection: 'source', settingsPage: 'digest', settings: core.readSettings()
+}));
+assert.equal(findAll(sourceLimitsPage, byAction('settings-goto')).length, 2,
+    'the Source section now has two pages (attach limits + whole-codebase reading)');
+
+// The digest page renders its three controls with the documented bounds, so a
+// user can actually reach the feature and cannot configure a step that hangs.
+const digestText = textOf(sourceDigestPage);
+assert.match(digestText, /Source context mode/, 'the mode control is missing from the digest page');
+assert.match(digestText, /Whole codebase/, 'the whole-codebase option is missing');
+assert.match(digestText, /Attached only/, 'the attached-only option is missing');
+assert.match(digestText, /Token budget/, 'the token budget control is missing');
+const digestInputs = findAll(sourceDigestPage, node => node.tagName === 'INPUT');
+const budgetInput = digestInputs.find(input => input.dataset.cbSetting === 'digestBudgetTokens');
+assert.ok(budgetInput, 'the token budget input did not render');
+assert.equal(budgetInput.value, '16000', 'the token budget did not render its default');
+assert.equal(budgetInput.min, '2048', 'the token budget floor is not enforced in the UI');
+assert.equal(budgetInput.max, '65536', 'the token budget ceiling is not enforced in the UI');
+const minLinesInput = digestInputs.find(input => input.dataset.cbSetting === 'digestMinFullTextLines');
+assert.ok(minLinesInput, 'the minimum-lines input did not render');
+assert.equal(minLinesInput.value, '40', 'the minimum-lines default did not render');
+const modeInputs = digestInputs.filter(input => input.dataset.cbSetting === 'sourceContextMode');
+assert.equal(modeInputs.length, 2, 'the mode control did not render both options');
+const checkedMode = modeInputs.find(input => input.checked);
+assert.ok(checkedMode, 'neither source context mode was selected by default');
+assert.equal(checkedMode.value, 'attached',
+    'the default mode is not "attached" — that would silently change behaviour for existing users');
+
+schema.sections().forEach(section => {
+    section.pages.forEach(page => {
+        const rendered = ui.renderSettingsPage(baseState({
+            folder: 'cb-settings', settingsSection: section.id, settingsPage: page.id,
+            settings: core.readSettings()
+        }));
+        const tabs = findAll(rendered, byAction('settings-goto'));
+        const expected = section.pages.length > 1 ? section.pages.length : 0;
+        assert.equal(tabs.length, expected,
+            `section "${section.id}" page "${page.id}": expected ${expected} sub-page tabs, got ${tabs.length}`);
+        if (expected) {
+            // Every page of the section is reachable, and the current one is marked.
+            const ids = tabs.map(tab => tab.dataset.pageId);
+            section.pages.forEach(item => {
+                assert.ok(ids.indexOf(item.id) >= 0,
+                    `section "${section.id}" has no sub-tab for page "${item.id}"`);
+            });
+            const active = tabs.filter(tab => tab.classList.contains('active'));
+            assert.equal(active.length, 1,
+                `section "${section.id}" page "${page.id}": expected exactly one active sub-tab`);
+            assert.equal(active[0].dataset.pageId, page.id,
+                `section "${section.id}": the active sub-tab is not the page being rendered`);
+        }
+    });
+});
+assert.ok(schema.sections().length >= 5, 'the settings schema lost sections');
 
 // 7h. Read-only panels land on their own pages.
 assert.equal(findAll(dataPage, byClass('cb-metrics')).length, 1, 'the storage metrics strip is missing');
@@ -937,7 +999,7 @@ assert.match(textOf(toast), /Saved\./);
 
 [
     emptyAgent, busyAgent, msgAgent, filesPage, sourcePage, historyPage,
-    planningPage, modelPage, dataPage, tabsPage, sourceLimitsPage,
+    planningPage, modelPage, dataPage, tabsPage, sourceLimitsPage, sourceDigestPage,
     navNode, searchedNav, emptyNav,
     listContent, modal, toast
 ].forEach(root => {
