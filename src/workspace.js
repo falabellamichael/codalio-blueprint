@@ -702,7 +702,7 @@
         const strip = node('div', 'cb-tabstrip');
         strip.dataset.cbRole = 'tabstrip';
         strip.setAttribute('role', 'tablist');
-        strip.setAttribute('aria-label', 'Blueprint workspace tabs');
+        strip.setAttribute('aria-label', 'Codalio Blueprint workspace tabs');
 
         const fileTitleCounts = new Map();
         tabs(ws).forEach(tab => {

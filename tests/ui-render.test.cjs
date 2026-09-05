@@ -530,6 +530,7 @@ assert.equal(findAll(noFilePage, byAction('add-source-file')).length, 1, 'empty 
 // fail the "lists every file" assertion for an unrelated reason.
 core.store.files = {};
 core.store.openPath = '';
+core.store.openFolderId = '';
 core.writeStore();
 
 const multiFolders = core.listFolders();
@@ -580,10 +581,10 @@ assert.equal(roots.length, core.listFolders().length,
 assert.equal(roots.filter(byAction('toggle-folder-root')).length, roots.length,
     'a folder root is not clickable to expand or collapse');
 
-// The active folder is badged, the others are not.
+// Exactly one folder is the target; importing roots have a separate badge.
 assert.equal(roots.filter(r => r.className.includes('active')).length, 1,
     'exactly one root should be marked as the target folder');
-assert.equal(findAll(multiContent, byClass('cb-root-badge')).length, 1,
+assert.equal(findAll(multiContent, byClass('cb-root-badge')).filter(badge => textOf(badge) === 'target').length, 1,
     'the target-folder badge is missing or duplicated');
 
 // EVERY file in EVERY folder is listed, including folders that are not active.
@@ -1057,7 +1058,78 @@ walk(hostilePage, node => { if (node.nodeType === 1) hostileTags.push(node.tagNa
 });
 assert.match(textOf(hostilePage), /<img src=x onerror=alert\(1\)>/, 'hostile markup was dropped rather than shown as text');
 
-console.log('ui-render.test.cjs: 11 render groups passed');
+// Progress belongs in the project file list even when the viewer is elsewhere.
+const progressTitle = documentStub.createElement('div');
+let progressList = documentStub.createElement('div');
+ui.renderList(baseState({ folder: 'cb-files', busyImport: true,
+    importProgress: { phase: 'scan', name: 'Example', done: 7, total: 0, imported: 0 }
+}), progressTitle, progressList);
+assert.match(textOf(progressList), /Scanning Example.*7 files found/);
+assert.equal(findAll(progressList, byClass('cb-import-progress'))[0].getAttribute('role'), 'status');
+assert.ok(findAll(progressList, byAction('stop-run')).length, 'no cancellation control beside progress');
+assert.equal(findAll(progressList, node => node.tagName === 'PROGRESS')[0].getAttribute('value'), null,
+    'discovery with no known total reported a fabricated percentage');
+progressList = documentStub.createElement('div');
+ui.renderList(baseState({ folder: 'cb-files', busyImport: true,
+    importProgress: { phase: 'import', name: 'Example', done: 3, total: 9, imported: 1 }
+}), progressTitle, progressList);
+assert.match(textOf(progressList), /1 file loaded.*3 of 9 examined/);
+assert.equal(Number(findAll(progressList, node => node.tagName === 'PROGRESS')[0].value), 3);
+assert.equal(Number(findAll(progressList, node => node.tagName === 'PROGRESS')[0].max), 9);
+progressList = documentStub.createElement('div');
+ui.renderList(baseState({ folder: 'cb-files', busyImport: false }), progressTitle, progressList);
+assert.equal(findAll(progressList, byClass('cb-import-progress')).length, 0, 'completed import left a busy indicator');
+
+// Single-line composer bar: hint, path-context and send/stop controls live together.
+const idlePage = ui.renderAgentPage(baseState({ busy: false, hint: 'Test skill hint' }));
+const idleBar = findAll(idlePage, byClass('cb-composer-bar'))[0];
+assert.ok(idleBar, 'composer is missing .cb-composer-bar');
+const composerNode = findAll(idlePage, byClass('cb-composer'))[0];
+assert.equal(composerNode.children.length, 3, 'composer should have exactly 3 children: quickBar, textarea and single-line bar');
+assert.ok(!composerNode.querySelector(':scope > .cb-path-context'), 'path context should no longer sit on its own second line');
+const scrollArea = findAll(idleBar, byClass('cb-composer-bar-scroll'))[0];
+assert.ok(scrollArea, 'composer bar should have scroll container up until Stop/Send');
+assert.ok(findAll(scrollArea, byClass('cb-composer-hint')).length, 'scroll area should contain hint');
+assert.ok(findAll(scrollArea, byClass('cb-path-context')).length, 'scroll area should contain path context');
+assert.ok(findAll(idleBar, byClass('cb-composer-hint')).length, 'single-line bar is missing hint');
+assert.ok(findAll(idleBar, byClass('cb-path-context')).length, 'path context should be inside .cb-composer-bar on the same line');
+assert.ok(findAll(idleBar, byClass('cb-path-context-input')).length, 'path context input is missing');
+assert.ok(findAll(idleBar, byClass('cb-composer-right')).length, 'controls group missing');
+assert.ok(findAll(idleBar, byAction('send')).length, 'send button missing');
+assert.equal(findAll(idleBar, byAction('stop-run')).length, 0, 'idle composer should not show stop button');
+
+// When busy, dynamic stop button appears inside .cb-composer-right on the same line.
+const busyPage = ui.renderAgentPage(baseState({ busy: true, hint: 'Running step' }));
+const busyBar = findAll(busyPage, byClass('cb-composer-bar'))[0];
+assert.ok(findAll(busyBar, byClass('cb-path-context')).length, 'path context remains on same line when busy');
+const stopBtns = findAll(busyBar, byAction('stop-run'));
+assert.equal(stopBtns.length, 1, 'busy composer must render dynamic stop button');
+
+// Notification tooltips and icon preservation at tiny widths:
+const hintEl = findAll(idleBar, byClass('cb-composer-hint'))[0];
+assert.equal(hintEl.getAttribute('data-cb-tooltip'), 'Test skill hint', 'hint element missing data-cb-tooltip');
+assert.equal(hintEl.title, 'Test skill hint', 'hint element missing title attribute');
+assert.ok(findAll(hintEl, node => node.tagName === 'I').length >= 1, 'hint must have an icon for tiny widths');
+assert.ok(findAll(hintEl, node => node.tagName === 'SPAN').length >= 1, 'hint must have text span');
+
+const idleStatusEl = findAll(idleBar, byClass('cb-path-context-status'))[0];
+assert.ok(idleStatusEl.getAttribute('data-cb-tooltip'), 'status element missing data-cb-tooltip');
+assert.ok(idleStatusEl.title, 'status element missing title');
+assert.ok(findAll(idleStatusEl, node => node.tagName === 'I').length >= 1, 'status must have an icon even when off for tiny widths');
+assert.ok(findAll(idleStatusEl, node => node.tagName === 'SPAN').length >= 1, 'status must have text span');
+
+const grantedPage = ui.renderAgentPage(baseState({
+    pathContextEnabled: true,
+    pathContextPath: 'sub',
+    pathContextHasGrant: true,
+    pathContextRootName: 'my-project'
+}));
+const grantedStatusEl = findAll(grantedPage, byClass('cb-path-context-status'))[0];
+assert.ok(grantedStatusEl.getAttribute('data-cb-tooltip').includes('my-project'), 'active status tooltip must reflect project folder');
+assert.ok(findAll(grantedStatusEl, node => node.tagName === 'I').length >= 1, 'active status must have an icon');
+
+
+console.log('ui-render.test.cjs: 13 render groups passed');
 console.log(`  skill cards    : ${welcomeCards.length}`);
 console.log(`  step rows      : ${renderedSteps.length} (done/running/error/question/lens/document)`);
 console.log(`  tree rows      : ${treeRows.length} across nested docs/ and src/`);

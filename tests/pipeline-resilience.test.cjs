@@ -413,6 +413,60 @@ test('asynchronous cancellation acknowledgements never authorize an overlapping 
         'an ambiguous asynchronous cancellation cleared its recovery ledger');
 });
 
+test('confirmed cancellation waits for the worker before allowing a retry', async () => {
+    const harness = createHarness();
+    let workerActive = true;
+    let streamAttempt = 0;
+    let confirmations = 0;
+    harness.state.fetchImpl = async url => {
+        if (String(url).includes('/chat/cancel/')) {
+            assert.ok(String(url).endsWith('?confirm_terminal=true'),
+                'cancellation did not request the fenced terminal contract');
+            confirmations += 1;
+            if (confirmations === 1) return makeResponse({
+                async json() { return { cancelled: false, status: 'requested', terminal: false }; }
+            });
+            workerActive = false;
+            return makeResponse({
+                async json() { return { cancelled: true, status: 'cancelled', terminal: true }; }
+            });
+        }
+        assert.equal(workerActive && streamAttempt > 0, false,
+            'a retry started while the cancelled worker was still active');
+        return makeResponse({ streamAttempt: ++streamAttempt });
+    };
+    harness.state.streamImpl = async (response, onEvent) => {
+        if (response.streamAttempt === 1) return new Promise(() => {});
+        await onEvent({ type: 'done', response: 'recovered safely', finish_reason: 'stop' });
+    };
+    const result = await resolvedWithin(harness.core.streamModelTurn({
+        message: 'recover cancellation', systemPrompt: 'test', maxRetries: 1,
+        requestTimeoutMs: 20, idleTimeoutMs: 0, cancelTimeoutMs: 500, retryBaseDelayMs: 0
+    }), 1000, 'confirmed worker completion');
+    assert.equal(confirmations, 2);
+    assert.equal(streamAttempt, 2);
+    assert.equal(result.text, 'recovered safely');
+    assert.equal(harness.core.listPendingCancels().length, 0);
+});
+
+test('confirmation polling stays bounded and shared while a worker remains active', async () => {
+    const harness = createHarness();
+    let confirmations = 0;
+    harness.state.fetchImpl = async () => {
+        confirmations += 1;
+        return makeResponse({
+            async json() { return { status: 'requested', cancelled: false, terminal: false }; }
+        });
+    };
+    const first = harness.core.cancelTurnOutcome('pending-confirmation', { timeoutMs: 50 });
+    const second = harness.core.cancelTurnOutcome('pending-confirmation', { timeoutMs: 50 });
+    assert.equal(first, second, 'Stop and recovery duplicated the cancellation request');
+    const outcome = await resolvedWithin(first, 250, 'bounded confirmation');
+    assert.ok(!['cancelled', 'already-terminal'].includes(outcome),
+        'an unfinished worker was treated as terminal after the deadline');
+    assert.equal(confirmations, 1);
+});
+
 test('terminal frames complete without EOF and cancelled frames stay cancellations', async () => {
     const hangingEof = createHarness();
     hangingEof.state.streamImpl = async (_response, onEvent) => {

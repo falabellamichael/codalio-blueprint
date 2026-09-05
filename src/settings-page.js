@@ -46,7 +46,7 @@
         input.dataset.cbRole = 'settings-search';
         input.placeholder = 'Search settings…';
         input.value = state.settingsQuery || '';
-        input.setAttribute('aria-label', 'Search Blueprint settings');
+        input.setAttribute('aria-label', 'Search Codalio Blueprint settings');
         input.maxLength = 120;
         search.appendChild(input);
         if (state.settingsQuery) {

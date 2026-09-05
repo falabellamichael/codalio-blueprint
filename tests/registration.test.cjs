@@ -507,7 +507,7 @@ assert.match(mountHtml, /data-extension-plugin="codalio-blueprint"/, 'icon is no
 assert.match(mountHtml, /aria-label="Open the Codalio Blueprint planning agent"/, 'icon has no accessible label');
 assert.match(mountHtml, /role="button"/, 'icon is not keyboard reachable');
 assert.match(mountHtml, /fa-compass-drafting/, 'icon does not use the declared Font Awesome icon');
-assert.match(mountHtml, /title="Blueprint"/, 'icon has no tooltip title');
+assert.match(mountHtml, /title="Codalio Blueprint"/, 'icon has no product-name tooltip title');
 assert.equal(initResult.pages.some(item => item.appId === 'blueprint'), true, 'initialize() did not report the blueprint page');
 
 // 18. Disabling the plug-in removes the page from the app bar (uninstall path).

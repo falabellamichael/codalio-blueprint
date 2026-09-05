@@ -187,7 +187,8 @@
             }
             return;
         }
-        listTitle.textContent = 'Blueprint Skills';
+        listTitle.textContent = '';
+        listTitle.appendChild(node('span', 'cb-brand-name', 'Codalio Blueprint Skills'));
         listContent.appendChild(renderSkillList(state));
     }
 
@@ -344,6 +345,32 @@
         }
         wrap.appendChild(summary);
 
+        if (state.busyImport) {
+            const progress = state.importProgress || {};
+            const scanning = progress.phase !== 'import';
+            const total = Math.max(0, Number(progress.total) || 0);
+            const done = Math.max(0, Number(progress.done) || 0);
+            const imported = Math.max(0, Number(progress.imported) || 0);
+            const status = node('div', 'cb-import-progress');
+            status.setAttribute('role', 'status');
+            status.setAttribute('aria-live', 'polite');
+            status.setAttribute('aria-atomic', 'true');
+            status.appendChild(node('strong', null,
+                `${scanning ? 'Scanning' : 'Importing'}${progress.name ? ` ${progress.name}` : ' folder'}…`));
+            status.appendChild(node('span', null, scanning
+                ? `${done.toLocaleString()} file${done === 1 ? '' : 's'} found`
+                : `${imported.toLocaleString()} file${imported === 1 ? '' : 's'} loaded · ${done.toLocaleString()} of ${total.toLocaleString()} examined`));
+            const meter = node('progress');
+            meter.setAttribute('aria-label', scanning ? 'Discovering project files' : 'Importing project files');
+            if (!scanning && total) {
+                meter.max = total;
+                meter.value = Math.min(done, total);
+            }
+            status.appendChild(meter);
+            status.appendChild(button('Cancel import', 'fa-stop', 'stop-run'));
+            wrap.appendChild(status);
+        }
+
         // ---- one root per project folder ------------------------------
         const tree = node('div', 'cb-tree cb-tree-multiroot');
         tree.setAttribute('role', 'tree');
@@ -375,6 +402,9 @@
             if (isActive) nameWrap.appendChild(node('span', 'cb-root-badge', 'target'));
             if (folder.importState === 'incomplete') {
                 nameWrap.appendChild(node('span', 'cb-root-badge cb-root-badge-warn', 'incomplete'));
+            }
+            if (folder.importState === 'importing') {
+                nameWrap.appendChild(node('span', 'cb-root-badge', 'importing'));
             }
             row.appendChild(nameWrap);
             row.appendChild(node('span', 'cb-tree-meta', String(fileCount)));
@@ -795,7 +825,7 @@
 
         const head = node('div', 'cb-msg-head');
         head.appendChild(icon(message.role === 'user' ? 'fa-user' : 'fa-compass-drafting'));
-        head.appendChild(node('strong', null, message.role === 'user' ? 'You' : 'Blueprint'));
+        head.appendChild(node('strong', 'cb-msg-author', message.role === 'user' ? 'You' : 'Codalio Blueprint'));
         if (message.skillName) head.appendChild(node('span', 'cb-msg-skill', message.skillName));
         head.appendChild(node('time', null, core.formatClock(message.at)));
         wrap.appendChild(head);
@@ -910,7 +940,9 @@
         const header = node('header', 'cb-agent-header');
         const title = node('div', 'cb-agent-title');
         title.appendChild(icon('fa-compass-drafting'));
-        title.appendChild(node('h2', null, state.run && state.run.title ? state.run.title : 'Blueprint planning agent'));
+        const heading = node('h2', null, state.run && state.run.title ? state.run.title : 'Codalio Blueprint');
+        heading.title = heading.textContent;
+        title.appendChild(heading);
         if (state.run) {
             title.appendChild(node('span', `cb-run-status cb-run-${state.run.status}`, state.run.status));
         }
@@ -1088,7 +1120,7 @@
         const empty = node('div', 'cb-welcome');
         empty.appendChild(icon('fa-compass-drafting'));
         empty.appendChild(node('h3', null, 'One big planning chat'));
-        empty.appendChild(node('p', null, 'Describe the product you are building. Blueprint runs the Codalio skills as visible steps — clarifying questions, three independent lenses, then one synthesized document — and writes the results into the project file tree.'));
+        empty.appendChild(node('p', null, 'Describe the product you are building. Codalio Blueprint runs the planning skills as visible steps — clarifying questions, three independent lenses, then one synthesized document — and writes the results into the project file tree.'));
 
         const picker = node('div', 'cb-welcome-skills');
         skills.SKILLS.forEach(skill => {
@@ -1411,12 +1443,21 @@
         composer.appendChild(textarea);
 
         const bar = node('div', 'cb-composer-bar');
+        const scrollArea = node('div', 'cb-composer-bar-scroll');
+
         const hint = node('span', 'cb-composer-hint');
         hint.appendChild(icon(isAwaitingAnswer ? 'fa-pen-to-square' : isEffectivelyBusy ? 'fa-circle-notch fa-spin' : 'fa-circle-info'));
-        hint.appendChild(node('span', null, isSubmittingAnswer
+        const hintText = isSubmittingAnswer
             ? 'Saving your answer before the agent continues…'
-            : isAwaitingAnswer ? 'Agent paused · Awaiting your response to proceed with the plan.' : (state.hint || 'Runs on your active SimpleRAG model endpoint. Nothing is written to your workspace.')));
-        bar.appendChild(hint);
+            : isAwaitingAnswer ? 'Agent paused · Awaiting your response to proceed with the plan.' : (state.hint || 'Runs on your active SimpleRAG model endpoint. Nothing is written to your workspace.');
+        hint.appendChild(node('span', null, hintText));
+        hint.title = hintText;
+        hint.setAttribute('aria-label', hintText);
+        hint.setAttribute('data-cb-tooltip', hintText);
+        scrollArea.appendChild(hint);
+
+        scrollArea.appendChild(renderPathContextBar(state, isEffectivelyBusy));
+        bar.appendChild(scrollArea);
 
         const right = node('div', 'cb-composer-right');
         if (state.busy || state.busyImport) {
@@ -1435,17 +1476,17 @@
         bar.appendChild(right);
         composer.appendChild(bar);
 
-        composer.appendChild(renderPathContextBar(state, isEffectivelyBusy));
         return composer;
     }
 
     /**
      * Path context bar: one folder pick, one path field, one toggle.
      *
-     * Sits BENEATH the send row because the top of the composer already carries
-     * the folder select, file select and attachment chips. It reads a named
-     * subdirectory live at run time, so it is the escape hatch from the 2 MB
-     * workspace cap that keeps a large project's real source out of reach.
+     * Integrated directly beside the hint and send controls in the composer bar,
+     * so it shares the single horizontal row beneath the input textarea. The
+     * path field dynamically flexes and shrinks when the dynamic Stop button
+     * appears during a run. It reads a named subdirectory live at run time, so
+     * it is the escape hatch from the 2 MB workspace cap.
      */
     function renderPathContextBar(state, disabled) {
         const bar = node('div', `cb-path-context${state.pathContextEnabled ? ' cb-path-context-on' : ''}`);
@@ -1522,19 +1563,27 @@
         // called out explicitly rather than reading as "off".
         const status = node('span', 'cb-path-context-status');
         const settings = state.settings || {};
+        let statusText = '';
         if (enabled && hasGrant && value.trim()) {
             status.appendChild(icon('fa-circle-check'));
-            status.appendChild(node('span', null,
-                `${state.pathContextRootName}/… · up to ${Number(settings.pathContextMaxFiles || 400).toLocaleString()} files`));
+            statusText = `${state.pathContextRootName}/… · up to ${Number(settings.pathContextMaxFiles || 400).toLocaleString()} files`;
+            status.appendChild(node('span', null, statusText));
         } else if (enabled && !hasGrant) {
             status.appendChild(icon('fa-triangle-exclamation'));
-            status.appendChild(node('span', null, 'Needs folder access — pick the project folder'));
+            statusText = 'Needs folder access — pick the project folder';
+            status.appendChild(node('span', null, statusText));
         } else if (enabled && !value.trim()) {
             status.appendChild(icon('fa-circle-info'));
-            status.appendChild(node('span', null, 'Type a folder to read'));
+            statusText = 'Type a folder to read';
+            status.appendChild(node('span', null, statusText));
         } else {
-            status.appendChild(node('span', null, 'Off · imported files only'));
+            status.appendChild(icon('fa-circle-minus'));
+            statusText = 'Off · imported files only';
+            status.appendChild(node('span', null, statusText));
         }
+        status.title = statusText;
+        status.setAttribute('aria-label', statusText);
+        status.setAttribute('data-cb-tooltip', statusText);
         bar.appendChild(status);
 
         return bar;
@@ -1597,15 +1646,15 @@
         pathWrap.appendChild(node('span', null, record.path));
         if (isImported) {
             const badge = node('span', 'cb-chip cb-chip-muted cb-viewer-badge');
-            badge.title = 'Project source file — Read-only to Blueprint';
+            badge.title = 'Project source file — Read-only to Codalio Blueprint';
             badge.appendChild(icon('fa-lock'));
             badge.appendChild(node('span', null, 'Read-Only Source'));
             pathWrap.appendChild(badge);
         } else {
             const badge = node('span', 'cb-chip cb-chip-primary cb-viewer-badge');
-            badge.title = 'Created by Blueprint — Editable & rewritable';
+            badge.title = 'Created by Codalio Blueprint — Editable & rewritable';
             badge.appendChild(icon('fa-pen-nib'));
-            badge.appendChild(node('span', null, 'Blueprint Document'));
+            badge.appendChild(node('span', null, 'Codalio Blueprint'));
             pathWrap.appendChild(badge);
         }
         bar.appendChild(pathWrap);

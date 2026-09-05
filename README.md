@@ -1,4 +1,4 @@
-# codalio-blueprint — SimpleRAG fork
+# Codalio Blueprint — SimpleRAG fork
 
 A fork of [**codalio-blueprint**](https://github.com/codalio/codalio-blueprint) by Codalio: a set of planning skills for IDE coding agents that turn a rough product idea into written documents, all the way through launch.
 
@@ -226,6 +226,18 @@ tests/                     13 suites (Node, no dependencies)
 
 Script load order matters — each module reads the ones before it. `manifest.js` first, `controller.js` last. It is declared once in `tools/blueprint.py` as `SCRIPT_SOURCES`, and the suites assert they load modules in that same order.
 
+### Bounded code reading
+
+Architecture Evaluation and Code to PRD use chunk selection when **Source files → Whole-codebase reading → Whole codebase** is enabled (also selected by a whole-codebase scope answer or live path context). The structural map still covers the available project scope within its budget. Implementation selection starts with up to four files matching the request and clarifying answers, then adds at most four direct dependencies. Callers remain visible in the map and can match the request themselves; sharing a central module does not trigger automatic reading of every consumer. If nothing specific matches, manual attachments or structurally important modules supply the starting points.
+
+Each automatic file supplies at most two non-overlapping excerpts, each bounded to 80 lines and 3,200 characters before framing. Selection favours declaration boundaries and strong request matches, so a function in the middle of a large file can be included without sending its unrelated beginning and end. A second chunk prioritizes a named helper referenced by the first. JavaScript/TypeScript excerpts prefer statement and branch endings, keeping fitting multiline calls and `if`/`else` arms together. An oversized statement is skipped, and the final budget fitter accepts whole excerpts rather than trimming their trailing lines. These are conservative syntax hints, not an AST: large enclosing functions can still span chunks, and other formats retain declaration/line boundaries. The prompt identifies supplied line ranges and treats the rest as unknown. Manual attachments retain full-file priority within the combined budget. Spare budget is not filled with unrelated implementations.
+
+Recognized `plugin.json`, `package.json` and `manifest.json` entries include bounded declared name, id, version and permission identifiers in the map. These values establish what the manifest declares, without implying runtime permission grants. Source sanitization preserves a control's harmless `key` identifier when adjacent label/type or label/icon/tone properties identify a UI schema field or action. Bare key assignments, explicit credential fields, known token families and high-entropy secrets remain subject to redaction, including at the final model boundary.
+
+Static links resolve local JavaScript imports, Python modules, HTML assets and uniquely assigned `window`/`globalThis` exports within the supplied scope. Ambiguous imports and external packages remain unresolved; these heuristics do not prove runtime calls. Dependencies never widen an explicit subsystem filter or trigger extra disk/model requests. The in-code system prompt tells the model to use relevant supplied evidence, stop when it supports the requested output, and identify missing files or symbols instead of inferring unseen behavior. The run trace reports chunk counts and directly linked files. Token counts remain character-based estimates, not a model-specific tokenizer guarantee.
+
+The implementation is in `src/controller-core.js` (`buildSourceCoupling`, `chunkSourceForDigest`, `buildCodebaseDigest`), with request selection and system instructions in `src/agent.js` and source framing in `src/skills.js`. Regression coverage lives in `tests/codebase-digest.test.cjs`.
+
 ### Tests
 
 ```bash
@@ -267,7 +279,7 @@ The static checks catch classes of bug the suites cannot: corrupted string liter
 
 **Nothing is written to your SimpleRAG workspace.** Generated documents, run history, imported source, and settings live in a virtual filesystem under Blueprint's own localStorage keys. Your journal, documents, knowledge graph, and settings are never read or written. The agent explicitly sends `use_workspace_context: false`.
 
-**Every step carries a `cancel_id`** so Stop actually stops the backend turn rather than just abandoning the fetch.
+**Every step carries a `cancel_id`** so Stop requests cancellation of the backend turn. Blueprint asks `/chat/cancel/{cancel_id}?confirm_terminal=true` for explicit completion and waits, within a bounded deadline, before allowing a retry. This requires a SimpleRAG backend that retains unfinished provider workers and fences delayed requests for confirmed IDs. Older backends that return only `status: "requested"` cannot confirm completion; Blueprint keeps the recovery barrier instead of assuming that the worker stopped.
 
 **Boot failures are visible.** If SimpleRAG's own bundle fails to parse, the extension host never exists and Blueprint cannot register. It renders an on-page alert naming the missing host object and pointing at the likely cause, instead of logging one console line and leaving a blank page. The panel is inline-styled and `cb-`-free, because when the host is broken this plug-in's own stylesheet may not have loaded either.
 

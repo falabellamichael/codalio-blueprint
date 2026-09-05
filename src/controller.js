@@ -175,6 +175,7 @@
         busyImport: false,
         importController: null,
         importSettlement: null,
+        importRenderTimer: null,
         draft: '',
         hint: '',
         showSettings: false,
@@ -622,12 +623,46 @@
 
     function finishImportOperation(operation) {
         if (operation && runtime.importController !== operation) return;
+        clearTimeout(runtime.importRenderTimer);
+        runtime.importRenderTimer = null;
         runtime.busyImport = false;
         runtime.importProgress = null;
         runtime.importController = null;
+        refreshImportList();
         // Let the import caller finish its final toast/tree bookkeeping first,
         // then apply the newest host snapshot that arrived during the import.
         void Promise.resolve().then(() => flushPendingRestoreState());
+    }
+
+    function refreshImportList() {
+        if (!runtime.mounted || !runtime.active || runtime.folder !== 'cb-files') return;
+        if (runtime.context && runtime.context.state && runtime.context.state.app !== APP_ID) return;
+        const elements = hostElements();
+        const list = elements && elements.listContent;
+        if (!list) return;
+        const scrollTop = list.scrollTop;
+        const scrollLeft = list.scrollLeft;
+        const render = runtime.context && runtime.context.render;
+        try {
+            if (render && typeof render.list === 'function') render.list();
+            else ui.renderList(stateSnapshot(), elements.listTitle, list);
+        } catch (error) {
+            console.warn('[codalio-blueprint] import list refresh failed', error);
+        }
+        list.scrollTop = scrollTop;
+        list.scrollLeft = scrollLeft;
+    }
+
+    function updateImportProgress(operation, progress) {
+        if (runtime.importController !== operation || operation.signal.aborted) return;
+        runtime.importProgress = progress;
+        // Batch rapid discoveries without rebuilding the viewer, resetting its
+        // editor, stealing composer focus, or opening a tab for every file.
+        if (runtime.importRenderTimer !== null || !runtime.active) return;
+        runtime.importRenderTimer = setTimeout(() => {
+            runtime.importRenderTimer = null;
+            if (runtime.importController === operation && runtime.busyImport) refreshImportList();
+        }, 120);
     }
 
     function requestLifecycleHooks(controller) {
@@ -1511,6 +1546,8 @@
     /**
      * Apply sidebar width to host list pane. If host uses CSS variables
      * (--list-pane-width), update the variable; otherwise set inline styles.
+     * When host list pane is collapsed (.list-pane-collapsed), this function
+     * leaves the collapsed inline styles and CSS variables untouched.
      */
     function applyListPaneWidth(width) {
         const elements = hostElements();
@@ -1518,15 +1555,17 @@
         if (!listPane) return;
         const hostToggle = (elements && elements.listPaneToggle) || document.getElementById('list-pane-toggle');
         const mainBody = (elements && elements.mainBody) || document.querySelector('.main-body');
+        if (mainBody && mainBody.classList.contains('list-pane-collapsed')) {
+            return;
+        }
+        const numeric = Number(width);
+        const clamped = Math.min(640, Math.max(220, Number.isFinite(numeric) ? Math.round(numeric) : 320));
         if (hostToggle) {
-            listPane.style.setProperty('--list-pane-width', `${width}px`);
-            if (mainBody) mainBody.style.setProperty('--list-pane-width', `${width}px`);
-            if (typeof window.setListPaneWidth === 'function') {
-                try { window.setListPaneWidth(width, false); } catch (_) {}
-            }
+            listPane.style.setProperty('--list-pane-width', `${clamped}px`);
+            if (mainBody) mainBody.style.setProperty('--list-pane-width', `${clamped}px`);
         } else {
-            listPane.style.width = `${width}px`;
-            listPane.style.flex = `0 0 ${width}px`;
+            listPane.style.width = `${clamped}px`;
+            listPane.style.flex = `0 0 ${clamped}px`;
         }
     }
 
@@ -1534,12 +1573,15 @@
      * Remove the divider and undo the inline width we set on the host list pane.
      * Must run whenever the page is left, or the drag handle leaks into other
      * apps (Journal, Settings, ...) and the pane keeps Blueprint's width.
+     * In environments with host #list-pane-toggle, we NEVER clear inline styles,
+     * so host's collapse state (width: 0px, flex: 0 0 0px) remains intact.
      */
     function releaseDivider() {
         const elements = hostElements();
         const listPane = elements && elements.listPane
             ? elements.listPane
             : document.getElementById('list-pane');
+        const hostToggle = (elements && elements.listPaneToggle) || document.getElementById('list-pane-toggle');
         if (runtime.listPaneObserver) {
             try { runtime.listPaneObserver.disconnect(); } catch (_) { /* already gone */ }
             runtime.listPaneObserver = null;
@@ -1550,7 +1592,7 @@
         }
         runtime.dividerBound = false;
         runtime.dividerWidth = 0;
-        if (listPane) {
+        if (listPane && !hostToggle) {
             listPane.style.width = '';
             listPane.style.flex = '';
             delete listPane.dataset.cbWidthApplied;
@@ -1563,8 +1605,8 @@
      * and collapse button. In that environment, injecting a duplicate .cb-divider
      * or hardcoding inline style.width/style.flex breaks host resizing and collapse!
      * When hostToggle is present, we harmonize with the host's CSS variable and
-     * observe width changes. When absent (test harnesses/standalone), we provide
-     * the fallback .cb-divider.
+     * observe width changes without triggering destructive workspace re-renders.
+     * When absent (test harnesses/standalone), we provide the fallback .cb-divider.
      */
     function bindDividerDrag(container) {
         if (!container) return;
@@ -1576,6 +1618,7 @@
         if (!listPane || !listPane.parentNode) return;
 
         const hostToggle = (elements && elements.listPaneToggle) || document.getElementById('list-pane-toggle');
+        const mainBody = (elements && elements.mainBody) || document.querySelector('.main-body');
         if (hostToggle) {
             // Remove any obsolete .cb-divider that may have been previously injected
             if (runtime.dividerElement) {
@@ -1583,12 +1626,25 @@
                 runtime.dividerElement = null;
             }
             runtime.dividerBound = false;
-            // Clear any conflicting inline styles on listPane so host CSS variable works
-            listPane.style.width = '';
-            listPane.style.flex = '';
-            delete listPane.dataset.cbWidthApplied;
 
-            applyListPaneWidth(settings.listPaneWidth);
+            const isCollapsed = Boolean(mainBody && mainBody.classList.contains('list-pane-collapsed'));
+            if (!isCollapsed) {
+                let hostWidth = 0;
+                try {
+                    const saved = Number.parseInt(localStorage.getItem('signalLifeListPaneWidth'), 10);
+                    if (Number.isFinite(saved) && saved >= 220 && saved <= 640) hostWidth = saved;
+                } catch (_) {}
+                const targetWidth = hostWidth || settings.listPaneWidth || 320;
+                // Clear any leftover fallback-divider inline styles on listPane, but ONLY when not collapsed
+                listPane.style.width = '';
+                listPane.style.flex = '';
+                delete listPane.dataset.cbWidthApplied;
+                applyListPaneWidth(targetWidth);
+                if (settings.listPaneWidth !== targetWidth) {
+                    settings.listPaneWidth = targetWidth;
+                    core.writeSettings(settings);
+                }
+            }
 
             if (!runtime.listPaneObserver && typeof ResizeObserver !== 'undefined') {
                 let resizeDebounce = null;
@@ -1596,7 +1652,7 @@
                     for (const entry of entries) {
                         const width = Math.round(entry.contentRect?.width || entry.target?.getBoundingClientRect().width || 0);
                         if (width < 80) return; // ignore collapsed states
-                        const bounded = Math.round(Math.min(520, Math.max(220, width)));
+                        const bounded = Math.round(Math.min(640, Math.max(220, width)));
                         runtime.dividerWidth = bounded;
                         if (resizeDebounce) clearTimeout(resizeDebounce);
                         resizeDebounce = setTimeout(() => {
@@ -1606,10 +1662,8 @@
                                 core.writeSettings(current);
                                 const ws = wsModule();
                                 if (ws && runtime.workspace) {
-                                    commitWorkspaceMutation(
-                                        workspace => ws.setDivider(workspace, bounded),
-                                        { retainOnWorkspaceFailure: true }
-                                    );
+                                    ws.setDivider(runtime.workspace, bounded);
+                                    core.saveWorkspace(runtime.workspace);
                                 }
                             }
                         }, 250);
@@ -1647,7 +1701,7 @@
         const onMove = moveEvent => {
             if (!dragging) return;
             const rect = listPane.getBoundingClientRect();
-            const width = Math.round(Math.min(520, Math.max(220, moveEvent.clientX - rect.left)));
+            const width = Math.round(Math.min(640, Math.max(220, moveEvent.clientX - rect.left)));
             listPane.style.width = `${width}px`;
             listPane.style.flex = `0 0 ${width}px`;
             runtime.dividerWidth = width;
@@ -1701,7 +1755,7 @@
             keyEvent.preventDefault();
             const step = keyEvent.shiftKey ? 40 : 10;
             const current = listPane.getBoundingClientRect().width;
-            const next = Math.round(Math.min(520, Math.max(220,
+            const next = Math.round(Math.min(640, Math.max(220,
                 current + (keyEvent.key === 'ArrowRight' ? step : -step))));
             listPane.style.width = `${next}px`;
             listPane.style.flex = `0 0 ${next}px`;
@@ -1827,7 +1881,7 @@
                 const schema = schemaModule();
                 const defaults = schema ? schema.SCHEMA_DEFAULTS : core.DEFAULT_SETTINGS;
                 openConfirmModal({
-                    title: 'Reset all Blueprint settings?',
+                    title: 'Reset all Codalio Blueprint settings?',
                     icon: 'fa-rotate-left',
                     message: 'Every setting returns to its documented default. Your documents and run history are untouched.',
                     confirmLabel: 'Reset settings',
@@ -1887,7 +1941,7 @@
             case 'clear-all': {
                 openConfirmModal({
                     conflictSensitive: true,
-                    title: 'Erase all Blueprint data?',
+                    title: 'Erase all Codalio Blueprint data?',
                     icon: 'fa-trash-can',
                     message: 'Documents, run history, settings and the tab layout are all removed. The plug-in then behaves as if freshly installed. Your SimpleRAG workspace is never touched.',
                     confirmLabel: 'Erase everything',
@@ -1927,7 +1981,7 @@
             // Reuses the 'file' modal kind so the existing upload picker, path
             // field and content textarea all work unchanged.
             kind: 'file',
-            title: 'Import Blueprint settings',
+            title: 'Import Codalio Blueprint settings',
             icon: 'fa-file-arrow-up',
             description: 'Choose a settings JSON you exported earlier. Recognised values are clamped to their documented bounds; unknown keys are ignored.',
             pathLabel: 'File (optional)',
@@ -4489,13 +4543,13 @@
         // trip. A later explicit pick overwrites it.
         runtime.pathContextRoot = rootHandle;
         runtime.pathContextRootName = String(rootHandle.name || '');
+        updateImportProgress(operation, { phase: 'scan', name: rootHandle.name, done: 0, total: 0, imported: 0 });
         let collected;
         try {
             collected = await core.collectFilesFromDirectoryHandle(rootHandle, {
                 signal: operation.signal,
                 onProgress: found => {
-                    runtime.importProgress = { done: found, total: 0, imported: 0 };
-                    setToast(`Scanning "${rootHandle.name}"… ${found.toLocaleString()} file(s) found`, 'info');
+                    updateImportProgress(operation, { phase: 'scan', name: rootHandle.name, done: found, total: 0, imported: 0 });
                 }
             });
         } catch (error) {
@@ -4627,7 +4681,7 @@
 
         setToast(`Importing ${files.length.toLocaleString()} file(s) from ${pickedName}…`, 'info');
         runtime.busyImport = true;
-        runtime.importProgress = null;
+        updateImportProgress(operation, { phase: 'import', name: pickedName, done: 0, total: files.length, imported: 0 });
         renderPage();
 
         let result;
@@ -4650,7 +4704,7 @@
                 maxTotalKb: IMPORT_MAX_TOTAL_KB,
                 incompleteReason: scanIncompleteReason,
                 onProgress: (done, total, imported) => {
-                    runtime.importProgress = { done, total, imported };
+                    updateImportProgress(operation, { phase: 'import', name: pickedName, done, total, imported });
                 }
             });
         } catch (error) {
@@ -6820,6 +6874,91 @@
         }
     }
 
+    let activeTooltipEl = null;
+    let tooltipBox = null;
+
+    function ensureTooltipBox() {
+        if (tooltipBox && tooltipBox.parentNode) return tooltipBox;
+        tooltipBox = document.createElement('div');
+        tooltipBox.className = 'cb-floating-tooltip';
+        tooltipBox.setAttribute('role', 'tooltip');
+        tooltipBox.setAttribute('aria-hidden', 'true');
+        if (document.body) {
+            document.body.appendChild(tooltipBox);
+        }
+        return tooltipBox;
+    }
+
+    function onMouseOver(event) {
+        if (!isBlueprintPage()) return;
+        const target = event.target && typeof event.target.closest === 'function'
+            ? event.target.closest('[data-cb-tooltip]')
+            : null;
+        if (!target) return;
+        const text = target.getAttribute('data-cb-tooltip');
+        if (!text) return;
+        activeTooltipEl = target;
+        const box = ensureTooltipBox();
+        box.textContent = text;
+        box.className = 'cb-floating-tooltip';
+
+        if (typeof target.getBoundingClientRect !== 'function') return;
+        const rect = target.getBoundingClientRect();
+        box.style.display = 'block';
+        box.style.visibility = 'hidden';
+        box.style.left = '0px';
+        box.style.top = '0px';
+
+        const boxRect = box.getBoundingClientRect ? box.getBoundingClientRect() : { width: 200, height: 28 };
+        let top = (rect.top || 0) - (boxRect.height || 28) - 7;
+        let left;
+        if (target.classList && target.classList.contains('cb-path-context-status')) {
+            left = (rect.right || 0) - (boxRect.width || 200);
+            box.classList.add('arrow-right');
+        } else {
+            left = rect.left || 0;
+            box.classList.add('arrow-left');
+        }
+
+        const winWidth = typeof window !== 'undefined' && window.innerWidth ? window.innerWidth : 1200;
+        if (left < 8) {
+            left = 8;
+        } else if (left + (boxRect.width || 200) > winWidth - 8) {
+            left = winWidth - (boxRect.width || 200) - 8;
+        }
+        if (top < 8) {
+            top = (rect.bottom || 0) + 7;
+            box.classList.add('arrow-top');
+        }
+
+        box.style.left = `${Math.round(left)}px`;
+        box.style.top = `${Math.round(top)}px`;
+        box.style.visibility = '';
+        box.classList.add('visible');
+    }
+
+    function onMouseOut(event) {
+        if (!activeTooltipEl) return;
+        if (event.relatedTarget && typeof activeTooltipEl.contains === 'function' && activeTooltipEl.contains(event.relatedTarget)) return;
+        activeTooltipEl = null;
+        if (tooltipBox) {
+            tooltipBox.classList.remove('visible');
+        }
+    }
+
+    function onWheel(event) {
+        if (!isBlueprintPage()) return;
+        const scrollArea = event.target && typeof event.target.closest === 'function'
+            ? event.target.closest('.cb-composer-bar-scroll')
+            : null;
+        if (!scrollArea) return;
+        if (scrollArea.scrollWidth <= scrollArea.clientWidth) return;
+        if (event.deltaY && !event.deltaX) {
+            scrollArea.scrollLeft += event.deltaY;
+            if (typeof event.preventDefault === 'function') event.preventDefault();
+        }
+    }
+
     function trapFocus(event, selector) {
         const scope = document.querySelector(selector);
         if (!scope) return;
@@ -6884,6 +7023,8 @@
 
         deactivate() {
             runtime.active = false;
+            clearTimeout(runtime.importRenderTimer);
+            runtime.importRenderTimer = null;
             const composer = hostElements()?.settingsContainer?.querySelector('[data-cb-role="composer"]');
             if (composer) runtime.draft = composer.value;
             persistWorkspace();
@@ -6895,6 +7036,8 @@
         unmount() {
             runtime.active = false;
             runtime.mounted = false;
+            clearTimeout(runtime.importRenderTimer);
+            runtime.importRenderTimer = null;
             const execution = runtime.currentController;
             const interruptedRun = (execution && execution.ownerRun) || runtime.currentRun;
             const cancelIds = execution && execution.cancelIds
@@ -7018,9 +7161,12 @@
         renderNav(context, hostApi) {
             runtime.context = context || runtime.context;
             const elements = hostElements();
-            if (elements && elements.navTitle) elements.navTitle.textContent = 'Blueprint';
+            if (elements && elements.navTitle) {
+                elements.navTitle.textContent = '';
+                elements.navTitle.appendChild(ui.node('span', 'cb-brand-name', 'Codalio Blueprint'));
+            }
             if (elements && elements.navFolderList) {
-                elements.navFolderList.setAttribute('aria-label', 'Blueprint navigation');
+                elements.navFolderList.setAttribute('aria-label', 'Codalio Blueprint navigation');
             }
             ui.renderNav(stateSnapshot(), hostApi);
         },
@@ -7117,6 +7263,9 @@
     document.addEventListener('input', onInput);
     document.addEventListener('change', onChange);
     document.addEventListener('keydown', onKeydown);
+    document.addEventListener('mouseover', onMouseOver);
+    document.addEventListener('mouseout', onMouseOut);
+    document.addEventListener('wheel', onWheel, { passive: false });
     if (typeof window.addEventListener === 'function') {
         // controller.js can be re-evaluated by a development host. Replace the
         // prior closure instead of accumulating duplicate abort/reload handlers.
@@ -7145,6 +7294,12 @@
             document.removeEventListener('input', onInput);
             document.removeEventListener('change', onChange);
             document.removeEventListener('keydown', onKeydown);
+            document.removeEventListener('mouseover', onMouseOver);
+            document.removeEventListener('mouseout', onMouseOut);
+            document.removeEventListener('wheel', onWheel);
+            if (tooltipBox && tooltipBox.parentNode) {
+                tooltipBox.parentNode.removeChild(tooltipBox);
+            }
         }
         if (typeof window.removeEventListener === 'function') {
             window.removeEventListener('codalio-blueprint-store-change', onExternalStoreChange);

@@ -533,15 +533,16 @@
                                     label: 'Sidebar width',
                                     type: 'range',
                                     min: 220,
-                                    max: 520,
+                                    max: 640,
                                     step: 10,
                                     unit: 'px',
                                     format: value => `${value}px`,
                                     help: 'Width of the left sidebar (skills, file tree, run list). Drag the divider between the panes to set it directly; the value is stored here.',
                                     hints: [
                                         { at: 220, label: 'Narrow' },
-                                        { at: 300, label: 'Default' },
-                                        { at: 420, label: 'Wide' }
+                                        { at: 320, label: 'Default' },
+                                        { at: 480, label: 'Wide' },
+                                        { at: 640, label: 'Max' }
                                     ]
                                 },
                                 {
@@ -701,7 +702,7 @@
                             id: 'mode',
                             label: 'What the code-reading skills see',
                             icon: 'fa-layer-group',
-                            note: 'A whole codebase cannot be attached verbatim. Digest mode builds a bounded structural map (imports, classes, function signatures, HTTP routes, host-extension registrations, command tables), discloses exclusions or omissions, and spends the remaining budget on full implementation text or a clearly marked excerpt. An explicit subsystem stays inside that scope and fails closed when no path matches.',
+                            note: 'Digest mode maps the project structure and static code links, then selects line-numbered implementation chunks relevant to your request and directly connected files. It stops after one dependency hop and discloses omitted code. Manual attachments keep full-file priority within the same budget. An explicit subsystem stays inside that scope and fails closed when no path matches.',
                             fields: [
                                 {
                                     key: 'sourceContextMode',
@@ -718,7 +719,7 @@
                                             value: 'digest',
                                             label: 'Whole codebase',
                                             icon: 'fa-sitemap',
-                                            hint: 'Map the active project within one combined budget, then add full code or a disclosed excerpt. Exclusions and omissions are reported.'
+                                            hint: 'Map the active project, then read relevant code chunks and direct dependencies within one budget. Exclusions and omissions are reported.'
                                         }
                                     ],
                                     help: 'Applies to the code-reading skills (Architecture Evaluation, Code to PRD). A "whole codebase" answer selects digest mode for that run even when this default remains bounded source.'
@@ -739,17 +740,17 @@
                                     max: 65536,
                                     step: 1024,
                                     unit: 'tokens',
-                                    help: 'Approximate source-envelope budget. About 62% goes to structure and the rest to full text or one disclosed implementation excerpt; prompt wrappers still consume additional context.'
+                                    help: 'Approximate source-envelope ceiling, including source framing. About 62% is reserved for structure; the rest holds manual attachments and relevant code chunks. Unused budget stays unused. Other prompt sections consume additional context.'
                                 },
                                 {
                                     key: 'digestMinFullTextLines',
-                                    label: 'Minimum lines for full text',
+                                    label: 'Minimum lines for discovery',
                                     type: 'number',
                                     min: 1,
                                     max: 2000,
                                     step: 1,
                                     unit: 'lines',
-                                    help: 'A file must be at least this long to spend budget on full text rather than only its digest. Keeps tiny stubs from crowding out the modules that explain the system.'
+                                    help: 'Prefer substantial files when no specific code matches the request. Relevant files, directly linked helpers and manual attachments can be smaller.'
                                 }
                             ]
                         }
@@ -843,7 +844,7 @@
                     groups: [
                         {
                             id: 'privacy',
-                            label: 'What Blueprint touches',
+                            label: 'What Codalio Blueprint touches',
                             icon: 'fa-user-shield',
                             note: 'Blueprint is a guest in SimpleRAG. Your journal, documents, knowledge graph and settings are never read or written — every document, run and preference lives in this browser profile under Blueprint\u2019s own storage keys. The only thing sent anywhere is the prompt for the model endpoint you already configured.',
                             fields: [
@@ -877,7 +878,7 @@
                                 { key: 'reset-workspace', label: 'Reset tab layout', icon: 'fa-window-restore', tone: 'warn', help: 'Removes only Blueprint\'s saved tabs and recreates the Agent tab. Projects, runs and settings remain untouched.' },
                                 { key: 'clear-runs', label: 'Clear run history', icon: 'fa-clock-rotate-left', tone: 'warn', help: 'Deletes every stored run and its step trace. Documents already written stay in the project.' },
                                 { key: 'clear-files', label: 'Clear project files', icon: 'fa-folder-minus', tone: 'danger', help: 'Deletes every document and attached source file from the project. Run history is kept.' },
-                                { key: 'clear-all', label: 'Erase all Blueprint data', icon: 'fa-trash-can', tone: 'danger', help: 'Removes projects, runs, settings and the removal marker — the plug-in starts as if freshly installed.' }
+                                { key: 'clear-all', label: 'Erase all Codalio Blueprint data', icon: 'fa-trash-can', tone: 'danger', help: 'Removes projects, runs, settings and the removal marker — the plug-in starts as if freshly installed.' }
                             ]
                         }
                     ]

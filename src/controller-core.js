@@ -187,7 +187,7 @@
         // 'attached' = only the manually attached files, capped by the limits
         //   above (the v1 behaviour).
         // 'digest'   = the whole project folder, as a structural digest plus
-        //   verbatim text for the highest-value code files.
+        //   bounded implementation chunks and direct static links.
         sourceContextMode: 'attached',
         // 16,000 tokens measured at ~2.7 min of prompt evaluation on the
         // target GPU (95 tok/s at long prompts). 32K was ~5 min, which is where
@@ -286,7 +286,7 @@
         settings.modelIdleTimeoutSeconds = boundedInt(settings.modelIdleTimeoutSeconds, 15, 900, DEFAULT_SETTINGS.modelIdleTimeoutSeconds);
         settings.modelRetryBaseDelayMs = boundedInt(settings.modelRetryBaseDelayMs, 100, 10000, DEFAULT_SETTINGS.modelRetryBaseDelayMs);
         settings.maxOpenTabs = boundedInt(settings.maxOpenTabs, 2, 24, DEFAULT_SETTINGS.maxOpenTabs);
-        settings.listPaneWidth = boundedInt(settings.listPaneWidth, 220, 520, DEFAULT_SETTINGS.listPaneWidth);
+        settings.listPaneWidth = boundedInt(settings.listPaneWidth, 220, 640, DEFAULT_SETTINGS.listPaneWidth);
         settings.treeIndentPx = boundedInt(settings.treeIndentPx, 8, 28, DEFAULT_SETTINGS.treeIndentPx);
         settings.maxSourceFiles = boundedInt(settings.maxSourceFiles, 1, 150, DEFAULT_SETTINGS.maxSourceFiles);
         settings.maxSourceFileKb = boundedInt(settings.maxSourceFileKb, 8, 2048, DEFAULT_SETTINGS.maxSourceFileKb);
@@ -1059,8 +1059,29 @@
      * hydrates afterwards and may replace what this returned.
      */
     function readStore() {
-        const parsed = parsePersistedStoreRaw(window.localStorage.getItem(PROJECTS_KEY));
+        const raw = window.localStorage.getItem(PROJECTS_KEY);
+        const headRaw = window.localStorage.getItem(DURABLE_HEAD_KEY);
+        // A controller refresh must not undo disk hydration by reading the
+        // deliberately stale browser cache again. Only reuse our snapshot while
+        // BOTH shared keys still match the versions we actually observed.
+        const recovered = localStorageDegraded && raw === degradedLocalRaw
+            && headRaw === knownDurableHeadRaw && lastGoodStoreSnapshot;
+        const parsed = parsePersistedStoreRaw(recovered
+            ? JSON.stringify(lastGoodStoreSnapshot, withoutDomNodes) : raw);
         projectStoreLoadError = parsed.error;
+        if (!parsed.error && !recovered) {
+            try {
+                const head = parseDurableHead(headRaw);
+                if (head && (head.revision > parsed.store.revision
+                    || (head.revision === parsed.store.revision
+                        && head.commitId !== parsed.store.commitId))) {
+                    projectStoreLoadError = 'The newer project data is still being restored from disk. Try again after recovery finishes.';
+                    Promise.resolve().then(() => hydrateFromDurableTier());
+                }
+            } catch (error) {
+                projectStoreLoadError = error.message;
+            }
+        }
         return parsed.store;
     }
 
@@ -1116,6 +1137,9 @@
     let knownStoreRevision = 0;
     let knownStoreCommitId = '';
     let lastGoodStoreSnapshot = null;
+    const DURABLE_HEAD_KEY = `${PROJECTS_KEY}:durable-head`;
+    let knownDurableHeadRaw = null;
+    let degradedLocalRaw = null;
     let externalResetObserved = false;
     const storeWriterId = uid('writer');
     const RUN_LEASE_SYMBOL = Symbol('codalioBlueprintRunLease');
@@ -1334,6 +1358,7 @@
         let serializedCandidate = null;
         let nextRevision = 0;
         let commitId = '';
+        let raw = null;
         try {
             if (externalResetObserved && !(options && options.allowMissingReset === true)) {
                 recordPersistenceFailure(new Error(
@@ -1352,7 +1377,19 @@
                 recordPersistenceFailure(new Error(lease.reason), 'store-busy');
                 return false;
             }
-            const raw = window.localStorage.getItem(PROJECTS_KEY);
+            raw = window.localStorage.getItem(PROJECTS_KEY);
+            const headRaw = window.localStorage.getItem(DURABLE_HEAD_KEY);
+            const head = parseDurableHead(headRaw);
+            if ((localStorageDegraded && headRaw !== knownDurableHeadRaw)
+                || (!localStorageDegraded && head && (head.revision > knownStoreRevision
+                    || (head.revision === knownStoreRevision && head.commitId !== knownStoreCommitId)))) {
+                recordPersistenceFailure(new Error(
+                    'Project data changed in another window. Restoring the newer disk revision before saving again.'
+                ), 'concurrent-update');
+                scheduleAuthoritativeStoreReload('external-disk-update');
+                return false;
+            }
+            const unchangedDiskCache = localStorageDegraded && raw === degradedLocalRaw;
             if (raw) {
                 let currentRevision = 0;
                 let currentCommitId = '';
@@ -1386,12 +1423,13 @@
                     currentRevision = knownStoreRevision;
                     currentCommitId = knownStoreCommitId;
                 }
-                if (currentRevision !== knownStoreRevision || currentCommitId !== knownStoreCommitId) {
+                if (!unchangedDiskCache
+                    && (currentRevision !== knownStoreRevision || currentCommitId !== knownStoreCommitId)) {
                     const conflict = new Error('Project data changed in another window. Reload before making more changes.');
                     recordPersistenceFailure(conflict, 'concurrent-update');
                     return false;
                 }
-            } else if (knownStoreRevision !== 0) {
+            } else if (knownStoreRevision !== 0 && !unchangedDiskCache) {
                 if (options && options.allowMissingReset === true) {
                     knownStoreRevision = 0;
                     knownStoreCommitId = '';
@@ -1418,7 +1456,10 @@
                 }
             }
 
-            nextRevision = knownStoreRevision + 1;
+            // A quota-refused candidate may already be queued to disk. Reserve
+            // a distinct revision for the retry, even though the caller rolled
+            // the failed mutation back in memory.
+            nextRevision = Math.max(knownStoreRevision, head ? head.revision : 0) + 1;
             commitId = lease.token;
             const candidate = {
                 version: STORE_VERSION,
@@ -1453,10 +1494,9 @@
                 ), 'store-busy');
                 return false;
             }
-            // Once the durable tier has advanced past localStorage (a quota
-            // failure in an earlier session), localStorage's revision is stale
-            // and comparing against it would reject every save as a concurrent
-            // update. The newer tier becomes the fencing authority instead.
+            // Keep a small shared revision fence when full project bytes no
+            // longer fit in localStorage. Other windows can then detect disk
+            // writes instead of silently committing from the stale cache.
             let localCommitOk = false;
             if (!localStorageDegraded) {
                 window.localStorage.setItem(PROJECTS_KEY, serialized);
@@ -1470,10 +1510,13 @@
                     return false;
                 }
                 localCommitOk = true;
+            } else {
+                publishDurableHead(nextRevision, commitId, true);
             }
             // Mirror to disk under the lease we still hold, so the durable copy
             // carries the same commit identity the lease granted.
-            mirrorToDurableTier(serialized, nextRevision, commitId);
+            if (borrowedLease) borrowedLease.durableMirror = { serialized, revision: nextRevision, commitId };
+            else mirrorToDurableTier(serialized, nextRevision, commitId);
             if (!localCommitOk && !ownsStoreWriteIntent(lease)) {
                 recordPersistenceFailure(new Error(
                     'Another Blueprint window acquired project-write priority before this save committed.'
@@ -1503,17 +1546,20 @@
             // still fail (no OPFS, no disk space). A reported failure keeps the
             // run's persistenceError and lets the existing retry path re-save,
             // which is the honest and recoverable outcome.
-            if (!localStorageDegraded && isLocalStorageQuotaError(error)) {
+            if (!borrowedLease && !localStorageDegraded && serializedCandidate && durableState.available
+                && lease && ownsStoreWriteIntent(lease) && isLocalStorageQuotaError(error)) {
                 try {
+                    publishDurableHead(nextRevision, commitId, true);
+                    degradedLocalRaw = raw;
+                    localStorageDegraded = true;
+                    durableState.degraded = true;
                     mirrorToDurableTier(serialized, nextRevision, commitId);
                 } catch (mirrorError) {
                     console.warn('[codalio-blueprint] durable mirror could not be queued', mirrorError);
                 }
                 // Only trust the durable tier once it has actually confirmed a
                 // write; until then localStorage remains the authority of record.
-                if (durableState.available) {
-                    localStorageDegraded = true;
-                    durableState.degraded = true;
+                if (localStorageDegraded) {
                     console.info('[codalio-blueprint] localStorage refused a commit; project data is mirrored to disk');
                 }
             }
@@ -1581,6 +1627,37 @@
     // Set once localStorage has rejected a commit (quota). From then on the
     // durable tier's revision — not localStorage's — is the fencing authority.
     let localStorageDegraded = false;
+    let durableHydrationTimer = null;
+
+    function parseDurableHead(raw) {
+        if (!raw) return null;
+        const head = JSON.parse(raw);
+        if (!head || !Number.isSafeInteger(head.revision) || head.revision < 1
+            || typeof head.commitId !== 'string' || !head.commitId) {
+            throw new Error('The saved disk revision marker is malformed. Project data was preserved.');
+        }
+        return head;
+    }
+
+    // Called only while holding the shared store lease. The payload remains on
+    // disk; this tiny record makes its revision visible to every window.
+    function publishDurableHead(revision, commitId, pending) {
+        const raw = JSON.stringify({ revision, commitId, pending,
+            expiresAt: pending ? Date.now() + STORE_LOCK_LEASE_MS : 0 });
+        window.localStorage.setItem(DURABLE_HEAD_KEY, raw);
+        if (window.localStorage.getItem(DURABLE_HEAD_KEY) !== raw) {
+            throw new Error('Another window replaced the disk revision marker before it could be verified.');
+        }
+        knownDurableHeadRaw = raw;
+    }
+
+    function durableMirrorIsCurrent(revision, commitId) {
+        const head = parseDurableHead(window.localStorage.getItem(DURABLE_HEAD_KEY));
+        const local = parsePersistedStoreRaw(window.localStorage.getItem(PROJECTS_KEY));
+        if (local.error) return false;
+        return [head, local.store].every(value => !value || value.revision < revision
+            || (value.revision === revision && value.commitId === commitId));
+    }
 
     function durableRoot() {
         if (!durableRootPromise) {
@@ -1618,7 +1695,8 @@
 
     async function durableWriteRaw(serialized, revision, commitId) {
         // Fence before touching disk.
-        if (Number(revision) < durableState.revision) return false;
+        if (Number(revision) < durableState.revision
+            || !durableMirrorIsCurrent(revision, commitId)) return false;
         const root = await durableRoot();
         const tempName = `${DURABLE_FILE}.${commitId || revision}.tmp`;
         const handle = await root.getFileHandle(tempName, { create: true });
@@ -1630,6 +1708,12 @@
             // A failed write must not leave a half-written temp file behind.
             try { await root.removeEntry(tempName); } catch (_) { /* best effort */ }
             throw error;
+        }
+        // A second window can advance while the temp file is being written.
+        // Do not promote a mirror that has since lost the shared revision fence.
+        if (!durableMirrorIsCurrent(revision, commitId)) {
+            try { await root.removeEntry(tempName); } catch (_) { /* best effort */ }
+            return false;
         }
         if (typeof handle.move === 'function') {
             // Rename over the target: the only atomic replace OPFS offers, so a
@@ -1647,6 +1731,18 @@
         durableState.revision = Number(revision) || 0;
         durableState.commitId = String(commitId || '');
         durableState.lastError = '';
+        withStorageWriteLease(() => {
+            const raw = window.localStorage.getItem(DURABLE_HEAD_KEY);
+            const head = parseDurableHead(raw);
+            if (head && head.revision === revision && head.commitId === commitId && head.pending) {
+                // Changing pending -> confirmed emits a second storage event,
+                // allowing peers that saw the reservation to retry hydration.
+                const wasKnown = raw === knownDurableHeadRaw;
+                const previousKnown = knownDurableHeadRaw;
+                publishDurableHead(revision, commitId, false);
+                if (!wasKnown) knownDurableHeadRaw = previousKnown;
+            }
+        });
         return true;
     }
 
@@ -1718,6 +1814,11 @@
      */
     async function hydrateFromDurableTier() {
         if (durableUnsupported) return false;
+        if (durableHydrationTimer) {
+            clearTimeout(durableHydrationTimer);
+            durableHydrationTimer = null;
+        }
+        const localRawAtStart = window.localStorage.getItem(PROJECTS_KEY);
         let raw = null;
         try {
             raw = await durableReadRaw();
@@ -1755,11 +1856,56 @@
             return false;
         }
         const durableRevision = Number.isSafeInteger(parsed.store.revision) ? parsed.store.revision : 0;
+        let headRaw = window.localStorage.getItem(DURABLE_HEAD_KEY);
+        let head;
+        try { head = parseDurableHead(headRaw); } catch (error) {
+            durableState.lastError = error.message;
+            return false;
+        }
+        if (window.localStorage.getItem(PROJECTS_KEY) !== localRawAtStart) return false;
+        if (head && (head.revision > durableRevision
+            || (head.revision === durableRevision && head.commitId !== parsed.store.commitId))) {
+            if (!head.pending) return false;
+            if (Number(head.expiresAt) > Date.now()) {
+                // Confirmation usually arrives first. Retry as well so a window
+                // that crashed before confirming cannot strand startup forever.
+                durableHydrationTimer = setTimeout(() => {
+                    durableHydrationTimer = null;
+                    hydrateFromDurableTier();
+                }, Math.min(1000, Number(head.expiresAt) - Date.now()));
+                return false;
+            }
+            const recovered = withStorageWriteLease(() => {
+                if (window.localStorage.getItem(DURABLE_HEAD_KEY) !== headRaw
+                    || window.localStorage.getItem(PROJECTS_KEY) !== localRawAtStart) return false;
+                publishDurableHead(durableRevision, parsed.store.commitId, false);
+                headRaw = knownDurableHeadRaw;
+                return true;
+            });
+            if (!recovered) return false;
+        }
         durableState.revision = durableRevision;
         durableState.commitId = String(parsed.store.commitId || '');
         // Only a strictly newer tier wins. Equal means both agree; LOWER means
         // another window already moved on, so rolling back would lose its work.
-        if (durableRevision <= localRevision) return false;
+        if (durableRevision <= localRevision) {
+            if (projectStoreLoadError && durableRevision === localRevision
+                && parsed.store.commitId === store.commitId) {
+                projectStoreLoadError = '';
+                scheduleAuthoritativeStoreReload('durable-tier-recovery');
+            }
+            return false;
+        }
+
+        const adopted = withStorageWriteLease(() => {
+            if (window.localStorage.getItem(PROJECTS_KEY) !== localRawAtStart
+                || window.localStorage.getItem(DURABLE_HEAD_KEY) !== headRaw) return false;
+            // Upgrade legacy disk-only data to the shared fence before allowing
+            // any subsequent synchronous saves from this recovered snapshot.
+            publishDurableHead(durableRevision, parsed.store.commitId, false);
+            return true;
+        });
+        if (!adopted) return false;
 
         assignStoreState(parsed.store);
         store.revision = durableRevision;
@@ -1770,6 +1916,7 @@
         // The durable tier outran localStorage — typically a quota failure in an
         // earlier session. Treat localStorage as a cache from here on.
         localStorageDegraded = true;
+        degradedLocalRaw = localRawAtStart;
         durableState.degraded = true;
         projectStoreLoadError = '';
         persistence.ok = true;
@@ -1822,6 +1969,12 @@
             if (event.key === WORKSPACE_KEY) {
                 scheduleAuthoritativeWorkspaceReload(event.newValue === null
                     ? 'external-workspace-reset' : 'external-workspace-update');
+                return;
+            }
+            if (event.key === DURABLE_HEAD_KEY) {
+                // Stop active work through the controller first. readStore will
+                // request disk hydration only once it reaches a safe reload.
+                scheduleAuthoritativeStoreReload('external-disk-update');
                 return;
             }
             if (event.key !== PROJECTS_KEY) return;
@@ -3445,8 +3598,14 @@
         let redactions = 0;
         const replace = (pattern, replacer) => {
             content = content.replace(pattern, (...args) => {
+                const replacement = typeof replacer === 'function' ? replacer(...args) : replacer;
+                if (replacement === args[0]) return replacement;
                 redactions += 1;
-                return typeof replacer === 'function' ? replacer(...args) : replacer;
+                // Line-numbered evidence must still refer to the original file
+                // after a multiline key or credential has been removed.
+                const removedLines = (args[0].match(/\n/g) || []).length
+                    - (replacement.match(/\n/g) || []).length;
+                return replacement + '\n'.repeat(Math.max(0, removedLines));
             });
         };
         replace(/-----BEGIN (?:(?:RSA|EC|OPENSSH|DSA|ENCRYPTED) )?PRIVATE KEY-----[\s\S]*?-----END (?:(?:RSA|EC|OPENSSH|DSA|ENCRYPTED) )?PRIVATE KEY-----/gi,
@@ -3473,8 +3632,27 @@
             (_match, prefix, quote) => `${prefix}${quote}[REDACTED_SECRET]${quote}`);
         replace(/(["']?(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|password|passwd|private[_-]?key|secret)["']?\s*[:=]\s*)([^\s,;}"']{6,})/gi,
             (_match, prefix) => `${prefix}[REDACTED_SECRET]`);
+        // A settings field/action's `key` names a control, not its stored value.
+        // Require adjacent UI schema properties in the same object fragment;
+        // a bare key assignment or an explicitly named credential still redacts.
+        // Known token families above and the entropy check below also apply.
+        const isSchemaIdentifier = (prefix, token, offset, source) => {
+            if (!/^["']?key["']?\s*:\s*$/i.test(prefix)
+                || (offset > 0 && /[\w$-]/.test(source[offset - 1]))
+                || !/^[A-Za-z_$][\w$.-]{0,95}$/.test(token)) return false;
+            const before = source.slice(Math.max(0, offset - 2048), offset);
+            const opening = before.lastIndexOf('{');
+            if (opening < 0 || before.lastIndexOf('}') > opening) return false;
+            const after = source.slice(offset, offset + 2048).split(/[{}]/, 1)[0];
+            const field = before.slice(opening + 1) + after;
+            const typedField = /(?:^|,)\s*["']?type["']?\s*:\s*(["'])(?:toggle|number|range|segmented|select|text|textarea|checkbox|switch|boolean|string)\1/.test(field);
+            const action = /(?:^|,)\s*["']?icon["']?\s*:\s*(["'])[\w-]+\1/.test(field)
+                && /(?:^|,)\s*["']?tone["']?\s*:\s*(["'])(?:default|warn|danger|primary)\1/.test(field);
+            return /(?:^|,)\s*["']?label["']?\s*:\s*(["'])[^\r\n"']+\1/.test(field) && (typedField || action);
+        };
         replace(/(["']?(?:[a-z][a-z0-9]*[_-])*(?:key|token|secret|password|passwd)["']?\s*[:=]\s*)(["'])([^\r\n"']{6,})(\2)/gi,
-            (_match, prefix, quote) => `${prefix}${quote}[REDACTED_SECRET]${quote}`);
+            (match, prefix, quote, token, _close, offset, source) => isSchemaIdentifier(prefix, token, offset, source)
+                ? match : `${prefix}${quote}[REDACTED_SECRET]${quote}`);
         replace(/(["']?(?:[a-z][a-z0-9]*[_-])*(?:key|token|secret|password|passwd)["']?\s*[:=]\s*)([^\s,;}"']{6,})/gi,
             (_match, prefix) => `${prefix}[REDACTED_SECRET]`);
         replace(/([a-z][a-z0-9+.-]*:\/\/[^\s/:@]+:)[^\s/@]+(@)/gi,
@@ -3886,6 +4064,11 @@
         let sinceYield = 0;
         for (let index = 0; index < list.length; index += 1) {
             assertImportActive();
+            // Report before the next asynchronous read, including imports with
+            // fewer than 40 files or a slow next file. The UI batches rendering.
+            if (typeof cfg.onProgress === 'function') {
+                cfg.onProgress(index, list.length, result.imported.length);
+            }
             // Walking a huge FileList is one long synchronous block, so the page
             // cannot paint the busy state the caller just set and the tab looks
             // hung. Yield every 40 files: enough to stay fast on a small import,
@@ -3893,9 +4076,6 @@
             sinceYield += 1;
             if (sinceYield >= 40) {
                 sinceYield = 0;
-                if (typeof cfg.onProgress === 'function') {
-                    cfg.onProgress(index, list.length, result.imported.length);
-                }
                 await new Promise(resolve => setTimeout(resolve, 0));
                 assertImportActive();
             }
@@ -3979,6 +4159,8 @@
                 noteSkip(relativePath, `canonical path collision (${storedPath})`);
                 continue;
             }
+            const selectedPath = store.openPath;
+            const selectedFolder = store.openFolderId;
             const written = writeFile(storedPath, content, {
                 folder: result.folder.id,
                 origin: 'imported',
@@ -3990,6 +4172,10 @@
                 noteSkip(relativePath, 'could not be stored');
                 continue;
             }
+            // Import arrivals update the tree, not the user's open document.
+            // Preserve even a selection made while an earlier read was pending.
+            store.openPath = selectedPath;
+            store.openFolderId = selectedFolder;
             totalBytes += size;
             importedPaths.add(written.path);
             result.imported.push({ path: written.path, folderId: result.folder.id, bytes: size });
@@ -4000,15 +4186,6 @@
                 result.notEnumerated = list.length - index - 1;
                 break;
             }
-        }
-
-        // writeFile() moves openPath to whatever it last wrote; putting the user's
-        // previously open document back means importing a folder does not silently
-        // switch the viewer to some arbitrary file from it.
-        const lastImported = result.imported[result.imported.length - 1];
-        if (!lastImported || (store.openFolderId === result.folder.id && store.openPath === lastImported.path)) {
-            store.openPath = openPathBeforeImport;
-            store.openFolderId = openFolderBeforeImport;
         }
 
         const destination = result.folder && store.folders[result.folder.id];
@@ -4341,12 +4518,10 @@
                 for (let index = 0; index < ordered.length; index += 1) {
                     if (out.truncated && !truncatedWhileListing) break;
                     const entry = ordered[index];
+                    if (typeof cfg.onProgress === 'function') cfg.onProgress(out.files.length);
                     processedSinceYield += 1;
                     if (processedSinceYield >= 40) {
                         processedSinceYield = 0;
-                        if (typeof cfg.onProgress === 'function') {
-                            cfg.onProgress(out.files.length);
-                        }
                         await new Promise(resolve => setTimeout(resolve, 0));
                         assertScanActive();
                     }
@@ -4822,9 +4997,8 @@
     // function signatures, HTTP routes, host-extension registrations and
     // slash-command tables compresses ~19.5x with no model and no GPU cost, and
     // covers 100% of first-party files. Tier 2 then spends what is left on the
-    // FULL TEXT of the highest-value files, so the model reads real code, not
-    // only names — the skills explicitly forbid inferring architecture from
-    // file names alone.
+    // implementation chunks near request matches and direct static neighbours.
+    // The model reads real code with disclosed line ranges, not only names.
     // ------------------------------------------------------------------
 
     /** Extensions whose content is code worth full-text attachment in Tier 2. */
@@ -4895,7 +5069,7 @@
         out.imports = Array.prototype.map.call(
             text.match(/^(?:from\s+[\w.]+\s+import|import\s+[\w.]+)/gm) || [],
             line => line.replace(/^from\s+/, '').replace(/^import\s+/, '').split(/\s+/)[0]
-        ).slice(0, 14);
+        );
         return out;
     }
 
@@ -4967,12 +5141,12 @@
         });
         out.routes = extractRoutes(text);
         out.imports = Array.prototype.map.call(
-            text.match(/(?:^|\n)\s*(?:import\s+[^'"]*from\s+|const\s+\w+\s*=\s*require\(\s*)['"][^'"]+['"]/g) || [],
+            text.match(/(?:^|\n)\s*(?:(?:import|export)\s+(?:[^'";]*?from\s+)?|(?:const|let|var)\s+[^=\n]+\s*=\s*require\(\s*)['"][^'"\n]+['"]/g) || [],
             line => {
                 const m = /['"]([^'"]+)['"]\s*$/.exec(line);
                 return m ? m[1] : '';
             }
-        ).filter(Boolean).slice(0, 14);
+        ).filter(Boolean);
         return out;
     }
 
@@ -5021,6 +5195,32 @@
         } catch (_) {
             return [];
         }
+    }
+
+    /** Only declared identity/permission fields from recognized JSON manifests.
+     * Values are bounded facts with provenance, not evidence of runtime grants. */
+    function digestManifestMetadata(relativePath, content) {
+        if (!/(?:^|\/)(?:plugin|package|manifest)\.json$/i.test(relativePath)) return '';
+        let manifest;
+        try { manifest = JSON.parse(content); } catch (_) { return ''; }
+        if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) return '';
+        const bounded = (value, limit) => {
+            let clean;
+            try { clean = JSON.parse(sanitizeSourceForModel(JSON.stringify(value)).content); }
+            catch (_) { return '[REDACTED_UNSAFE_METADATA]'; }
+            return clean.length > limit ? clean.slice(0, limit) + '… [truncated]' : clean;
+        };
+        const facts = {};
+        ['id', 'name', 'version'].forEach(key => {
+            if (typeof manifest[key] === 'string') facts[key] = bounded(manifest[key], 160);
+        });
+        if (Array.isArray(manifest.permissions)) {
+            const ids = manifest.permissions.map(permission => typeof permission === 'string'
+                ? permission : permission && permission.id).filter(id => typeof id === 'string');
+            facts.permissions = ids.slice(0, 12).map(id => bounded(id, 80));
+            if (ids.length > 12) facts.permissionsOmitted = ids.length - 12;
+        }
+        return Object.keys(facts).length ? 'declared manifest metadata: ' + JSON.stringify(facts) : '';
     }
 
     /**
@@ -5072,7 +5272,7 @@
 
         if (extension === 'py') {
             const py = extractPythonStructure(text);
-            if (py.imports.length) { parts.push('imports: ' + uniqueInOrder(py.imports).join(', ')); value += 1; }
+            if (py.imports.length) { parts.push('imports: ' + uniqueInOrder(py.imports).slice(0, 14).join(', ')); value += 1; }
             addList('ROUTES', py.routes, 3);
             addList('classes', py.classes, 2);
             addList('functions', py.functions, 2);
@@ -5087,7 +5287,7 @@
                 if (html.actions.length) { parts.push('UI actions: ' + html.actions.join(', ')); value += 2; }
             } else {
                 const js = extractJsStructure(text);
-                if (js.imports.length) { parts.push('imports: ' + uniqueInOrder(js.imports).join(', ')); value += 1; }
+                if (js.imports.length) { parts.push('imports: ' + uniqueInOrder(js.imports).slice(0, 14).join(', ')); value += 1; }
                 js.registers.forEach(register => {
                     value += 3;
                     const bits = [];
@@ -5102,6 +5302,8 @@
                 addList('functions', js.functions, 2);
             }
         } else if (extension === 'json') {
+            const metadata = digestManifestMetadata(relativePath, text);
+            if (metadata) { parts.push(metadata); value += 2; }
             addList('keys', extractJsonStructure(text), 1);
         } else if (/^(md|txt)$/.test(extension)) {
             const headings = extractMarkdownStructure(text);
@@ -5124,6 +5326,236 @@
         return { text: parts.join('\n'), value, excluded: false };
     }
 
+    /** Static links inside the supplied scope only; never resolve by basename.
+     * Ambiguous packages, aliases and dynamic imports remain unknown. This is
+     * an orientation graph, not proof of a runtime call or execution order. */
+    function buildSourceCoupling(records) {
+        const normalize = value => {
+            const parts = [];
+            for (const part of String(value).replace(/\\/g, '/').split('/')) {
+                if (!part || part === '.') continue;
+                if (part === '..') {
+                    if (!parts.length) return '';
+                    parts.pop();
+                } else parts.push(part);
+            }
+            return parts.join('/');
+        };
+        const nodes = new Map(records.map(record => [record.path, {
+            dependencies: new Set(), dependents: new Set(), unresolved: 0
+        }]));
+        const paths = new Map(records.map(record => [normalize(record.path), record.path]));
+        const link = (from, to) => {
+            if (!to || from === to) return;
+            nodes.get(from).dependencies.add(to);
+            nodes.get(to).dependents.add(from);
+        };
+        const resolve = (base, python) => {
+            const normalized = normalize(base);
+            if (!normalized) return '';
+            if (paths.has(normalized)) return paths.get(normalized);
+            const suffixes = python ? ['.py', '/__init__.py']
+                : ['.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.vue', '.svelte',
+                    '/index.js', '/index.ts', '/index.tsx', '/index.jsx'];
+            const hits = suffixes.map(suffix => paths.get(normalized + suffix)).filter(Boolean);
+            return hits.length === 1 ? hits[0] : '';
+        };
+        const globalWriters = new Map();
+        const globalReaders = new Map();
+        records.forEach(record => {
+            const filePath = normalize(record.path);
+            const dir = filePath.includes('/') ? filePath.slice(0, filePath.lastIndexOf('/') + 1) : '';
+            const python = /\.py$/i.test(filePath);
+            const javascript = /\.(?:[cm]?js|jsx|tsx?|vue|svelte)$/i.test(filePath);
+            const html = /\.html?$/i.test(filePath);
+            const structure = python ? extractPythonStructure(record.content)
+                : (javascript ? extractJsStructure(record.content) : (html ? extractHtmlStructure(record.content) : {}));
+            const specifiers = html ? (structure.scripts || []).concat(structure.styles || [])
+                : (structure.imports || []);
+            new Set(specifiers).forEach(specifier => {
+                let base = '';
+                if (python) {
+                    const relative = /^(\.+)(.*)$/.exec(specifier);
+                    if (relative) {
+                        base = dir + '../'.repeat(relative[1].length - 1) + relative[2].replace(/\./g, '/');
+                        // `from . import helper` does not identify which child
+                        // is a module; don't pretend the package is that child.
+                        if (!relative[2]) base = '';
+                    } else base = specifier.replace(/\./g, '/');
+                } else if (html && !/^(?:[a-z]+:|\/|#)/i.test(specifier)) {
+                    base = dir + specifier.split(/[?#]/)[0];
+                } else if (javascript && /^\.\.?\//.test(specifier)) base = dir + specifier;
+                const hit = base ? resolve(base, python) : '';
+                if (hit) link(record.path, hit);
+                else nodes.get(record.path).unresolved += 1;
+            });
+            // This plug-in uses IIFEs and window exports instead of ESM. Only
+            // connect a named global when exactly one file assigns it.
+            if (!javascript) return;
+            const globalPattern = /\b(?:window|globalThis)\.([A-Za-z_$][\w$]*)(\s*=(?!=|>))?/g;
+            let match;
+            while ((match = globalPattern.exec(record.content)) !== null) {
+                const table = match[2] ? globalWriters : globalReaders;
+                if (!table.has(match[1])) table.set(match[1], new Set());
+                table.get(match[1]).add(record.path);
+            }
+        });
+        globalReaders.forEach((readers, name) => {
+            const writers = globalWriters.get(name);
+            if (!writers || writers.size !== 1) return;
+            const writer = [...writers][0];
+            readers.forEach(reader => link(reader, writer));
+        });
+        return nodes;
+    }
+
+    function sourceFocusTerms(text) {
+        const stop = new Set(('a all an and analyze app architecture are as at be build by can change check code codebase '
+            + 'could current describe document entire evaluate evaluation explain file files fix for from full function '
+            + 'help how i implement in inspect is it its me model module need of on or our please prd project read '
+            + 'review scope should source subsystem system task test tests that the their them then these this to '
+            + 'understand update use user want we what when where which whole will with would you').split(' '));
+        return [...new Set((String(text || '').slice(0, 8000).toLowerCase().match(/[a-z_$][\w$-]{2,}/g) || [])
+            .filter(term => !stop.has(term)))].slice(0, 24);
+    }
+
+    /** Conservative JS/TS statement-end hints, not an AST. Ignore delimiters
+     * inside comments, strings, templates and regex literals. Prefer shallower
+     * ends so a fitting branch stays together; never end just before else/catch.
+     * Unsupported syntax may reduce evidence rather than force a broken slice. */
+    function sourceStatementEnds(lines) {
+        const ends = new Map();
+        const stack = [];
+        const codeLines = [];
+        let quote = '';
+        let blockComment = false;
+        let regexClass = false;
+        let previousToken = '';
+        lines.forEach((line, index) => {
+            let code = '';
+            for (let i = 0; i < line.length; i += 1) {
+                const char = line[i];
+                const next = line[i + 1];
+                if (blockComment) {
+                    if (char === '*' && next === '/') { blockComment = false; i += 1; }
+                    continue;
+                }
+                if (quote) {
+                    if (char === '\\') { i += 1; continue; }
+                    if (quote === '/' && char === '[') regexClass = true;
+                    if (quote === '/' && char === ']') regexClass = false;
+                    if (char === quote && !regexClass) { quote = ''; code += 'v'; previousToken = 'v'; }
+                    continue;
+                }
+                if (char === '/' && next === '/') break;
+                if (char === '/' && next === '*') { blockComment = true; i += 1; continue; }
+                const regexStart = char === '/' && (!previousToken || /[=(:,!&|?;{\[]$/.test(previousToken)
+                    || /\b(?:return|throw|case|yield)\s*$/.test(code));
+                if (char === '"' || char === "'" || char === '`' || regexStart) {
+                    quote = char;
+                    regexClass = false;
+                    continue;
+                }
+                code += char;
+                if ('({['.includes(char)) stack.push(char);
+                if (')}]'.includes(char)) {
+                    if (stack[stack.length - 1] === ({ ')': '(', '}': '{', ']': '[' })[char]) stack.pop();
+                }
+                if (char.trim()) previousToken = char;
+            }
+            codeLines.push(code.trim());
+            if (quote || blockComment) return;
+            const top = stack[stack.length - 1];
+            // Commas qualify only when closing a whole object, not a property.
+            const closedBlock = /}\s*[;),]*$/.test(code) && top !== '(';
+            const statement = /;\s*$/.test(code) && (!top || top === '{');
+            const asi = /[\w$)\]]\s*$/.test(code) && (!top || top === '{')
+                && !/\b(?:else|try|finally|do)\s*$/.test(code)
+                && !/^\s*(?:(?:if|for|while|switch|catch|with)\b|\)+\s*$)/.test(code);
+            if (closedBlock || statement || asi || (!code.trim()
+                && (!previousToken || previousToken === '{' || ends.has(index)))) ends.set(index + 1, stack.length);
+        });
+        // The next non-comment line may continue the preceding expression or
+        // branch. Removing that boundary keeps both sides in one excerpt.
+        let following = '';
+        for (let i = lines.length - 1; i >= 0; i -= 1) {
+            if (/^(?:else\b|catch\b|finally\b|while\s*\(|as\b|satisfies\b|[.([{`+\-*/?:=,&|])/.test(following)) ends.delete(i + 1);
+            if (codeLines[i]) following = codeLines[i];
+        }
+        return ends;
+    }
+
+    /** Bounded, non-overlapping excerpts. JS/TS favors statement/branch ends;
+     * other formats use declaration/line hints. Large enclosing functions can
+     * span chunks; original line ranges never imply complete function bodies. */
+    function chunkSourceForDigest(file, terms) {
+        const lines = String(file.content || '').split('\n');
+        const statementEnds = /\.(?:[cm]?js|ts)$/i.test(file.path) ? sourceStatementEnds(lines) : null;
+        const declaration = /^\s*(?:(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function|def|class)\s+|(?:export\s+)?(?:const|let|var)\s+\w+\s*=\s*(?:async\s*)?(?:\([^)]*\)|\w+)\s*=>|(?:async\s+)?(?!(?:if|for|while|switch|catch|with)\b)[A-Za-z_$][\w$]*\s*\([^;]*\)\s*\{|#{1,6}\s)/;
+        const score = text => {
+            const words = new Set(String(text).toLowerCase().match(/[a-z_$][\w$-]*/g) || []);
+            return terms.reduce((total, term) => total + Number(words.has(term)), 0);
+        };
+        const pathScore = score(file.path) * 6;
+        const chunks = [];
+        let start = 0;
+        let chars = 0;
+        const append = end => {
+            const content = lines.slice(start, end).join('\n');
+            const named = /\b(?:function|def|class)\s+([A-Za-z_$][\w$]*)|\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=|^\s*(?:async\s+)?([A-Za-z_$][\w$]*)\s*\(/.exec(lines[start] || '');
+            const symbol = declaration.test(lines[start] || '') && named ? named[1] || named[2] || named[3] : '';
+            if (content.trim() && content.length <= 3200) chunks.push({
+                startLine: start + 1, endLine: end, content,
+                symbol: /^(?:if|for|while|switch|catch|with)$/.test(symbol) ? '' : symbol,
+                score: pathScore + score(content) + (symbol ? score(lines[start]) * 3 : 0)
+            });
+            start = end;
+            chars = 0;
+        };
+        let index = 0;
+        while (index < lines.length) {
+            const line = lines[index];
+            // Keep a small function's closing brace from dragging unrelated
+            // following configuration into the same excerpt. Indentation is a
+            // boundary hint only; excerpts still make no completeness claim.
+            const closedDeclaration = index > start && declaration.test(lines[start])
+                && /^\s*}\s*[;)]*\s*$/.test(lines[index - 1])
+                && /^\s*/.exec(lines[index - 1])[0].length === /^\s*/.exec(lines[start])[0].length;
+            const limitReached = index - start >= 80 || chars + line.length > 3200;
+            if (index > start && (limitReached
+                || ((!statementEnds || statementEnds.has(index)) && (declaration.test(line) || closedDeclaration)))) {
+                let end = index;
+                if (statementEnds && limitReached) {
+                    end = 0;
+                    let shallowest = Infinity;
+                    for (let at = start + 1; at <= index; at += 1) {
+                        if (statementEnds.has(at) && statementEnds.get(at) <= shallowest) {
+                            shallowest = statementEnds.get(at);
+                            end = at;
+                        }
+                    }
+                    if (!end) {
+                        // One statement exceeds a chunk. Skip through its end,
+                        // including continuation lines, instead of sending half.
+                        start = index + 1;
+                        while (start < lines.length && !statementEnds.has(start)) start += 1;
+                        index = start;
+                        chars = 0;
+                        continue;
+                    }
+                }
+                append(end);
+                index = end;
+                continue;
+            }
+            chars += line.length + 1;
+            index += 1;
+        }
+        if (!statementEnds || statementEnds.has(lines.length)) append(lines.length);
+        return chunks.sort((left, right) => right.score - left.score
+            || Number(Boolean(right.symbol)) - Number(Boolean(left.symbol)) || left.startLine - right.startLine);
+    }
+
     /**
      * Score files so the budget goes where the architecture is explained.
      *
@@ -5136,33 +5568,8 @@
      *   - stylesheets and vendor/minified are pushed DOWN, not merely excluded:
      *     223K tokens of CSS was the single biggest waste measured
      */
-    function scoreFilesForDigest(records) {
-        const byBase = {};
-        records.forEach(record => {
-            const path = String(record.path || '');
-            const noExt = path.replace(/\.(?:js|mjs|cjs|jsx|ts|tsx|py|vue|svelte)$/, '');
-            if (!(noExt in byBase)) byBase[noExt] = path;
-            const base = noExt.split('/').pop();
-            if (!(base in byBase)) byBase[base] = path;
-            const leaf = path.split('/').pop();
-            if (!(leaf in byBase)) byBase[leaf] = path;
-        });
-
-        const references = {};
-        records.forEach(record => {
-            const path = String(record.path || '');
-            const extension = path.split('.').pop().toLowerCase();
-            const structure = extension === 'py'
-                ? extractPythonStructure(record.content)
-                : extractJsStructure(record.content);
-            (structure.imports || []).forEach(specifier => {
-                const normalized = String(specifier)
-                    .replace(/^\.\.?\//, '')
-                    .replace(/\.(?:js|py|ts|mjs|cjs)$/, '');
-                const hit = byBase[normalized] || byBase[normalized.split('/').pop()];
-                if (hit && hit !== path) references[hit] = (references[hit] || 0) + 1;
-            });
-        });
+    function scoreFilesForDigest(records, coupling) {
+        const graph = coupling || buildSourceCoupling(records);
 
         return records.map(record => {
             const path = String(record.path || '');
@@ -5173,7 +5580,9 @@
             if (isVendoredPath(path) || isMinifiedSource(path, record.content)) score -= 100;
             if (ENTRY_FILE_NAMES.indexOf(leaf) >= 0) score += 6;
             if (/^(router|main|app|index|controller|core|server|agent)\b/i.test(leaf)) score += 4;
-            score += Math.min(8, (references[path] || 0) * 2);
+            const node = graph.get(path);
+            const references = node ? node.dependents.size : 0;
+            score += Math.min(8, references * 2);
             score += Math.min(2, lines / 1500);
             if (/^(css|scss|sass|less)$/.test(extension)) score -= 2;
             return {
@@ -5181,7 +5590,7 @@
                 content: String(record.content || ''),
                 lines,
                 extension,
-                references: references[path] || 0,
+                references,
                 score
             };
         }).sort((left, right) => right.score - left.score);
@@ -5197,12 +5606,10 @@
      * files; if Tier 1 overflows, the LOWEST-scoring files degrade to a
      * one-line stub rather than being dropped, keeping coverage total.
      *
-     * Tier 2 (verbatim, the rest): full text of the highest-scoring CODE files
-     * that fit. Normally restricted to code and to files >= 40 lines, because in
-     * calibration an unrestricted Tier 2 spent 32% of the whole budget on two
-     * HTML files while the file that actually explained the system (router.py)
-     * could never fit. If that would leave the model with signatures only, one
-     * high-value implementation is sent in full or as a clearly marked excerpt.
+     * Tier 2 (implementation, the rest): manual attachments in full, then up to
+     * two bounded line chunks per automatic file. Start with at most four
+     * request matches (or structural seeds), add at most four direct neighbours,
+     * and stop. Remaining budget is a ceiling, never a target to fill.
      *
      * Returns { digestText, fullTextFiles, tokens, coverage, trimmed, deepened,
      * excluded, files } — `files` carries per-file digests for the UI to show
@@ -5217,14 +5624,45 @@
 
         const input = (Array.isArray(records) ? records : [])
             .filter(record => record && typeof record.content === 'string' && record.path);
-        const scored = scoreFilesForDigest(input);
+        const coupling = buildSourceCoupling(input.filter(file =>
+            !isVendoredPath(file.path) && !isMinifiedSource(file.path, file.content)));
+        const scored = scoreFilesForDigest(input, coupling);
         const real = scored.filter(file => file.score > -50 || priorityPaths.has(file.path));
+        const focusTerms = sourceFocusTerms(cfg.focusText);
+        const chunksByPath = new Map(real.map(file => [file.path, chunkSourceForDigest(file, focusTerms)]));
+        const focusScore = file => (chunksByPath.get(file.path)[0] || {}).score || 0;
+        const implementationFiles = real.filter(file => IMPLEMENTATION_EXTENSIONS.includes(file.extension)
+            && !priorityPaths.has(file.path));
+        const matched = implementationFiles.filter(file => focusScore(file) > 0)
+            .sort((left, right) => focusScore(right) - focusScore(left) || right.score - left.score);
+        const manualSeeds = real.filter(file => priorityPaths.has(file.path)
+            && IMPLEMENTATION_EXTENSIONS.includes(file.extension));
+        // A declaration/path match outranks an incidental mention in a comment
+        // or caller. Weak mentions remain in the map without seeding a read.
+        const strongMatches = matched.filter(file => focusScore(file) >= focusScore(matched[0]) / 2);
+        const seeds = (matched.length ? strongMatches : (manualSeeds.length ? manualSeeds : implementationFiles)).slice(0, 4);
+        const selectedPaths = new Set(seeds.map(file => file.path));
+        const seedPaths = new Set(selectedPaths);
+        // One hop, at most four neighbours. Never walk the graph recursively or
+        // fill spare budget with unrelated implementation just because it fits.
+        const neighbours = new Set();
+        seeds.forEach(file => {
+            const node = coupling.get(file.path);
+            // Callers stay visible in the map and can match the request as
+            // seeds, but sharing a hub is not a reason to read every consumer.
+            if (node) node.dependencies.forEach(path => neighbours.add(path));
+        });
+        implementationFiles.filter(file => neighbours.has(file.path) && !selectedPaths.has(file.path))
+            .slice(0, 4).forEach(file => selectedPaths.add(file.path));
+        real.sort((left, right) => Number(seedPaths.has(right.path)) - Number(seedPaths.has(left.path))
+            || Number(selectedPaths.has(right.path)) - Number(selectedPaths.has(left.path))
+            || focusScore(right) - focusScore(left) || right.score - left.score);
 
         // Manual attachments are explicit user choices. Reserve room for them
         // before expanding the structural map, while retaining at least a small
         // map and fixed prompt-envelope allowance. Attachments that cannot fit
         // are reported instead of being appended outside the advertised budget.
-        const fixedOverheadTokens = 200;
+        const fixedOverheadTokens = 400;
         // Mirror skills.sourceBlock's per-file framing, including collision-safe
         // fences and boundary tags. Counting only file bodies badly underpriced
         // projects made of many small files because each block adds metadata.
@@ -5235,7 +5673,7 @@
             const fence = '`'.repeat(Math.max(3, longest + 1));
             const safePath = String(file.path || '').replace(/[\r\n]+/g, ' ');
             return estimateTokens([
-                `### ${safePath} (${file.lines.toLocaleString()} lines)`,
+                `### ${safePath} (${file.excerpted ? `excerpt of ${file.originalLines || file.lines} lines` : `${file.lines} lines`})`,
                 '',
                 `<BLUEPRINT_SOURCE_9999 characters="${content.length}">`,
                 fence,
@@ -5257,8 +5695,21 @@
         );
         const tier2Budget = Math.max(0, budget - tier1Budget - fixedOverheadTokens);
 
+        const digestWithLinks = (file, depth) => {
+            const digest = digestFileStructure(file.path, file.content, depth);
+            const node = coupling.get(file.path);
+            if (!node || digest.excluded) return digest;
+            const cappedPaths = paths => [...paths].slice(0, 4).join(', ')
+                + (paths.size > 4 ? `, +${paths.size - 4} more` : '');
+            const links = [];
+            if (node.dependencies.size) links.push('uses: ' + cappedPaths(node.dependencies));
+            if (node.dependents.size) links.push('used by: ' + cappedPaths(node.dependents));
+            if (node.unresolved) links.push(`${node.unresolved} import(s) external or unresolved`);
+            if (links.length) digest.text += '\nstatic links (heuristic): ' + links.join('; ');
+            return digest;
+        };
         const digests = real.map(file => Object.assign({}, file, {
-            digest: digestFileStructure(file.path, file.content, 8),
+            digest: digestWithLinks(file, 8),
             trimmed: false
         }));
 
@@ -5275,7 +5726,7 @@
             for (let i = 0; i < digests.length && tier1Tokens < tier1Budget; i += 1) {
                 const item = digests[i];
                 for (let d = 0; d < DEPTH_LADDER.length; d += 1) {
-                    const candidate = digestFileStructure(item.path, item.content, DEPTH_LADDER[d]);
+                    const candidate = digestWithLinks(item, DEPTH_LADDER[d]);
                     const added = estimateTokens(candidate.text) - estimateTokens(item.digest.text);
                     if (added <= 0 || tier1Tokens + added > tier1Budget) break;
                     tier1Tokens += added;
@@ -5307,33 +5758,15 @@
             }
         }
 
-        // Tier 2: verbatim text for explicit attachments first, then substantial
-        // code files by score. A non-fitting candidate is skipped so a smaller
-        // useful file later in the ranking still gets a chance.
+        // Tier 2: explicit attachments in full, then bounded code excerpts.
         const fullTextFiles = [];
         const fullTextRecords = [];
         const rejectedPriorityFiles = [];
         let tier2Tokens = 0;
-        // Use `real`, not only map entries: a priority attachment may be one of
-        // the paths omitted from a very large structural map and still deserves
-        // a chance to consume the space explicitly reserved for it.
-        const tier2Candidates = real.slice().sort((left, right) => {
-            const priorityDelta = Number(priorityPaths.has(right.path)) - Number(priorityPaths.has(left.path));
-            return priorityDelta || right.score - left.score;
-        });
-        for (let i = 0; i < tier2Candidates.length; i += 1) {
-            const item = tier2Candidates[i];
-            const isPriority = priorityPaths.has(item.path);
-            if (!isPriority && CODE_EXTENSIONS.indexOf(item.extension) < 0) continue;
-            if (!isPriority && item.lines < minLines) continue;
+        for (const item of real.filter(file => priorityPaths.has(file.path))) {
             const tokens = sourceEnvelopeTokens(item);
-            // A single file may not eat more than 75% of Tier 2, or one giant
-            // heuristic module crowds out every other file the model might need.
-            // Explicit attachments are exempt from that heuristic but never from
-            // the total budget.
-            if (!isPriority && tokens > tier2Budget * 0.75) continue;
             if (tier2Tokens + tokens > tier2Budget) {
-                if (isPriority) rejectedPriorityFiles.push(item.path);
+                rejectedPriorityFiles.push(item.path);
                 continue;
             }
             tier2Tokens += tokens;
@@ -5341,48 +5774,61 @@
             fullTextRecords.push({ path: item.path, content: item.content, excerpted: false });
         }
 
-        // A code-reading skill is not allowed to infer runtime behaviour from
-        // signatures alone. If the normal size/length heuristic selected no
-        // implementation, add the best non-priority code file in full when it
-        // fits, otherwise use a deterministic head+tail excerpt. Explicit files
-        // that exceeded the combined budget remain rejected rather than being
-        // silently downgraded from "attached in full" to an excerpt.
-        if (!fullTextRecords.length && tier2Budget > 0) {
-            const fallback = tier2Candidates.find(item =>
-                IMPLEMENTATION_EXTENSIONS.indexOf(item.extension) >= 0 && !priorityPaths.has(item.path));
-            if (fallback) {
-                const remaining = Math.max(0, tier2Budget - tier2Tokens);
-                const fullTokens = sourceEnvelopeTokens(fallback);
-                if (fullTokens <= remaining) {
-                    tier2Tokens += fullTokens;
-                    fullTextFiles.push(fallback.path);
-                    fullTextRecords.push({ path: fallback.path, content: fallback.content, excerpted: false });
-                } else {
-                    const headingTokens = estimateTokens(`### ${fallback.path} (excerpt)\n\n`);
-                    const availableContentTokens = Math.max(0, remaining - headingTokens - 8);
-                    const maxChars = Math.floor(availableContentTokens * 3.8);
-                    if (maxChars >= 240) {
-                        const marker = '\n\n[... Blueprint omitted the middle of this file to stay within the source budget ...]\n\n';
-                        const bodyBudget = Math.max(120, maxChars - marker.length);
-                        const headChars = Math.floor(bodyBudget * 0.7);
-                        const tailChars = Math.max(1, bodyBudget - headChars);
-                        const excerpt = fallback.content.length <= bodyBudget
-                            ? fallback.content
-                            : fallback.content.slice(0, headChars) + marker + fallback.content.slice(-tailChars);
-                        const excerptRecord = Object.assign({}, fallback, {
-                            content: excerpt,
-                            lines: excerpt.split('\n').length
-                        });
-                        const excerptTokens = sourceEnvelopeTokens(excerptRecord);
-                        if (excerptTokens <= remaining) {
-                            tier2Tokens += excerptTokens;
-                            fullTextFiles.push(fallback.path);
-                            fullTextRecords.push({ path: fallback.path, content: excerpt, excerpted: true });
-                        }
-                    }
+        const chunkPicks = new Map();
+        const candidates = real.filter(file => selectedPaths.has(file.path) && !priorityPaths.has(file.path));
+        // One chunk per file before a second: a central module must not crowd
+        // out its dependencies. Small connected helpers bypass the length
+        // heuristic; minFullTextLines still keeps broad discovery on substance.
+        const substantial = candidates.filter(file => file.lines >= minLines);
+        const eligible = candidates.filter(file => matched.length || neighbours.has(file.path)
+            || file.lines >= minLines || !substantial.length);
+        const renderChunks = (file, chunks) => {
+            const ordered = chunks.slice().sort((a, b) => a.startLine - b.startLine);
+            const excerpted = ordered.reduce((sum, chunk) => sum + chunk.endLine - chunk.startLine + 1, 0) < file.lines;
+            const content = excerpted ? ordered.map(chunk =>
+                `[${file.path.replace(/[\r\n]+/g, ' ')}:L${chunk.startLine}-L${chunk.endLine}; other lines not supplied]\n${chunk.content}`
+            ).join('\n\n') : ordered.map(chunk => chunk.content).join('\n');
+            return {
+                path: file.path, content, lines: content.split('\n').length,
+                originalLines: file.lines, excerpted,
+                ranges: ordered.map(chunk => ({ startLine: chunk.startLine, endLine: chunk.endLine }))
+            };
+        };
+        for (let round = 0; round < 2; round += 1) {
+            for (const file of eligible) {
+                const previous = chunkPicks.get(file.path) || [];
+                const oldRecord = previous.length ? renderChunks(file, previous) : null;
+                const oldTokens = oldRecord ? sourceEnvelopeTokens(oldRecord) : 0;
+                const room = tier2Budget - tier2Tokens + oldTokens;
+                const referencedWords = new Set(previous.flatMap(chunk => chunk.content.match(/[A-Za-z_$][\w$]*/g) || []));
+                const directlyReferenced = chunk => Boolean(chunk.symbol && referencedWords.has(chunk.symbol));
+                const distance = chunk => previous.length ? Math.abs(chunk.startLine - previous[0].startLine) : 0;
+                const rankedChunks = chunksByPath.get(file.path).slice().sort((left, right) =>
+                    Number(directlyReferenced(right)) - Number(directlyReferenced(left)) || right.score - left.score
+                    || (directlyReferenced(left) ? distance(left) - distance(right) : 0));
+                for (const chunk of rankedChunks) {
+                    if (previous.some(item => item.startLine === chunk.startLine)) continue;
+                    // In a matched seed file, a second unrelated function is
+                    // not evidence for this request merely because it is small.
+                    if (round && matched.length && seedPaths.has(file.path) && !chunk.score && !directlyReferenced(chunk)) continue;
+                    const selected = chunk;
+                    const record = renderChunks(file, previous.concat(selected));
+                    // Fit whole chunks. Trimming individual trailing lines can
+                    // sever a message, call or branch even with correct ranges.
+                    const tokens = sourceEnvelopeTokens(record);
+                    if (tokens > room || !selected.content.trim()) continue;
+                    chunkPicks.set(file.path, previous.concat(selected));
+                    tier2Tokens += tokens - oldTokens;
+                    break;
                 }
             }
         }
+        eligible.forEach(file => {
+            const chunks = chunkPicks.get(file.path);
+            if (!chunks) return;
+            fullTextFiles.push(file.path);
+            fullTextRecords.push(renderChunks(file, chunks));
+        });
 
         priorityPaths.forEach(path => {
             if (real.some(item => item.path === path)
@@ -5438,6 +5884,9 @@
             digestText,
             fullTextFiles,
             fullTextRecords,
+            focused: matched.length > 0,
+            chunkCount: [...chunkPicks.values()].reduce((count, chunks) => count + chunks.length, 0),
+            coupledFiles: [...chunkPicks.keys()].filter(path => !seedPaths.has(path)).length,
             rejectedPriorityFiles,
             tokens: renderedSourceTokens,
             tier1Tokens,
@@ -5462,7 +5911,7 @@
                 score: item.score,
                 tokens: estimateTokens(item.digest.text),
                 trimmed: item.trimmed,
-                includedInFull: fullTextFiles.indexOf(item.path) >= 0
+                includedInFull: fullTextRecords.some(record => record.path === item.path && !record.excerpted)
             }))
         };
     }
@@ -5937,7 +6386,7 @@
                 error: 'A Blueprint operation is active. Stop it before clearing all data.'
             };
         }
-        const keys = [PROJECTS_KEY, SETTINGS_KEY, WORKSPACE_KEY];
+        const keys = [PROJECTS_KEY, SETTINGS_KEY, WORKSPACE_KEY, DURABLE_HEAD_KEY];
         const rawBefore = {};
         try {
             keys.forEach(key => { rawBefore[key] = window.localStorage.getItem(key); });
@@ -5955,6 +6404,7 @@
         const recoveryBefore = storageRecoveryState();
         const projectLoadErrorBefore = projectStoreLoadError;
         const externalResetBefore = externalResetObserved;
+        const headBefore = knownDurableHeadRaw;
         const priorRuns = store.runs.slice();
         const fresh = emptyStore();
         fresh.revision = store.revision;
@@ -5971,6 +6421,10 @@
         else {
             writtenKeys.push(PROJECTS_KEY);
             expectedCurrent[PROJECTS_KEY] = window.localStorage.getItem(PROJECTS_KEY);
+            if (window.localStorage.getItem(DURABLE_HEAD_KEY) !== rawBefore[DURABLE_HEAD_KEY]) {
+                writtenKeys.push(DURABLE_HEAD_KEY);
+                expectedCurrent[DURABLE_HEAD_KEY] = window.localStorage.getItem(DURABLE_HEAD_KEY);
+            }
             if (!writeSettings(Object.assign({}, nextSettings || DEFAULT_SETTINGS), {
                 allowCorruptReset: true,
                 expectedRaw: rawBefore[SETTINGS_KEY],
@@ -5991,6 +6445,7 @@
             const rollback = restoreStorageValues(rawBefore, expectedCurrent, writtenKeys);
             const concurrent = persistence.lastCode === 'concurrent-update' || rollback.conflict;
             const rolledBack = rollback.ok;
+            if (rolledBack && !concurrent) knownDurableHeadRaw = headBefore;
             const authoritative = rolledBack && !concurrent ? stateBefore : readStore();
             assignStoreState(authoritative);
             knownStoreRevision = store.revision;
@@ -6024,6 +6479,10 @@
                 releaseRunOwnership(run.id);
             }
         });
+        if (transactionLease.durableMirror) {
+            const mirror = transactionLease.durableMirror;
+            mirrorToDurableTier(mirror.serialized, mirror.revision, mirror.commitId);
+        }
         return { ok: true, rolledBack: false, error: '' };
         } finally {
             if (transactionLease && transactionLease.ok) releaseStoreWriteLease(transactionLease);
@@ -7598,46 +8057,51 @@
             }, limit);
         });
         try {
-            const response = await Promise.race([
-                fetch(`${API_BASE}/chat/cancel/${encodeURIComponent(cancelId)}`, {
-                    method: 'POST',
-                    keepalive: true,
-                    signal: controller.signal
-                }),
-                deadline
-            ]);
-            if (!response.ok) return 'unknown';
-            const body = await Promise.race([response.json(), deadline]);
-            const status = String((body && (body.status || body.state || body.result)) || '')
-                .trim().toLowerCase().replace(/_/g, '-');
-            if ((body && body.already_terminal === true)
-                || (body && body.terminal === true)
-                || [
-                    'already-terminal', 'cancelled', 'canceled', 'stopped', 'aborted',
-                    'completed', 'complete', 'done', 'terminal'
-                ].includes(status)) {
-                if (['cancelled', 'canceled', 'stopped', 'aborted'].includes(status)) {
-                    return 'cancelled';
+            for (;;) {
+                const response = await Promise.race([
+                    fetch(`${API_BASE}/chat/cancel/${encodeURIComponent(cancelId)}?confirm_terminal=true`, {
+                        method: 'POST',
+                        keepalive: true,
+                        signal: controller.signal
+                    }),
+                    deadline
+                ]);
+                if (!response.ok) return 'unknown';
+                const body = await Promise.race([response.json(), deadline]);
+                const status = String((body && (body.status || body.state || body.result)) || '')
+                    .trim().toLowerCase().replace(/_/g, '-');
+                if ((body && body.already_terminal === true)
+                    || (body && body.terminal === true)
+                    || [
+                        'already-terminal', 'cancelled', 'canceled', 'stopped', 'aborted',
+                        'completed', 'complete', 'done', 'terminal'
+                    ].includes(status)) {
+                    if (['cancelled', 'canceled', 'stopped', 'aborted'].includes(status)) {
+                        return 'cancelled';
+                    }
+                    return 'already-terminal';
                 }
-                return 'already-terminal';
+
+                // Updated SimpleRAG keeps pending workers observable and fences
+                // late arrivals when terminal confirmation is requested. Poll only
+                // that explicit contract, within this call's original deadline.
+                // Legacy requested/false still does not prove worker completion.
+                if ([
+                    'requested', 'accepted', 'pending', 'cancelling', 'canceling',
+                    'stopping', 'in-progress', 'processing'
+                ].includes(status)) {
+                    if (body && body.terminal === false) {
+                        await Promise.race([abortableDelay(150, controller.signal), deadline]);
+                        continue;
+                    }
+                    return 'requested';
+                }
+
+                // Retain compatibility with older backends that expose only the
+                // boolean and synchronously stop before replying.
+                if (body && body.cancelled === true) return 'cancelled';
+                return 'unknown';
             }
-
-            // SimpleRAG acknowledges cancellation asynchronously with
-            // `{ cancelled: true, status: "requested" }`. Its request handle can
-            // disappear before every worker event has settled, so neither that
-            // acknowledgement nor a later `requested/false` proves terminality.
-            // Fail closed and retain the durable recovery barrier until the
-            // backend exposes an explicit terminal state (or the stream itself
-            // supplies a terminal frame).
-            if ([
-                'requested', 'accepted', 'pending', 'cancelling', 'canceling',
-                'stopping', 'in-progress', 'processing'
-            ].includes(status)) return 'requested';
-
-            // Retain compatibility with older backends that expose only the
-            // boolean and synchronously stop before replying.
-            if (body && body.cancelled === true) return 'cancelled';
-            return 'unknown';
         } catch (_) {
             // A 2xx transport response without a parseable, explicit terminal
             // acknowledgement does not prove that generation stopped.

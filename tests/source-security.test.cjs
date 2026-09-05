@@ -155,7 +155,17 @@ const MUST_REDACT = [
     ['url with embedded creds', 'postgres://admin:supers3cret@db.example.com/app'],
     ['CLI --password flag', 'mysql --password=verysecretpass --user=root'],
     ['XML secret tag', '<secret>mySecretValue123</secret>'],
-    ['access_token field', 'access_token = "at_' + 'a'.repeat(24) + '"']
+    ['access_token field', 'access_token = "at_' + 'a'.repeat(24) + '"'],
+    ['bare key', 'key: "unknownCredential123"'],
+    ['unquoted bare key', 'key = unknownCredential123'],
+    ['prefixed key', 'service_key: "unknownCredential123"'],
+    ['camel case key beside schema metadata', '{ serviceKey: "unknownCredential123", label: "API", type: "text" }'],
+    ['credential beside schema metadata', '{ api_key: "unknownCredential123", label: "API", type: "text" }'],
+    ['key without a field type', '{ key: "unknownCredential123", label: "API" }'],
+    ['key without a field label', '{ key: "unknownCredential123", type: "text" }'],
+    ['key outside neighbouring field', '{ key: "unknownCredential123" }, { label: "Field", type: "text" }'],
+    ['known token as schema key', '{ key: "sk-proj-' + 'a'.repeat(24) + '", label: "Field", type: "text" }'],
+    ['unknown high entropy schema key', '{ key: "aB2_dE5_gH8_jK1_mN4_pQ7_sT0_vW3_yZ6", label: "Field", type: "text" }']
 ];
 MUST_REDACT.forEach(([label, source]) => {
     const result = sanitize(source);
@@ -179,6 +189,9 @@ const MUST_KEEP = [
     ['prose', 'The quick brown fox jumps over the lazy dog repeatedly here.'],
     ['function name', 'function calculatePasswordStrength(input) { return input.length; }'],
     ['identifier named key', 'const keyboardLayout = "qwertyuiopasdfghjklzxcvbnm";'],
+    ['settings field', '{ key: "listPaneWidth", label: "Sidebar width", type: "range", min: 200 }'],
+    ['JSON schema field', '{ "key": "sourceContextMode", "label": "Context", "type": "select" }'],
+    ['field with properties before key', '{ label: "Model", type: "text", key: "modelName" }'],
     ['import path', 'import { tokenize } from "./utils/tokenizer.js";'],
     ['short secret-like value', 'let password = "abc";']  // < 6 chars: deliberately conservative
 ];
@@ -186,7 +199,16 @@ MUST_KEEP.forEach(([label, source]) => {
     const result = sanitize(source);
     assert.equal(Number(result.redactions) || 0, 0,
         `FALSE POSITIVE: ordinary source redacted (${label}): ${result.content}`);
+    assert.equal(result.content, source, `ordinary source changed (${label})`);
+    assert.equal(sanitize(result.content).content, source, `second model boundary changed ${label}`);
 });
+
+// The reported schema is real source: preserve every declared identifier on
+// both the source-import and final-prompt passes, not just one synthetic field.
+const settingsSource = fs.readFileSync(path.join(SRC, 'settings.js'), 'utf8');
+const settingsKeys = source => Array.from(source.matchAll(/\bkey:\s*'([^']+)'/g), match => match[1]);
+assert.ok(settingsKeys(settingsSource).includes('listPaneWidth'));
+assert.deepEqual(settingsKeys(sanitize(sanitize(settingsSource).content).content), settingsKeys(settingsSource));
 
 // ---------------------------------------------------------------------------
 // 6. Contract: sanitize returns { content, redactions } and never throws on junk.

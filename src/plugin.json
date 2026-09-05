@@ -42,7 +42,7 @@
     "commands": [
       {
         "id": "codalio-blueprint.open-blueprint",
-        "title": "Blueprint: Open Planning Agent",
+        "title": "Codalio Blueprint: Open Planning Agent",
         "description": "Open the Cursor-style planning agent page with the chat, project file tree, and document viewer.",
         "entrypoint": "codalio-blueprint.js",
         "handler": "codalioBlueprint.openPage",
@@ -53,7 +53,7 @@
       },
       {
         "id": "codalio-blueprint.run-prd-builder",
-        "title": "Blueprint: Build a PRD",
+        "title": "Codalio Blueprint: Build a PRD",
         "description": "Run the multi-lens PRD builder skill on a described product idea and write the result to docs/prd/ in the Blueprint project.",
         "entrypoint": "codalio-blueprint.js",
         "handler": "codalioBlueprint.runPrdBuilder",
@@ -63,7 +63,7 @@
       },
       {
         "id": "codalio-blueprint.export-document",
-        "title": "Blueprint: Export Open Document",
+        "title": "Codalio Blueprint: Export Open Document",
         "description": "Export the currently open generated planning document as a Markdown file.",
         "entrypoint": "codalio-blueprint.js",
         "handler": "codalioBlueprint.exportOpenDocument",
@@ -75,7 +75,7 @@
     "exporters": [
       {
         "id": "codalio-blueprint.export-markdown",
-        "title": "Export Blueprint Markdown",
+        "title": "Export Codalio Blueprint Markdown",
         "description": "Export the active generated planning document as a Markdown file.",
         "entrypoint": "codalio-blueprint.js",
         "handler": "codalioBlueprint.exportOpenDocument",
@@ -95,7 +95,7 @@
         "id": "codalio-blueprint.blueprint-page",
         "location": "app-bar",
         "icon": "fa-compass-drafting",
-        "title": "Blueprint",
+        "title": "Codalio Blueprint",
         "ariaLabel": "Open the Codalio Blueprint planning agent",
         "order": 38,
         "entrypoint": "codalio-blueprint.js",

@@ -1266,7 +1266,74 @@ function tick(ms) {
         'reload resurrected a pre-clear turn from the same project root');
 
     // =======================================================================
-    // 11. Leaving the page releases the divider (no leak into other apps)
+    // 11. Project files update while an import is still awaiting a disk read.
+    // No hostRenderAll() or page round-trip is allowed after the import starts.
+    // A two-file fixture also catches the old progress-every-40-files gap.
+    hostActivateFolder('cb-files');
+    let releaseImportRead;
+    let importReadStarted = false;
+    const directory = (name, entries) => ({
+        kind: 'directory', name,
+        async *values() { for (const entry of entries) yield entry; }
+    });
+    const importFile = (name, read) => ({
+        kind: 'file', name,
+        async getFile() { return { name, size: 20, text: read }; }
+    });
+    windowStub.FileSystemDirectoryHandle = class {};
+    windowStub.showDirectoryPicker = async () => directory('Live progress fixture', [
+        importFile('a.js', async () => 'const first = 1;'),
+        importFile('b.js', () => {
+            importReadStarted = true;
+            return new Promise(resolve => { releaseImportRead = resolve; });
+        })
+    ]);
+    const previousOpenPath = core.store.openPath;
+    const previousOpenFolder = core.store.openFolderId;
+    click(listContent.querySelector('[data-cb-action="open-folder"]'));
+    for (let attempt = 0; attempt < 100 && !importReadStarted; attempt += 1) await tick(10);
+    assert.ok(importReadStarted, `the test never reached the pending disk read: ${allText().slice(-1400)} ${sidebarText().slice(-600)}`);
+    const viewerDuringImport = settingsContainer.firstChild;
+    listContent.scrollTop = 137;
+    await tick(180);
+    assert.match(sidebarText(), /Live progress fixture/);
+    assert.match(sidebarText(), /a\.js/, 'the first file stayed invisible until navigation');
+    assert.match(sidebarText(), /1 file loaded.*1 of 2 examined/, 'in-flight progress was not rendered');
+    assert.equal(core.store.openPath, previousOpenPath, 'import changed the selected file mid-read');
+    assert.equal(core.store.openFolderId, previousOpenFolder);
+    assert.equal(listContent.scrollTop, 137, 'live refresh reset sidebar scrolling');
+    assert.equal(settingsContainer.firstChild, viewerDuringImport, 'progress rebuilt the viewer');
+    releaseImportRead('const second = 2;');
+    for (let attempt = 0; attempt < 100 && listContent.querySelector('.cb-import-progress'); attempt += 1) await tick(10);
+    assert.match(sidebarText(), /b\.js/, 'the trailing import did not refresh the list');
+    assert.ok(!listContent.querySelector('.cb-import-progress'), 'progress remained after completion');
+
+    // Cancellation must refresh from the rolled-back VFS, removing partial rows
+    // without disturbing the previously completed project.
+    importReadStarted = false;
+    windowStub.showDirectoryPicker = async () => directory('Cancelled live fixture', [
+        importFile('a.js', async () => 'const partial = 1;'),
+        importFile('b.js', () => {
+            importReadStarted = true;
+            return new Promise(resolve => { releaseImportRead = resolve; });
+        })
+    ]);
+    click(listContent.querySelector('[data-cb-action="open-folder"]'));
+    for (let attempt = 0; attempt < 100 && !importReadStarted; attempt += 1) await tick(10);
+    assert.ok(importReadStarted);
+    await tick(180);
+    assert.match(sidebarText(), /Cancelled live fixture/);
+    click(listContent.querySelector('.cb-import-progress [data-cb-action="stop-run"]'));
+    releaseImportRead('const cancelled = 2;');
+    for (let attempt = 0; attempt < 100 && listContent.querySelector('.cb-import-progress'); attempt += 1) await tick(10);
+    assert.doesNotMatch(sidebarText(), /Cancelled live fixture/, 'cancelled partial project remained visible');
+    assert.match(sidebarText(), /Live progress fixture/, 'cancelling removed the earlier project');
+    assert.ok(!listContent.querySelector('.cb-import-progress'));
+    delete windowStub.showDirectoryPicker;
+    delete windowStub.FileSystemDirectoryHandle;
+
+    // =======================================================================
+    // 12. Leaving the page releases the divider (no leak into other apps)
     // =======================================================================
 
     // The divider lives beside the host list pane, outside our container.
@@ -1316,10 +1383,10 @@ function tick(ms) {
         `Blueprint wrote to storage it does not own: ${foreignKeys.join(', ')}`
     );
 
-    console.log('controller-integration.test.cjs: 13 groups passed');
+    console.log('controller-integration.test.cjs: 14 groups passed');
     console.log(`  SimpleRAG host  : ${SIMPLERAG}`);
     console.log(`  model turns     : ${requests.length} (endpoint injected, cancel_id on each)`);
-    console.log(`  documents       : ${core.listFiles().length} written to docs/prd/`);
+    console.log(`  project files   : ${core.listFiles().length} generated and imported files`);
     console.log(`  storage keys    : ${blueprintKeys.length} Blueprint-owned, ${foreignKeys.length} host-owned`);
     process.exit(0);
 })().catch(error => {
