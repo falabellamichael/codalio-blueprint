@@ -168,6 +168,7 @@
         dividerElement: null,
         dividerWidth: 0,
         dividerBound: false,
+        listPaneObserver: null,
         busy: false,
         // True only while a directory import is reading files. Separate from
         // `busy` (a model run) so the two cannot mask each other.
@@ -1452,6 +1453,28 @@
     }
 
     /**
+     * Apply sidebar width to host list pane. If host uses CSS variables
+     * (--list-pane-width), update the variable; otherwise set inline styles.
+     */
+    function applyListPaneWidth(width) {
+        const elements = hostElements();
+        const listPane = (elements && elements.listPane) || document.getElementById('list-pane');
+        if (!listPane) return;
+        const hostToggle = (elements && elements.listPaneToggle) || document.getElementById('list-pane-toggle');
+        const mainBody = (elements && elements.mainBody) || document.querySelector('.main-body');
+        if (hostToggle) {
+            listPane.style.setProperty('--list-pane-width', `${width}px`);
+            if (mainBody) mainBody.style.setProperty('--list-pane-width', `${width}px`);
+            if (typeof window.setListPaneWidth === 'function') {
+                try { window.setListPaneWidth(width, false); } catch (_) {}
+            }
+        } else {
+            listPane.style.width = `${width}px`;
+            listPane.style.flex = `0 0 ${width}px`;
+        }
+    }
+
+    /**
      * Remove the divider and undo the inline width we set on the host list pane.
      * Must run whenever the page is left, or the drag handle leaks into other
      * apps (Journal, Settings, ...) and the pane keeps Blueprint's width.
@@ -1461,6 +1484,10 @@
         const listPane = elements && elements.listPane
             ? elements.listPane
             : document.getElementById('list-pane');
+        if (runtime.listPaneObserver) {
+            try { runtime.listPaneObserver.disconnect(); } catch (_) { /* already gone */ }
+            runtime.listPaneObserver = null;
+        }
         if (runtime.dividerElement) {
             try { runtime.dividerElement.remove(); } catch (_) { /* already gone */ }
             runtime.dividerElement = null;
@@ -1475,26 +1502,71 @@
     }
 
     /**
-     * Drag-to-resize the host list pane. The width is persisted to
-     * Settings -> Workspace -> Layout -> Sidebar width so the two stay in sync:
-     * dragging updates the setting, editing the setting moves the divider.
+     * Drag-to-resize the host list pane.
+     * In SimpleRAG, #list-pane-toggle already acts as the draggable resize handle
+     * and collapse button. In that environment, injecting a duplicate .cb-divider
+     * or hardcoding inline style.width/style.flex breaks host resizing and collapse!
+     * When hostToggle is present, we harmonize with the host's CSS variable and
+     * observe width changes. When absent (test harnesses/standalone), we provide
+     * the fallback .cb-divider.
      */
     function bindDividerDrag(container) {
         if (!container) return;
-        // Already bound and still attached to the DOM: nothing to do. The divider
-        // sits beside the host listPane (outside settingsContainer), so a page
-        // re-render does not wipe it — but leaving the page does remove it.
-        if (runtime.dividerElement && runtime.dividerElement.isConnected) return;
-        runtime.dividerBound = false;
         const settings = core.readSettings();
-        // Use the host's own element map rather than a global lookup: the host
-        // writes inline flex/width on this pane when it collapses the list pane,
-        // so both sides must be touching the same node.
         const elements = hostElements();
         const listPane = elements && elements.listPane
             ? elements.listPane
             : document.getElementById('list-pane');
         if (!listPane || !listPane.parentNode) return;
+
+        const hostToggle = (elements && elements.listPaneToggle) || document.getElementById('list-pane-toggle');
+        if (hostToggle) {
+            // Remove any obsolete .cb-divider that may have been previously injected
+            if (runtime.dividerElement) {
+                try { runtime.dividerElement.remove(); } catch (_) {}
+                runtime.dividerElement = null;
+            }
+            runtime.dividerBound = false;
+            // Clear any conflicting inline styles on listPane so host CSS variable works
+            listPane.style.width = '';
+            listPane.style.flex = '';
+            delete listPane.dataset.cbWidthApplied;
+
+            applyListPaneWidth(settings.listPaneWidth);
+
+            if (!runtime.listPaneObserver && typeof ResizeObserver !== 'undefined') {
+                let resizeDebounce = null;
+                runtime.listPaneObserver = new ResizeObserver(entries => {
+                    for (const entry of entries) {
+                        const width = Math.round(entry.contentRect?.width || entry.target?.getBoundingClientRect().width || 0);
+                        if (width < 80) return; // ignore collapsed states
+                        const bounded = Math.round(Math.min(520, Math.max(220, width)));
+                        runtime.dividerWidth = bounded;
+                        if (resizeDebounce) clearTimeout(resizeDebounce);
+                        resizeDebounce = setTimeout(() => {
+                            const current = core.readSettings();
+                            if (current.listPaneWidth !== bounded) {
+                                current.listPaneWidth = bounded;
+                                core.writeSettings(current);
+                                const ws = wsModule();
+                                if (ws && runtime.workspace) {
+                                    commitWorkspaceMutation(
+                                        workspace => ws.setDivider(workspace, bounded),
+                                        { retainOnWorkspaceFailure: true }
+                                    );
+                                }
+                            }
+                        }, 250);
+                    }
+                });
+                runtime.listPaneObserver.observe(listPane);
+            }
+            return;
+        }
+
+        // Fallback divider for environments without host #list-pane-toggle:
+        if (runtime.dividerElement && runtime.dividerElement.isConnected) return;
+        runtime.dividerBound = false;
 
         // Apply the stored width once, then let dragging own it.
         if (!listPane.dataset.cbWidthApplied) {
@@ -1890,13 +1962,17 @@
 
     function renderHostSurfaces() {
         const render = runtime.context && runtime.context.render;
-        if (!render) return;
-        try {
-            render.nav();
-            render.list();
-            render.ribbon();
-        } catch (error) {
-            console.warn('[codalio-blueprint] host surface refresh failed', error);
+        const elements = hostElements();
+        if (render) {
+            try { render.nav(); } catch (error) { console.warn('[codalio-blueprint] host nav refresh failed', error); }
+            try { render.list(); } catch (error) { console.warn('[codalio-blueprint] host list refresh failed', error); }
+            try { render.ribbon(); } catch (error) { console.warn('[codalio-blueprint] host ribbon refresh failed', error); }
+        } else if (elements && elements.listContent) {
+            try {
+                ui.renderList(stateSnapshot(), elements.listTitle, elements.listContent);
+            } catch (error) {
+                console.warn('[codalio-blueprint] direct list refresh failed', error);
+            }
         }
     }
 
@@ -5106,7 +5182,10 @@
 
     function isBlueprintPage() {
         const context = runtime.context;
-        return Boolean(context && context.state && context.state.app === APP_ID);
+        if (context && context.state && context.state.app === APP_ID) return true;
+        if (typeof window !== 'undefined' && window.currentApp === APP_ID) return true;
+        const container = document.getElementById('settings-container');
+        return Boolean(container && container.querySelector('.cb-container'));
     }
 
     function findAction(target) {
@@ -5821,6 +5900,10 @@
             const counter = hostElements()?.settingsContainer
                 ?.querySelector(`[data-cb-role="counter-${cssEscape(key)}"]`);
             if (counter) counter.textContent = `${String(settings[key] || '').length} / ${field.maxChars || 240}`;
+        }
+
+        if (key === 'listPaneWidth') {
+            applyListPaneWidth(settings.listPaneWidth);
         }
 
         // Some settings change layout immediately; refresh the host surfaces so
