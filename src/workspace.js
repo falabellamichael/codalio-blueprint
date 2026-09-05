@@ -644,6 +644,10 @@
         }
         if (ctrl && key.toLowerCase() === 's') {
             const tab = activeTab(ws);
+            if (actions.isEditingFile && actions.isEditingFile(tab.path) && typeof actions.saveFile === 'function') {
+                actions.saveFile(tab.path);
+                return true;
+            }
             if (tab.kind === 'file') {
                 actions.downloadFile(tab.path, tab.folderId);
                 return true;

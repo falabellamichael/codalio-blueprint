@@ -39,9 +39,28 @@ import shutil
 import subprocess
 import sys
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _git_head() -> str:
+    """Short HEAD sha of this repo, or '' when it is not a git checkout.
+
+    Used only to label provenance in .installed-from.json; a failure here must
+    never block an install.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()[:16]
 SRC_DIR = REPO_ROOT / "src"
 PLUGIN_JSON = SRC_DIR / "plugin.json"
 MANIFEST_TEMPLATE = SRC_DIR / "manifest.template.js"
@@ -152,11 +171,19 @@ def collect_assets(plugin: dict) -> list[tuple[str, bytes]]:
     return assets
 
 
+# Merge-conflict markers. Installing a file that still contains these ships a
+# bundle with a hard SyntaxError: the host loads the script, the IIFE never
+# evaluates, the extension surface silently renders nothing, and nothing in the
+# host log explains why. That is a worse failure than refusing to install.
+CONFLICT_MARKERS = (b"<<<<<<<", b">>>>>>>", b"\n=======")
+
+
 def validate_assets(assets: list[tuple[str, bytes]]) -> None:
     """Enforce the same limits chat_frontend_server.py applies at serve time."""
     if len(assets) > MAX_ASSETS:
         raise SystemExit(f"error: {len(assets)} assets exceeds the host limit of {MAX_ASSETS}")
     total = 0
+    unresolved = []
     for name, data in assets:
         if not data:
             raise SystemExit(f"error: asset {name} is empty")
@@ -164,7 +191,16 @@ def validate_assets(assets: list[tuple[str, bytes]]) -> None:
             raise SystemExit(
                 f"error: asset {name} is {len(data)} bytes, over the {MAX_ASSET_BYTES}-byte host limit"
             )
+        if any(marker in data for marker in CONFLICT_MARKERS):
+            unresolved.append(name)
         total += len(data)
+    if unresolved:
+        raise SystemExit(
+            "error: unresolved merge conflicts in "
+            + ", ".join(unresolved)
+            + "\n       Refusing to install a bundle that would not parse. "
+            "Resolve the conflicts in src/ and re-run."
+        )
     if total > MAX_EXTENSION_BYTES:
         raise SystemExit(
             f"error: total payload {total} bytes exceeds the {MAX_EXTENSION_BYTES}-byte host limit"
@@ -239,7 +275,7 @@ def other_entries(registry: dict) -> list[dict]:
 # Commands
 # ----------------------------------------------------------------------
 
-def command_install(home: Path, dry_run: bool) -> int:
+def command_install(home: Path, dry_run: bool, force: bool = False) -> int:
     plugin = load_plugin_manifest()
     version = str(plugin["version"])
     assets = collect_assets(plugin)
@@ -248,6 +284,48 @@ def command_install(home: Path, dry_run: bool) -> int:
     manifest_hash = sha256_bytes(extension_manifest)
 
     target = package_dir(home, version)
+
+    # ------------------------------------------------------------------
+    # Provenance guard
+    #
+    # More than one working copy of this plug-in can exist on a machine, and
+    # they ALL install to the same registry path. Whoever installs last
+    # silently wins — that is how a parallel copy's work got overwritten with
+    # no warning. Record which repo produced the installed package, and refuse
+    # to overwrite a package that came from a DIFFERENT repo unless --force.
+    # ------------------------------------------------------------------
+    provenance = target / ".installed-from.json"
+    current_origin = {
+        "repo": str(REPO_ROOT),
+        "git_head": _git_head(),
+        "installed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    if provenance.is_file():
+        try:
+            previous = json.loads(provenance.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            previous = {}
+        prev_repo = str(previous.get("repo") or "")
+        if prev_repo and Path(prev_repo).resolve() != REPO_ROOT.resolve():
+            print()
+            print("!! The installed package came from a DIFFERENT working copy:")
+            print(f"     installed from : {prev_repo}")
+            print(f"     git head       : {previous.get('git_head', 'unknown')}")
+            print(f"     installed at   : {previous.get('installed_at', 'unknown')}")
+            print(f"     now installing : {current_origin['repo']}")
+            print(f"     git head       : {current_origin['git_head']}")
+            print()
+            print("   Overwriting discards the other copy's installed build. Both")
+            print("   copies may be actively worked on, and the source tree of the")
+            print("   other copy is NOT affected — but its installed bundle is lost.")
+            if not dry_run and not force:
+                print()
+                print("   Refusing to install. Re-run with --force once you have")
+                print("   confirmed the other copy's work is committed or backed up.")
+                return 3
+            print("   --force given: proceeding.")
+            print()
+
     print(f"Plug-in        : {plugin['name']} {version}")
     print(f"Publisher      : {plugin.get('publisher', {}).get('name', 'unknown')}")
     print(f"Registry root  : {home}")
@@ -269,6 +347,11 @@ def command_install(home: Path, dry_run: bool) -> int:
     for name, data in assets:
         (target / name).write_bytes(data)
     (target / "manifest.json").write_bytes(extension_manifest)
+    # Provenance is NOT a declared asset: the host serves only what
+    # manifest.json lists, and an unknown file in the package dir is ignored.
+    provenance.write_text(
+        json.dumps(current_origin, indent=2), encoding="utf-8"
+    )
 
     # Drop the schema-v1 plug-in manifest alongside the payload for reference.
     # It is not declared as an asset, so the host never serves or executes it.
@@ -580,6 +663,11 @@ def main(argv: list[str]) -> int:
     install = sub.add_parser("install", help="register the plug-in with SimpleRAG")
     install.add_argument("--extension-home", help="override the registry root")
     install.add_argument("--dry-run", action="store_true", help="show what would be written")
+    install.add_argument(
+        "--force",
+        action="store_true",
+        help="overwrite an installed package that came from a different working copy",
+    )
 
     uninstall = sub.add_parser("uninstall", help="unregister and remove the plug-in")
     uninstall.add_argument("--extension-home", help="override the registry root")
@@ -617,7 +705,7 @@ def main(argv: list[str]) -> int:
 
     home = extension_home(getattr(args, "extension_home", None))
     if args.command == "install":
-        return command_install(home, args.dry_run)
+        return command_install(home, args.dry_run, args.force)
     if args.command == "uninstall":
         return command_uninstall(home, args.keep_data)
     return command_status(home)

@@ -127,8 +127,8 @@
 
         // Agent -> Model
         temperature: 0.3,
-        lensMaxOutputTokens: 4096,
-        documentMaxOutputTokens: 8192,
+        lensMaxOutputTokens: 8192,
+        documentMaxOutputTokens: 16384,
         maxPromptChars: 2400,
         confirmStop: false,
         // Reliability guardrails. A "retry" is an additional attempt and is
@@ -2344,6 +2344,13 @@
             try { runId = decodeURIComponent(key.slice(RUN_OWNER_PREFIX.length)); } catch (_) { return { runId: '', live: true, unreadable: true }; }
             const owner = readRunOwner(runId);
             if (!owner || !owner.live) continue;
+            // Only a FOREIGN live owner fences a destructive mutation. Our own
+            // in-flight run must not stop us deleting our own project root:
+            // saveRun() already applies exactly this rule (live && !owned), and
+            // the run survives as an orphan whose transcript stays auditable.
+            // Note the fail-closed sentinel above carries no `owned` flag, so it
+            // is still treated as foreign and keeps blocking the operation.
+            if (owner.owned) continue;
             if (!scope || runId === MODEL_OPERATION_OWNER_ID) return owner;
             const run = findRun(runId);
             if (!run || String(run.folderId || '') === scope) return owner;
@@ -2685,7 +2692,8 @@
         // User project files (origin === 'imported') are protected from in-place rewrites.
         if (previous && previous.origin === 'imported') {
             const isImportAction = Boolean(meta && meta.origin === 'imported');
-            if (!isImportAction) {
+            const isUserEdit = Boolean(meta && meta.userEdit === true);
+            if (!isImportAction && !isUserEdit) {
                 console.warn(`[codalio-blueprint] protected user source file: ${cleanPath}. Writing revision to docs/ instead.`);
                 const lastSlash = cleanPath.lastIndexOf('/');
                 const lastDot = cleanPath.lastIndexOf('.');
@@ -5660,6 +5668,10 @@
         if (isNew && deletedRunIds.has(run.id)) return false;
         const previousRuns = store.runs.slice();
         const previousActiveRunId = store.activeRunId;
+        // A new run navigates the workspace to its own project root, so the
+        // rollback below must restore the previous root too — otherwise a save
+        // that fails closed would still leave the live tree pointed at a root
+        // whose run was never persisted.
         const previousActiveFolderId = store.activeFolderId;
         // persistenceError describes the current process's last attempted write;
         // it is not durable run state. Never serialize a stale failure after a
@@ -5668,12 +5680,21 @@
         if (!isNew) store.runs[index] = run;
         else store.runs.unshift(run);
         store.runs = store.runs.slice(0, 60);
-        // Saving progress is not navigation. A late callback from an older
-        // parallel run must never steal focus from the run the user opened (or
-        // from a newer run). New runs still become active, and the currently
-        // active run remains active while it checkpoints. An explicitly empty
-        // selection stays empty; a late checkpoint must not undo Clear chat or
-        // cross back into an older project root.
+        // Saving progress is not navigation for an EXISTING run: a late callback
+        // from an older parallel run must never steal focus from the run the user
+        // opened (or from a newer run), and an explicitly empty selection stays
+        // empty so a late checkpoint cannot undo Clear chat or cross back into an
+        // older project root.
+        //
+        // A NEW run is different: it is the thing the user just started, so it
+        // becomes active and the workspace navigates to its project root. Moving
+        // the root with the run is what keeps the store internally consistent —
+        // persistedStoreValidationError({ requireSelectionOwnership }) rejects a
+        // selection that pairs one root's live tree with another root's
+        // transcript, so activating the run without moving the root made the
+        // entire save fail closed and the run was never persisted at all.
+        // (Sol's implementation; supersedes an earlier variant here that left a
+        // foreign-root run saved but unfocused.)
         if (isNew) {
             if (run.folderId && store.folders[run.folderId]) {
                 store.activeFolderId = run.folderId;
@@ -6064,6 +6085,56 @@
     }
 
     /**
+     * Determines whether an error returned by a model endpoint or stream indicates
+     * that the context window / token limit was exceeded ("ran out of context").
+     */
+    function isContextOverflowError(error) {
+        if (!error) return false;
+        const msg = String(
+            (error && (error.message || error.detail || error.error || error.code || error.statusText)) || error || ''
+        ).toLowerCase();
+        return (
+            msg.includes('context length') ||
+            msg.includes('context window') ||
+            msg.includes('context overflow') ||
+            msg.includes('context_length_exceeded') ||
+            msg.includes('maximum context') ||
+            msg.includes('max context') ||
+            msg.includes('max_tokens') ||
+            msg.includes('n_ctx') ||
+            msg.includes('prompt is too long') ||
+            msg.includes('prompt too long') ||
+            msg.includes('too many tokens') ||
+            msg.includes('token limit') ||
+            msg.includes('token budget exceeded') ||
+            msg.includes('exceeds token') ||
+            msg.includes('exceeds maximum') ||
+            msg.includes('out of memory') ||
+            msg.includes('out of context') ||
+            (msg.includes('400') && (msg.includes('token') || msg.includes('context') || msg.includes('length')))
+        );
+    }
+
+    /**
+     * Determines whether the response text contains an output limit warning notice
+     * emitted by SimpleRAG or upstream providers.
+     */
+    function hasOutputLimitNotice(text) {
+        return /(?:Context window|Output|Response length) limit reached/i.test(String(text || ''));
+    }
+
+    /**
+     * Strips synthetic length-limit and context-window notices injected by the server
+     * so that the agent and downstream steps work with pristine model content.
+     */
+    function stripOutputLimitNotice(text) {
+        return String(text || '')
+            .replace(/\[⚠️\s*(?:Context window|Output|Response length) limit reached[^\]]*\]/gi, '')
+            .replace(/\n{3,}/g, '\n\n')
+            .trim();
+    }
+
+    /**
      * Anti-gravity Context Compactor (Deterministic Engine)
      *
      * Constructs a high-density, structured compaction summary adhering strictly
@@ -6151,6 +6222,14 @@
         });
         messages.forEach(msg => {
             if (!msg) return;
+            if (msg.compaction && Array.isArray(msg.compaction.userRequests)) {
+                msg.compaction.userRequests.forEach(req => {
+                    if (req && typeof req === 'string') {
+                        const trimmed = req.trim();
+                        if (trimmed && !userRequests.includes(trimmed)) userRequests.push(trimmed);
+                    }
+                });
+            }
             if (msg.role === 'user' && typeof msg.text === 'string') {
                 rememberRequest(msg.text);
             }
@@ -6601,10 +6680,20 @@
         return index;
     }
 
+    const markdownCache = new Map();
+    const MAX_MARKDOWN_CACHE = 100;
+
     function renderMarkdown(source) {
+        const text = String(source || '');
+        if (markdownCache.has(text)) {
+            const cached = markdownCache.get(text);
+            if (cached && typeof cached.cloneNode === 'function') {
+                return cached.cloneNode(true);
+            }
+        }
         const root = document.createElement('div');
         root.className = 'cb-markdown';
-        const lines = String(source || '').replace(/\r\n?/g, '\n').split('\n');
+        const lines = text.replace(/\r\n?/g, '\n').split('\n');
         let index = 0;
         while (index < lines.length) {
             const line = lines[index];
@@ -6613,9 +6702,10 @@
             const fence = /^\s*(```|~~~)\s*([A-Za-z0-9_+-]*)\s*$/.exec(line);
             if (fence) {
                 const closing = fence[1];
+                const closingRegex = new RegExp(`^\\s*${closing}\\s*$`);
                 const body = [];
                 index += 1;
-                while (index < lines.length && !new RegExp(`^\\s*${closing}\\s*$`).test(lines[index])) {
+                while (index < lines.length && !closingRegex.test(lines[index])) {
                     body.push(lines[index]);
                     index += 1;
                 }
@@ -6696,6 +6786,13 @@
             } else {
                 index += 1;
             }
+        }
+        if (text.length < 250000 && typeof root.cloneNode === 'function') {
+            if (markdownCache.size >= MAX_MARKDOWN_CACHE) {
+                const oldest = markdownCache.keys().next().value;
+                markdownCache.delete(oldest);
+            }
+            markdownCache.set(text, root.cloneNode(true));
         }
         return root;
     }
@@ -7292,6 +7389,24 @@
                     partialThinking: thinking
                 });
             }
+            text = text.trim();
+            thinking = thinking.trim();
+            if (NO_ENDPOINT_PATTERN.test(text)) {
+                throw new BlueprintModelError(text, {
+                    code: 'missing-endpoint', partialText: text, partialThinking: thinking
+                });
+            }
+            // The backend reports a hit output limit two different ways: as
+            // finish_reason 'length'/'max_tokens', or by appending a NOTICE to the
+            // text while still claiming 'stop'. Detecting only the finish reason
+            // silently truncates a document in the second case, because the turn
+            // looks complete. Normalizing here means BOTH routes reach Sol's
+            // output-limit throw below, so the agent's continuation recovery
+            // (which catches that error) can finish the document.
+            if (hasOutputLimitNotice(text)) {
+                text = stripOutputLimitNotice(text);
+                finishReason = 'length';
+            }
             const normalizedFinish = finishReason.trim().toLowerCase();
             if (['cancelled', 'canceled', 'abort', 'aborted'].includes(normalizedFinish)) {
                 const stopped = new BlueprintAbort('The model turn was cancelled.');
@@ -7299,13 +7414,6 @@
                 stopped.partialText = text;
                 stopped.partialThinking = thinking;
                 throw stopped;
-            }
-            text = text.trim();
-            thinking = thinking.trim();
-            if (NO_ENDPOINT_PATTERN.test(text)) {
-                throw new BlueprintModelError(text, {
-                    code: 'missing-endpoint', partialText: text, partialThinking: thinking
-                });
             }
             if (normalizedFinish === 'length' || normalizedFinish === 'max_tokens') {
                 throw new BlueprintModelError(
@@ -8002,6 +8110,9 @@
         clearAllData,
         createRun,
         estimateTokens,
+        isContextOverflowError,
+        hasOutputLimitNotice,
+        stripOutputLimitNotice,
         buildDeterministicCompaction,
         renderMarkdown,
         appendInline,

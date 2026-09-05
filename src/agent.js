@@ -128,6 +128,82 @@
         return `${standing}\n\n## Source-data boundary\n${safety}`;
     }
 
+    function stripContinuationPreamble(text) {
+        return String(text || '').replace(
+            /^(?:Here is the continuation(?:\s+of the response)?|Continuing from where (?:I|we) left off|Continuing(?: generation)?|As requested, continuing)\s*[:—–-]?\s*/i,
+            ''
+        );
+    }
+
+    function stitchContinuationText(prior, chunk) {
+        const p = String(prior || '');
+        let c = stripContinuationPreamble(String(chunk || ''));
+        if (!c) return p;
+        if (!p) return c;
+
+        const maxOverlap = Math.min(200, p.length, c.length);
+        for (let len = maxOverlap; len >= 6; len--) {
+            const pTail = p.slice(-len);
+            const cHead = c.slice(0, len);
+            if (pTail.toLowerCase() === cHead.toLowerCase()) {
+                c = c.slice(len);
+                break;
+            }
+        }
+
+        const pEndsWithSpace = /\s$/.test(p);
+        const cStartsWithSpace = /^\s/.test(c);
+        if (pEndsWithSpace || cStartsWithSpace) {
+            return p + c;
+        }
+
+        if (/[.!?:;)\n]$/.test(p)) {
+            return p + ' ' + c;
+        }
+
+        if (/^[A-Z]/.test(c) && /[a-z0-9]$/.test(p)) {
+            return p + ' ' + c;
+        }
+
+        return p + c;
+    }
+
+    function buildContinuationPrompt(originalPrompt, accumulatedText) {
+        const cleanText = (core && typeof core.stripOutputLimitNotice === 'function')
+            ? core.stripOutputLimitNotice(accumulatedText)
+            : String(accumulatedText || '').replace(/\[⚠️\s*(?:Context window|Output|Response length) limit reached[^\]]*\]/gi, '').trim();
+        
+        const tailLength = 1200;
+        const tail = cleanText.length > tailLength ? cleanText.slice(-tailLength) : cleanText;
+        
+        const headings = (cleanText.match(/^#{1,4}\s+.+$/gm) || [])
+            .map(h => h.trim())
+            .slice(-5);
+        const headingsContext = headings.length > 0
+            ? ['Sections started/completed so far:', ...headings.map(h => `- ${h}`), ''].join('\n')
+            : '';
+
+        return [
+            originalPrompt,
+            '',
+            '---',
+            '# CONTINUATION REQUIRED (OUTPUT LIMIT REACHED)',
+            'Your previous response reached the output token limit and was cut off before completing all sections.',
+            headingsContext,
+            'Here is the tail of the text you generated so far:',
+            '```markdown',
+            tail,
+            '```',
+            '',
+            'TASK: Continue generating seamlessly from the exact character/point where the text above ended.',
+            'CRITICAL RULES:',
+            '1. Do NOT restart from the beginning.',
+            '2. Do NOT repeat sections or paragraphs that were already generated above.',
+            '3. Produce all remaining sections until the entire output contract is completely fulfilled.',
+            '4. Return only the continuation text.'
+        ].join('\n');
+    }
+
     /**
      * Run one model turn as a visible step. The step streams into its own live
      * DOM node so the user watches tokens arrive, exactly like an agent trace.
@@ -147,6 +223,12 @@
         step.maxAttempts = (Number.isFinite(Number(options.maxRetries))
             ? Math.max(0, Number(options.maxRetries))
             : settings.modelMaxRetries) + 1;
+        // Gemini's resets: a retried step must not inherit the previous
+        // attempt's error/text/finishReason, or the UI shows stale failure state.
+        step.error = '';
+        step.text = '';
+        step.thinking = '';
+        step.finishReason = '';
         if (settings.expandRunningSteps !== false) {
             step.open = true;
         }
@@ -178,14 +260,14 @@
                 step.tokenCount = Math.round(totalChars / 3.8);
                 step.tokensPerSec = Math.round(step.tokenCount / elapsedSec);
             }
-            if (isThinking && step.liveThinkingElement) {
+            if (now - lastRender < 80) return;
+            lastRender = now;
+            if (step.liveThinkingElement && thinkingCode) {
                 thinkingCode.textContent = thinking;
                 if (liveThinking.scrollHeight - liveThinking.scrollTop - liveThinking.clientHeight < 60) {
                     liveThinking.scrollTop = liveThinking.scrollHeight;
                 }
             }
-            if (now - lastRender < 80) return;
-            lastRender = now;
             code.textContent = text;
             callCriticalHook(hooks, 'onStream', step, text);
         };
@@ -194,7 +276,7 @@
         callHook(hooks, 'onRender');
 
         try {
-            const result = await core.streamModelTurn({
+            let result = await core.streamModelTurn({
                 systemPrompt: options.systemPrompt,
                 message: options.prompt,
                 maxOutputTokens: options.maxOutputTokens,
@@ -256,6 +338,71 @@
                     scheduleRender(rendered, true);
                 }
             });
+
+            let accumulatedText = (core && typeof core.stripOutputLimitNotice === 'function')
+                ? core.stripOutputLimitNotice(result.text || rendered)
+                : String(result.text || rendered || '').replace(/\[⚠️\s*(?:Context window|Output|Response length) limit reached[^\]]*\]/gi, '').trim();
+            let accumulatedThinking = result.thinking || thinking;
+            let finishReason = result.finishReason || '';
+            let totalUsage = result.usage ? { ...result.usage } : null;
+            let continuationPass = 0;
+            const MAX_CONTINUATION_PASSES = 4;
+
+            const checkLimitReached = (resText, reason) => {
+                if (reason === 'length') return true;
+                if (core && typeof core.hasOutputLimitNotice === 'function') {
+                    return core.hasOutputLimitNotice(resText);
+                }
+                return /(?:Context window|Output|Response length) limit reached/i.test(String(resText || ''));
+            };
+
+            while (checkLimitReached(result.text || rendered, finishReason) && continuationPass < MAX_CONTINUATION_PASSES) {
+                if (options.signal && options.signal.aborted) break;
+                continuationPass++;
+                step.substatus = `⚡ Output limit reached — automatically continuing generation (part ${continuationPass + 1})…`;
+                scheduleRender(accumulatedText, false);
+                if (hooks && typeof hooks.onRender === 'function') hooks.onRender();
+
+                const contPrompt = buildContinuationPrompt(options.prompt, accumulatedText);
+                let contRendered = '';
+
+                const contResult = await core.streamModelTurn({
+                    systemPrompt: options.systemPrompt,
+                    message: contPrompt,
+                    maxOutputTokens: options.maxOutputTokens,
+                    temperature: options.temperature,
+                    signal: options.signal,
+                    cancelId: options.cancelId,
+                    onDelta: (_delta, fullContText) => {
+                        contRendered = fullContText;
+                        const stitchedLive = stitchContinuationText(accumulatedText, fullContText);
+                        scheduleRender(stitchedLive, false);
+                    },
+                    onThinking: (_delta, fullContThinking) => {
+                        const stitchedLive = stitchContinuationText(accumulatedText, contRendered);
+                        scheduleRender(stitchedLive, true);
+                    }
+                });
+
+                const cleanChunk = (core && typeof core.stripOutputLimitNotice === 'function')
+                    ? core.stripOutputLimitNotice(contResult.text || contRendered)
+                    : String(contResult.text || contRendered || '').replace(/\[⚠️\s*(?:Context window|Output|Response length) limit reached[^\]]*\]/gi, '').trim();
+                accumulatedText = stitchContinuationText(accumulatedText, cleanChunk);
+                finishReason = contResult.finishReason || '';
+                result = contResult;
+                rendered = contRendered;
+
+                if (contResult.usage && totalUsage) {
+                    totalUsage.prompt_tokens = (totalUsage.prompt_tokens || 0) + (contResult.usage.prompt_tokens || 0);
+                    totalUsage.completion_tokens = (totalUsage.completion_tokens || 0) + (contResult.usage.completion_tokens || 0);
+                    totalUsage.total_tokens = (totalUsage.total_tokens || 0) + (contResult.usage.total_tokens || 0);
+                }
+            }
+
+            if (continuationPass > 0 && !checkLimitReached(result.text || rendered, finishReason)) {
+                finishReason = 'stop';
+            }
+
             step.cancelId = result.cancelId || '';
             setCompleteStepText(step, result.text || rendered);
             step.thinking = bounded(result.thinking || thinking);
@@ -280,6 +427,37 @@
                 callCriticalHook(hooks, 'onState', step, 'aborted');
                 throw error;
             }
+
+            // Auto-compaction recovery: when context runs out, compact automatically and retry the turn
+            const isOverflow = (core && typeof core.isContextOverflowError === 'function')
+                ? core.isContextOverflowError(error)
+                : String(error && (error.message || error)).toLowerCase().includes('context');
+
+            if (isOverflow && !options._retriedWithCompaction) {
+                if (hooks && typeof hooks.onAutoCompact === 'function') {
+                    step.substatus = '⚡ Context limit reached — auto-compacting and retrying…';
+                    step.error = '';
+                    try {
+                        const newCompaction = await hooks.onAutoCompact({
+                            error,
+                            step,
+                            options,
+                            reason: 'context-overflow'
+                        });
+                        if (newCompaction) {
+                            options._retriedWithCompaction = true;
+                            options.prompt = injectCompactionIntoPrompt(options.prompt, newCompaction);
+                            step.promptPreview = promptPreview(options.prompt, settings.maxPromptChars);
+                            step.text = '';
+                            step.thinking = '';
+                            return await runModelStep(step, options, hooks);
+                        }
+                    } catch (compactError) {
+                        console.warn('[Blueprint] Auto-compaction recovery failed:', compactError);
+                    }
+                }
+            }
+
             finishStep(step, 'error');
             step.error = String((error && error.message) || 'The model step failed.');
             setCompleteStepText(step, (error && error.partialText) || rendered);
@@ -294,6 +472,18 @@
     // ------------------------------------------------------------------
     // Anti-gravity Context Compression Protocol
     // ------------------------------------------------------------------
+
+    function stripCompactionFromPrompt(prompt) {
+        const text = String(prompt || '');
+        const marker = '# Resuming from a compaction';
+        if (!text.startsWith(marker)) return text;
+        const separator = '\n\n---\n\n';
+        const sepIndex = text.indexOf(separator);
+        if (sepIndex !== -1) {
+            return text.slice(sepIndex + separator.length).trimStart();
+        }
+        return text;
+    }
 
     function formatCompactionPrompt(compaction) {
         if (!compaction || !compaction.rawText) return '';
@@ -311,7 +501,8 @@
         if (!compaction || !compaction.rawText) return prompt;
         const formatted = formatCompactionPrompt(compaction);
         if (!formatted) return prompt;
-        return `${formatted}\n\n---\n\n${prompt}`;
+        const cleanPrompt = stripCompactionFromPrompt(prompt);
+        return `${formatted}\n\n---\n\n${cleanPrompt}`;
     }
 
     /**
@@ -898,26 +1089,21 @@
             }).filter(Boolean);
         }
 
-        // Standalone Direct Project Access: if nothing was explicitly attached,
-        // read only the active project folder within the same bounded limits.
-        // An empty active root stays empty; it must never fall across project roots.
-        if (!attached.length && !hadExplicitAttachments && core && typeof core.listFiles === 'function') {
-            const folderFiles = hasActiveFolder
-                ? core.listFiles(activeFolderId)
-                : (activeFolderId ? [] : core.listFiles());
-            const targetFiles = folderFiles;
-
-            // Filter out generated docs, prioritize source code and project configs
-            const safePaths = targetFiles.filter(p => !(typeof core.isSensitiveSourcePath === 'function'
-                && core.isSensitiveSourcePath(p)));
-            const sourcePaths = safePaths.filter(p => !p.startsWith('docs/'));
-            const finalPaths = sourcePaths.length ? sourcePaths : safePaths;
-
-            attached = finalPaths.map(p => {
-                const rec = core.readFile(p, hasActiveFolder ? activeFolderId : undefined);
-                return rec ? { path: rec.path, content: rec.content, folderId: rec.folder || activeFolderId } : null;
-            }).filter(Boolean);
-        }
+        // Standalone Direct Project Access: when nothing was explicitly attached,
+        // step 2 below reads only the active project folder, within the same
+        // bounded limits. An empty active root stays empty; discovery must never
+        // fall across project roots.
+        //
+        // NOTE: Sol's original EAGER auto-discovery block lived here. It read
+        // EVERY candidate file into `attached` before the budget loop ran, which
+        // defeats the lazy-scan guarantee Gemini's performance suite asserts
+        // (readFile must stop once maxSourceFiles / maxSourceTotalKb is hit).
+        // Discovery is handled lazily in step 2 below, with the same sensitive-
+        // path and docs/ filtering and the same active-root scoping.
+        //
+        // Deleting it is safe for both modes: in 'exclusive' mode discovery never
+        // runs, and in 'combine' mode with explicit attachments the old block did
+        // not run either (it required !hadExplicitAttachments).
 
         const maxFiles = Number(cfg.maxSourceFiles) || 50;
         const maxFileBytes = (Number(cfg.maxSourceFileKb) || 500) * 1024;
@@ -928,6 +1114,16 @@
         const selected = [];
         const rejected = missingAttachments.slice();
 
+        // Review mode governs how much ATTACHED source is sent. This branch is
+        // reached only when whole-codebase digest mode is NOT active (the digest
+        // replaces selection with a structural map and returns earlier), so the
+        // caps below still bound attached mode exactly as before.
+        const mode = projectState.sourceFileMode || '';
+
+        // 1. User-selected / attached files first, with Sol's security filtering:
+        //    a sensitive path is rejected outright, and everything else passes
+        //    through sanitizeSourceForModel so a secret pasted into an ordinary
+        //    file is redacted at the model boundary.
         for (const file of attached) {
             if (!file || typeof file.content !== 'string') continue;
             if (typeof core.isSensitiveSourcePath === 'function' && core.isSensitiveSourcePath(file.path)) {
@@ -958,6 +1154,54 @@
                 content: safeContent,
                 lines: safeContent.split('\n').length
             });
+        }
+
+        // 2. Auto-discovery to fill the remaining budget (Gemini):
+        //    - 'combine'   augments attached files with workspace files
+        //    - 'exclusive' strictly limits to what the user attached
+        //    - unspecified  auto-discovers only when nothing was attached
+        const shouldDiscover = mode === 'combine'
+            || (!mode && !hadExplicitAttachments);
+        if (shouldDiscover && core && typeof core.listFiles === 'function') {
+            // Lazily inspect files, stopping as soon as the budget is filled —
+            // never read every file in the project just to count them.
+            const folderFiles = hasActiveFolder
+                ? core.listFiles(activeFolderId)
+                : (activeFolderId ? [] : core.listFiles());
+            const safePaths = folderFiles.filter(p => !(typeof core.isSensitiveSourcePath === 'function'
+                && core.isSensitiveSourcePath(p)));
+            const sourcePaths = safePaths.filter(p => !p.startsWith('docs/'));
+            const finalPaths = sourcePaths.length ? sourcePaths : safePaths;
+
+            for (const path of finalPaths) {
+                if (selected.some(item => item.path === path)) continue;
+
+                if (selected.length >= maxFiles) {
+                    rejected.push({ path, reason: 'over the maximum file count' });
+                    break; // stop reading any more files from storage
+                }
+                const rec = core.readFile(path, hasActiveFolder ? activeFolderId : undefined);
+                if (!rec || typeof rec.content !== 'string') continue;
+                const sanitized = typeof core.sanitizeSourceForModel === 'function'
+                    ? core.sanitizeSourceForModel(rec.content)
+                    : { content: rec.content, redactions: 0 };
+                const bytes = sanitized.content.length;
+                if (bytes > maxFileBytes) {
+                    rejected.push({ path, reason: `larger than ${Math.round(maxFileBytes / 1024)} KB` });
+                    continue;
+                }
+                if (total + bytes > maxTotalBytes) {
+                    rejected.push({ path, reason: 'would exceed the total size budget' });
+                    break; // stop reading once the size budget is hit
+                }
+                total += bytes;
+                redactedSecrets += Number(sanitized.redactions) || 0;
+                selected.push({
+                    path: rec.path,
+                    content: sanitized.content,
+                    lines: sanitized.content.split('\n').length
+                });
+            }
         }
 
         selected.rejected = rejected;
@@ -1705,6 +1949,25 @@
             }
         }
 
+        const handleAutoCompact = async (event) => {
+            if (hooks && typeof hooks.onAutoCompact === 'function') {
+                const updated = await hooks.onAutoCompact(event);
+                if (updated) {
+                    compaction = updated;
+                    input.compaction = updated;
+                    return updated;
+                }
+            }
+            const fallback = core.buildDeterministicCompaction({
+                messages: input.messages || [],
+                run,
+                settings
+            });
+            compaction = fallback;
+            input.compaction = fallback;
+            return fallback;
+        };
+
         // ---- Lenses (multi-lens skills) -----------------------------
         const lensOutputs = {};
         if (skill.multiLens && Array.isArray(skill.lenses) && skill.lenses.length) {
@@ -1861,6 +2124,8 @@
                 updatePipeline('synthesis', 'running');
                 synthesisMarkedRunning = true;
             }
+            const isLargeStep = isDoc || phase.kind === 'analysis' || Boolean(phase.requiresSource || skill.requiresSource);
+            const phaseTokenBudget = isLargeStep ? settings.documentMaxOutputTokens : settings.lensMaxOutputTokens;
             const step = makeStep({
                 kind: isDoc ? 'document' : 'phase',
                 label: phase.label,
@@ -1898,7 +2163,7 @@
                     'You are a product planning analyst. Follow the output contract exactly. Return only the requested Markdown, with no preamble.',
                     settings
                 ),
-                maxOutputTokens: isDoc ? settings.documentMaxOutputTokens : settings.lensMaxOutputTokens,
+                maxOutputTokens: phaseTokenBudget,
                 temperature: settings.temperature,
                 runId: run.id,
                 runLeaseId: core.runLeaseId ? core.runLeaseId(run) : '',
@@ -2205,6 +2470,8 @@
         }
         if (hooks && typeof hooks.onStep === 'function') hooks.onStep(step);
         if (hooks && typeof hooks.onRender === 'function') hooks.onRender();
+        // callHook (Gemini's error isolation) rather than a bare call: a throwing
+        // render/write hook must not undo an already-persisted result.
 
         const missing = gaps && Array.isArray(gaps.missing) ? gaps.missing : [];
         const placeholders = gaps && Array.isArray(gaps.placeholders) ? gaps.placeholders : [];
@@ -2286,6 +2553,8 @@
         }
         if (hooks && typeof hooks.onRender === 'function') hooks.onRender();
         return { path: targetPath, folderId, review };
+        // callHook (Gemini's error isolation) rather than a bare call: a throwing
+        // render/write hook must not undo an already-persisted result.
     }
 
     window.__codalioBlueprintAgent = Object.freeze({
@@ -2308,6 +2577,7 @@
         promptPreview,
         bounded,
         formatCompactionPrompt,
+        stripCompactionFromPrompt,
         injectCompactionIntoPrompt,
         compressContext
     });

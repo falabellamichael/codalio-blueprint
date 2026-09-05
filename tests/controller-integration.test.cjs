@@ -169,6 +169,9 @@ async function fakeFetch(url, options) {
                                 error.name = 'AbortError';
                                 throw error;
                             }
+                            if (streamMode === 'slow') {
+                                await new Promise(r => setTimeout(r, 25));
+                            }
                             if (index >= encoded.length) return { value: new TextEncoder().encode(''), done: true };
                             return { value: encoded[index++], done: false };
                         }
@@ -964,7 +967,104 @@ function tick(ms) {
     assert.ok(requests.length > 0, 'Enter in the composer did not send');
 
     // Wait for it to settle before the next section.
-    for (let i = 0; i < 150 && query('[data-cb-role="composer"]') && query('[data-cb-role="composer"]').disabled; i += 1) await tick(25);
+    for (let i = 0; i < 200 && requests.length < 4; i += 1) await tick(25);
+    for (let i = 0; i < 150 && (!query('[data-cb-role="composer"]') || query('[data-cb-role="composer"]').disabled); i += 1) await tick(25);
+    await tick(50);
+
+    // =======================================================================
+    // 10b. Switching apps while a run is in flight continues in background
+    // =======================================================================
+
+    hostActivateFolder('cb-agent');
+    await tick(30);
+
+    streamMode = 'slow';
+    const bgComposer = query('[data-cb-role="composer"]');
+    bgComposer.value = 'Background run test idea.';
+    documentStub.dispatch('input', { target: bgComposer });
+    requests.length = 0;
+    clickAction('send');
+
+    // Wait until busy
+    for (let i = 0; i < 120; i += 1) {
+        await tick(15);
+        if (query('[data-cb-role="composer"]') && query('[data-cb-role="composer"]').disabled) break;
+    }
+    assert.equal(query('[data-cb-role="composer"]').disabled, true, 'background test run never started');
+
+    // Simulate switching to another app (e.g. Journal) by calling deactivate hook
+    await host.callPageHook('blueprint', 'deactivate');
+
+    // Wait while in the background for the run to finish
+    for (let i = 0; i < 300; i += 1) {
+        await tick(25);
+        const runs = core.store.runs || [];
+        const latest = runs[0];
+        if (latest && latest.status === 'done') break;
+    }
+    streamMode = 'ok';
+
+    // Simulate switching back to Blueprint (activate hook + renderPage)
+    await host.callPageHook('blueprint', 'activate');
+    hostRenderAll();
+    await tick(30);
+
+    const reloadedComposer = query('[data-cb-role="composer"]');
+    assert.ok(reloadedComposer, 'composer missing after switching back to Blueprint');
+    assert.equal(reloadedComposer.disabled, false, 'composer remained locked after background run completed');
+    const latestRun = core.store.runs[0];
+    assert.equal(latestRun.status, 'done', 'run did not complete in background');
+    assert.ok(latestRun.writtenPaths.length > 0, 'background run did not produce any documents');
+
+    // =======================================================================
+    // 10c. Switching tabs inside Blueprint while a run is in flight
+    // =======================================================================
+
+    hostActivateFolder('cb-agent');
+    await tick(30);
+
+    streamMode = 'slow';
+    const tabComposer = query('[data-cb-role="composer"]');
+    tabComposer.value = 'Internal tab switch test idea.';
+    documentStub.dispatch('input', { target: tabComposer });
+    requests.length = 0;
+    clickAction('send');
+
+    // Wait until busy
+    for (let i = 0; i < 120; i += 1) {
+        await tick(15);
+        if (query('[data-cb-role="composer"]') && query('[data-cb-role="composer"]').disabled) break;
+    }
+    assert.equal(query('[data-cb-role="composer"]').disabled, true, 'tab switch test run never started');
+
+    // Switch to Project Files tab while in flight
+    hostActivateFolder('cb-files');
+    await tick(30);
+
+    // The Project Files tab is active, and the Agent tab shows the busy spinner
+    const agentTab = queryAll('[data-cb-action="activate-tab"]').find(t => t.dataset.tabId === 'tab-agent');
+    assert.ok(agentTab, 'agent tab missing from tabstrip');
+    assert.ok(agentTab.querySelector('.cb-tab-busy'), 'agent tab did not show busy spinner while running in background');
+
+    // Wait for the run to finish in background
+    for (let i = 0; i < 300; i += 1) {
+        await tick(25);
+        const runs = core.store.runs || [];
+        const latest = runs[0];
+        if (latest && (latest.status === 'done' || latest.status === 'error')) break;
+    }
+    streamMode = 'ok';
+
+    // Switch back to Agent tab
+    hostActivateFolder('cb-agent');
+    await tick(30);
+
+    const backComposer = query('[data-cb-role="composer"]');
+    assert.ok(backComposer, 'composer missing after returning to Agent tab');
+    assert.equal(backComposer.disabled, false, 'composer stayed locked after run finished');
+    const finishedRun = core.store.runs[0];
+    assert.equal(finishedRun.status, 'done', 'run did not finish when switching internal tabs');
+    assert.ok(finishedRun.writtenPaths.length > 0, 'run did not write document');
 
     // Six visible messages crosses the default deterministic compaction
     // threshold. It must run only after the final settlement token is removed,
